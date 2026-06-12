@@ -3,8 +3,20 @@
 //!
 //! Communicates with the audio thread only through lock-free ring buffers.
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn placeholder() {}
+pub mod commands;
+
+/// Compact, allocation-free messages sent from the control side to the audio
+/// thread through an `rtrb` ring buffer. The callback drains all pending
+/// messages at the start of each block before rendering.
+///
+/// This enum grows over later milestones (per ARCHITECTURE.md: `Seek`,
+/// `NoteOn`, `NoteOff`, `SetParam`, `SwapGraph`). M1 only needs transport.
+pub enum ControlMsg {
+    Transport(TransportCmd),
+}
+
+#[derive(Clone, Copy)]
+pub enum TransportCmd {
+    Play,
+    Stop,
 }

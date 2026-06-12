@@ -13,8 +13,17 @@ Trois niveaux de zoom conceptuels :
 2. **Panneau chaîne (bas d'écran)** — la chaîne de la piste sélectionnée :
    `Notes -> Instrument -> Effets -> Mixeur`. C'est le graphe rendu linéairement
    tant qu'il est simple ; il bascule en graphe libre (Vue Flow) dès qu'un routage
-   non linéaire apparaît (send, modulation croisée). **Une seule source de
-   vérité, deux rendus.**
+   non linéaire apparaît (send, modulation croisée, sortie multiple). **Une seule
+   source de vérité, deux rendus.** La bascule est automatique et **sans retour
+   forcé** : une fois la chaîne non linéaire, on ne la replie jamais en strip. Une
+   vue linéaire qui cacherait un send ferait croire la chaîne plus simple qu'elle
+   n'est — le genre de mensonge qui empêche un débutant de comprendre son propre
+   son. Asymétrie volontaire : on peut toujours *ouvrir* le graphe d'une chaîne
+   simple par curiosité, jamais voir moins que la réalité. Quand une action est sur
+   le point de rendre la chaîne non linéaire (on tire un send depuis la vue
+   linéaire), un indice visuel annonce la transition vers le graphe — pas de pop-up
+   de confirmation, juste de quoi éviter l'effet « ma chaîne a sauté en mode bizarre
+   sans prévenir ».
 3. **Intérieur d'un module** — double-clic sur un nœud = on descend dans son
    patch (oscillateurs, filtres, LFO). **Breadcrumb** pour remonter :
    `Master ▸ Lead ▸ Piano FM`. Modèle mental : sous-graphes Blueprints.
@@ -71,6 +80,15 @@ valides s'illuminent.**
   s'interrompt jamais**, y compris pendant la lecture.
 
 ## Feedback visuel (le DAW « vivant »)
+
+**Principe directeur : le feedback réagit aux changements d'état, pas aux gestes
+de l'utilisateur.** Le renderer pense « l'état a changé, je l'anime », jamais
+« l'utilisateur a agi, je réagis ». L'UI a deux sources d'édition de rang égal —
+l'humain (souris/clavier) et l'agent Claude Code (`song.json` + macros) — et le
+feedback les traite à l'identique : qu'un knob soit bougé à la souris ou par une
+édition de fichier, l'anneau s'anime et la valeur transite en douceur, jamais de
+saut sec. Pensé ainsi, le feedback des éditions agent vient gratuitement. Corollaire :
+l'UI ne ment jamais sur le signal — ce qu'on voit reflète ce que le moteur fait.
 
 Alimenté par la télémétrie (audio -> UI, 60 fps, unidirectionnel) :
 

@@ -235,7 +235,10 @@ audible. Toute l'UX modulaire repose dessus.
 
 ## M5 — Timeline + piano roll canvas (5-8 jours)
 
-**Objectif** : les trois interactions reines, à 60 fps.
+**Objectif** : les trois interactions reines à 60 fps, plus le premier slice
+vertical de télémétrie (faire passer un chiffre du thread audio jusqu'au pixel,
+de bout en bout — on prouve le pipeline tôt, sur une donnée, plutôt que de le
+découvrir en entier à M7).
 
 **Fichiers**
 - `views/timeline/TimelineCanvas.vue` + `renderer.ts` — un seul canvas,
@@ -248,6 +251,13 @@ audible. Toute l'UX modulaire repose dessus.
 - `stores/project.ts` — miroir Pinia de `song.json` ; toute mutation passe
   par des actions qui appellent les commandes Tauri (source de vérité côté
   Rust, l'UI est optimiste puis confirmée).
+- `telemetry/frame.rs` — `TelemetryFrame` minimal `{playhead_samples,
+  master_peak}`, écrit chaque bloc par le thread audio dans un `rtrb` dédié
+  (jamais d'allocation, écrase si plein). // RT-SAFE
+- `control/telemetry_pump.rs` — draine le ring, agrège (max des peaks), pousse
+  un event Tauri `telemetry` à ~60 Hz maximum.
+- `views/transport/MasterMeter.vue` — VU master (peak, ballistique : attaque
+  instantanée, release 300 ms), alimenté par l'event `telemetry`.
 
 **Étapes**
 1. Renderer : boucle `requestAnimationFrame` qui ne redessine que si
@@ -261,8 +271,14 @@ audible. Toute l'UX modulaire repose dessus.
 3. Chaque geste committé = une commande Tauri + une entrée d'undo. Pendant le
    drag, l'UI affiche la position fantôme localement ; le commit ne se fait
    qu'au relâchement.
-4. Playhead : interpoler entre deux frames de télémétrie
-   (`pos + vitesse × dt`) pour un déplacement parfaitement fluide.
+4. **Slice vertical de télémétrie minimal** — faire passer une seule donnée du
+   thread audio jusqu'au pixel, de bout en bout. Le thread audio écrit chaque
+   bloc un `TelemetryFrame {playhead_samples, master_peak}` dans le ring `rtrb`
+   (jamais d'allocation, écrase si plein) ; le pump le draine et émet l'event
+   Tauri `telemetry` à ~60 Hz ; l'UI interpole le playhead entre deux frames
+   (`pos + vitesse × dt`) pour un déplacement parfaitement fluide et anime le VU
+   master sur `master_peak`. Rien de plus : c'est le pipeline complet prouvé sur
+   une donnée, pas encore le DAW vivant (qui l'élargit à M7).
 
 **CA (manuels chronométrés + un test perf)**
 - [ ] Poser une note : double-clic → la note apparaît ET sonne en < 30 ms
@@ -272,6 +288,9 @@ audible. Toute l'UX modulaire repose dessus.
       frame time p95 < 16 ms (mesuré via `performance.now()` dans le renderer).
 - [ ] Resize d'un clip ne déplace jamais les notes qu'il contient (positions
       absolues conservées).
+- [ ] Le playhead se déplace de façon fluide et le VU master réagit au signal,
+      alimentés de bout en bout par le pipeline de télémétrie (audio → ring →
+      pump → event → UI), sans allocation côté audio.
 
 **Pièges**
 - Un composant Vue par note = mort à 500 notes. Canvas immédiat obligatoire.
@@ -335,13 +354,18 @@ pendant la lecture.
 
 ## M7 — Le DAW vivant : télémétrie, VU, file watcher (3-4 jours)
 
-**Objectif** : feedback visuel temps réel + boucle Claude Code en direct.
+**Objectif** : feedback visuel temps réel complet + boucle Claude Code en direct.
+**Élargissement** du pipeline de télémétrie déjà éprouvé en M5 : le fil vertical
+`audio → ring → pump → event → UI` existe et fait transiter un
+`{playhead_samples, master_peak}`. Ici on l'étend au `TelemetryFrame` plein et à
+tous les consommateurs visuels — on ne crée pas le pipeline, on le densifie.
 
 **Fichiers**
-- `telemetry/frame.rs` — `TelemetryFrame` à capacité fixe (cf. ARCHITECTURE.md),
-  écrit chaque bloc par le thread audio dans un `rtrb` dédié (cap. 64).
-- `control/telemetry_pump.rs` — draine, agrège (max des peaks), pousse un
-  event Tauri `telemetry` à ~60 Hz maximum.
+- `telemetry/frame.rs` — **étend** le `TelemetryFrame` minimal de M5 à sa capacité
+  fixe pleine (cf. ARCHITECTURE.md) : peaks/RMS par nœud, valeurs de modulation.
+  Le ring `rtrb` dédié et son écriture par le thread audio existent déjà.
+- `control/telemetry_pump.rs` — **existe depuis M5** ; on l'étend pour agréger le
+  frame plein (max des peaks par nœud) en gardant l'event `telemetry` à ~60 Hz.
 - `views/chain/NodeMeter.vue` — VU par nœud (peak + RMS, ballistique :
   attaque instantanée, release 300 ms).
 - `control/watcher.rs` — `notify` sur `projects/<p>/` avec debounce 100 ms →

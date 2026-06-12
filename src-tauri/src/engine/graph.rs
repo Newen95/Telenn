@@ -15,15 +15,20 @@ use crate::engine::node::{AudioNode, NodeIdx, NoteEvent, ParamId, ProcessCtx, Si
 /// this in a single block are dropped rather than reallocating. // RT-SAFE
 const NOTE_CAPACITY: usize = 64;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NodeDesc {
+    /// Stable instance id (from `song.json`); the key that matches a node across
+    /// a hot-swap so its live state is carried over. An id always maps to the
+    /// same `module_id`.
+    #[serde(default)]
+    pub id: String,
     pub module_id: String,
     /// Initial parameter values, normalized 0..1.
     #[serde(default)]
     pub params: Vec<(ParamId, f32)>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Connection {
     pub src_node: NodeIdx,
     pub src_port: usize,
@@ -32,7 +37,7 @@ pub struct Connection {
 }
 
 /// Serializable graph description (the future shape of `song.json` chains).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GraphDesc {
     pub nodes: Vec<NodeDesc>,
     pub connections: Vec<Connection>,
@@ -59,6 +64,9 @@ pub enum GraphError {
 /// Compiled graph, owned by the audio thread.
 pub struct CompiledGraph {
     nodes: Vec<Box<dyn AudioNode>>,
+    /// Stable instance id per node, indexed like `nodes`. Used to match nodes
+    /// across a hot-swap so their live state is carried over.
+    node_ids: Vec<String>,
     /// Topological order: `order[pos]` is the node processed at step `pos`.
     order: Vec<NodeIdx>,
     /// Inverse of `order`: node index → topological position.
@@ -87,6 +95,27 @@ impl CompiledGraph {
         }
     }
 
+    /// Move live node instances from `old` into `self` for every node whose id
+    /// (and port shape) matches, so their real-time state — voices, filter
+    /// memory, effect tails — is carried across a hot-swap with no recompute and
+    /// no buffer copy. `old` receives `self`'s fresh instances and is discarded
+    /// off the audio thread afterwards. // RT-SAFE
+    pub fn adopt_nodes_from(&mut self, old: &mut CompiledGraph) {
+        for i in 0..self.nodes.len() {
+            if self.node_ids[i].is_empty() {
+                continue;
+            }
+            let Some(j) = old.node_ids.iter().position(|oid| *oid == self.node_ids[i]) else {
+                continue;
+            };
+            // Same id ⟹ same module ⟹ same port shape; guard against a stale id
+            // reused for a different module.
+            if self.in_counts[i] == old.in_counts[j] && self.out_counts[i] == old.out_counts[j] {
+                std::mem::swap(&mut self.nodes[i], &mut old.nodes[j]);
+            }
+        }
+    }
+
     /// Release every sounding voice across all nodes (transport stop). // RT-SAFE
     pub fn all_notes_off(&mut self) {
         for n in &mut self.nodes {
@@ -106,6 +135,11 @@ impl CompiledGraph {
         if let Some(n) = self.nodes.get_mut(node) {
             n.set_param(param, value);
         }
+    }
+
+    /// Stable instance id of each node, indexed by node index.
+    pub fn node_ids(&self) -> &[String] {
+        &self.node_ids
     }
 
     /// The output node's mono buffer for the last processed block. // RT-SAFE
@@ -247,9 +281,11 @@ pub fn compile(
     let max_in = in_counts.iter().copied().max().unwrap_or(0);
     let in_scratch = vec![0.0f32; max_in * max_block];
     let node_notes = (0..n).map(|_| Vec::with_capacity(NOTE_CAPACITY)).collect();
+    let node_ids = desc.nodes.iter().map(|d| d.id.clone()).collect();
 
     Ok(CompiledGraph {
         nodes,
+        node_ids,
         order,
         node_to_pos,
         in_counts,
@@ -355,10 +391,12 @@ mod tests {
         let desc = GraphDesc {
             nodes: vec![
                 NodeDesc {
+                    id: "src".into(),
                     module_id: "const".into(),
                     params: vec![],
                 },
                 NodeDesc {
+                    id: "fx".into(),
                     module_id: "half".into(),
                     params: vec![],
                 },
@@ -383,10 +421,12 @@ mod tests {
         let desc = GraphDesc {
             nodes: vec![
                 NodeDesc {
+                    id: "fx".into(),
                     module_id: "half".into(),
                     params: vec![],
                 },
                 NodeDesc {
+                    id: "src".into(),
                     module_id: "const".into(),
                     params: vec![],
                 },
@@ -407,14 +447,48 @@ mod tests {
     }
 
     #[test]
+    fn adopt_moves_live_node_state() {
+        use crate::engine::swap::test_support;
+        let desc = GraphDesc {
+            nodes: vec![NodeDesc {
+                id: "t".into(),
+                module_id: "tail".into(),
+                params: vec![],
+            }],
+            connections: vec![],
+            output: 0,
+        };
+        // Ring the tail (struck to 1.0 by prepare) well down.
+        let mut a = compile(&desc, test_support::create, 48_000.0, 64).expect("compiles");
+        for _ in 0..16 {
+            a.process_block(48_000.0, 64);
+        }
+        let decayed = a.output()[0];
+        assert!(decayed < 0.7, "tail should have decayed: {decayed}");
+
+        // A fresh graph's tail is struck back to 1.0 by prepare; adopting the
+        // live node must carry the decayed state instead of restarting at 1.0.
+        let mut b = compile(&desc, test_support::create, 48_000.0, 64).expect("compiles");
+        b.adopt_nodes_from(&mut a);
+        b.process_block(48_000.0, 64);
+        assert!(
+            b.output()[0] <= decayed,
+            "live state was not moved into the new graph: {}",
+            b.output()[0]
+        );
+    }
+
+    #[test]
     fn incompatible_port_types_are_rejected() {
         let desc = GraphDesc {
             nodes: vec![
                 NodeDesc {
+                    id: "src".into(),
                     module_id: "const".into(),
                     params: vec![],
                 },
                 NodeDesc {
+                    id: "sink".into(),
                     module_id: "notesink".into(),
                     params: vec![],
                 },

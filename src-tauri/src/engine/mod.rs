@@ -8,6 +8,7 @@ pub mod node;
 pub mod params;
 pub mod rt;
 pub mod stream;
+pub mod swap;
 
 pub use stream::{AudioEngine, EngineError};
 

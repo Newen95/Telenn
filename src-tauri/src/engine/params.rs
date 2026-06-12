@@ -26,6 +26,11 @@ impl LinearRamp {
         self.target = target;
     }
 
+    /// Current value (without advancing). // RT-SAFE
+    pub fn value(&self) -> f32 {
+        self.current
+    }
+
     /// Advance one sample and return the new value. // RT-SAFE
     pub fn tick(&mut self) -> f32 {
         if self.current < self.target {

@@ -40,7 +40,7 @@ pub enum ProjectError {
 
 /// A project, mirroring `song.json`. Unknown fields (and M6/M8 fields such as
 /// `mixer`, `buses`, `modulations`, node `preset`) are ignored by serde for now.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Project {
     #[serde(default = "default_version")]
     #[allow(dead_code)]
@@ -51,7 +51,7 @@ pub struct Project {
     pub tracks: Vec<Track>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Track {
     pub id: String,
     #[serde(default)]
@@ -62,9 +62,8 @@ pub struct Track {
     pub clips: Vec<Clip>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct NodeSpec {
-    #[allow(dead_code)]
     pub id: String,
     pub module: String,
     /// Initial parameter values, by parameter name, normalized 0..1.
@@ -72,7 +71,7 @@ pub struct NodeSpec {
     pub params: HashMap<String, f32>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Clip {
     /// Clip placement and length. In M3 clips are containers only: notes carry
     /// absolute positions and are not windowed by the clip yet.
@@ -84,7 +83,7 @@ pub struct Clip {
     pub notes: Vec<Note>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Note {
     pub pitch: u8,
     /// Absolute song position `"bar.beat.tick"` (1-indexed bar/beat).
@@ -140,50 +139,57 @@ impl Project {
 
     /// Build a graph description from the track chains, summing every chain into
     /// a unity master node. Returns the graph and the note-routing index.
+    ///
+    /// Layout is **instruments first** (indices `0..T-1`), then every track's
+    /// effects, then the master. Keeping instrument indices independent of the
+    /// effect chains means a live effect edit never shifts an instrument index,
+    /// so the playing schedule and held notes stay valid across a hot-swap.
     pub fn to_graph(&self) -> Result<(GraphDesc, GraphIndex), ProjectError> {
-        let mut nodes: Vec<NodeDesc> = Vec::new();
-        let mut connections: Vec<Connection> = Vec::new();
-        let mut index = GraphIndex::default();
-        let mut track_outputs: Vec<NodeIdx> = Vec::new();
-
         for track in &self.tracks {
             if track.chain.is_empty() {
                 return Err(ProjectError::EmptyChain(track.id.clone()));
             }
-            let mut prev: Option<NodeIdx> = None;
-            let mut first: Option<NodeIdx> = None;
-            for spec in &track.chain {
-                let idx = nodes.len();
-                nodes.push(NodeDesc {
-                    module_id: spec.module.clone(),
-                    params: resolve_params(&spec.module, &spec.params)?,
-                });
-                if let Some(p) = prev {
-                    connections.push(Connection {
-                        src_node: p,
-                        src_port: 0,
-                        dst_node: idx,
-                        dst_port: 0,
-                    });
-                }
-                first.get_or_insert(idx);
-                prev = Some(idx);
-            }
-            index
-                .instrument
-                .insert(track.id.clone(), first.expect("chain non-empty"));
-            track_outputs.push(prev.expect("chain non-empty"));
         }
 
-        // The master node: every track's chain output sums into its single input.
+        let mut nodes: Vec<NodeDesc> = Vec::new();
+        let mut connections: Vec<Connection> = Vec::new();
+        let mut index = GraphIndex::default();
+
+        // Pass 1: every track's instrument (chain head) → stable indices 0..T-1.
+        let mut tails: Vec<NodeIdx> = Vec::with_capacity(self.tracks.len());
+        for track in &self.tracks {
+            let head = &track.chain[0];
+            let idx = nodes.len();
+            nodes.push(self.node_desc(head)?);
+            index.instrument.insert(track.id.clone(), idx);
+            tails.push(idx);
+        }
+
+        // Pass 2: each track's effects, chained from its instrument.
+        for (t, track) in self.tracks.iter().enumerate() {
+            for spec in &track.chain[1..] {
+                let idx = nodes.len();
+                nodes.push(self.node_desc(spec)?);
+                connections.push(Connection {
+                    src_node: tails[t],
+                    src_port: 0,
+                    dst_node: idx,
+                    dst_port: 0,
+                });
+                tails[t] = idx;
+            }
+        }
+
+        // The master node: every track's chain tail sums into its single input.
         let master = nodes.len();
         nodes.push(NodeDesc {
+            id: "_master".into(),
             module_id: MASTER_MODULE.into(),
             params: Vec::new(),
         });
-        for &out in &track_outputs {
+        for &tail in &tails {
             connections.push(Connection {
-                src_node: out,
+                src_node: tail,
                 src_port: 0,
                 dst_node: master,
                 dst_port: 0,
@@ -198,6 +204,15 @@ impl Project {
             },
             index,
         ))
+    }
+
+    /// Build a `NodeDesc` from a chain node spec (validates module + params).
+    fn node_desc(&self, spec: &NodeSpec) -> Result<NodeDesc, ProjectError> {
+        Ok(NodeDesc {
+            id: spec.id.clone(),
+            module_id: spec.module.clone(),
+            params: resolve_params(&spec.module, &spec.params)?,
+        })
     }
 
     /// Build the playable schedule, resolving each note to its track's
@@ -363,6 +378,32 @@ mod tests {
         // The instrument feeds the master.
         assert_eq!(graph.connections.len(), 1);
         assert_eq!(graph.connections[0].dst_node, 1);
+    }
+
+    #[test]
+    fn instruments_come_first_and_ids_propagate() {
+        // Two tracks; the first carries an effect. Instruments must take the
+        // leading indices (0, 1) regardless of effects, and node ids propagate.
+        let song = r#"{ "bpm": 120, "tracks": [
+            { "id": "lead", "chain": [
+                { "id": "lead_synth", "module": "subtractive" },
+                { "id": "lead_gain", "module": "gain" } ] },
+            { "id": "bass", "chain": [ { "id": "bass_synth", "module": "subtractive" } ] }
+        ] }"#;
+        let project: Project = serde_json::from_str(song).unwrap();
+        let (graph, index) = project.to_graph().unwrap();
+
+        assert_eq!(index.instrument["lead"], 0);
+        assert_eq!(index.instrument["bass"], 1);
+        assert_eq!(graph.nodes[0].id, "lead_synth");
+        assert_eq!(graph.nodes[1].id, "bass_synth");
+        // Effect after the instruments, master last.
+        assert_eq!(graph.nodes[2].id, "lead_gain");
+        assert_eq!(graph.nodes[3].id, "_master");
+        assert_eq!(graph.output, 3);
+        // The layout still compiles to a valid RT graph.
+        crate::engine::graph::compile(&graph, crate::modules::registry::create, 48_000.0, 64)
+            .unwrap();
     }
 
     #[test]

@@ -15,15 +15,15 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use rtrb::{Consumer, Producer, RingBuffer};
 
 use crate::control::project::{GraphIndex, ProjectError};
-use crate::control::sequencer::Schedule;
 use crate::control::{ControlMsg, EngineInit};
 use crate::engine::graph::GraphError;
 use crate::engine::rt::RtState;
+use crate::engine::swap::Garbage;
 use crate::engine::MAX_BLOCK;
 
 /// Capacity of the control→audio ring (per ARCHITECTURE.md).
 const CONTROL_RING_CAPACITY: usize = 1024;
-/// Capacity of the audio→control garbage ring for displaced schedules.
+/// Capacity of the audio→control garbage ring for displaced schedules and graphs.
 const GARBAGE_RING_CAPACITY: usize = 8;
 /// Block size requested from the device where it advertises a usable range.
 const DESIRED_BUFFER: u32 = 256;
@@ -51,8 +51,8 @@ pub enum EngineError {
 /// Control-side handle to the running audio engine.
 pub struct AudioEngine {
     commands: Mutex<Producer<ControlMsg>>,
-    /// Displaced schedules returned by the audio thread, dropped here off-RT.
-    garbage: Mutex<Consumer<Box<Schedule>>>,
+    /// Displaced schedules and graphs returned by the audio thread, dropped here off-RT.
+    garbage: Mutex<Consumer<Garbage>>,
     /// Track → node routing of the running graph, used to resolve a reloaded
     /// project's notes against the topology already on the audio thread.
     index: GraphIndex,
@@ -70,7 +70,7 @@ impl AudioEngine {
     /// note-routing of that graph, kept for later `load_project` calls.
     pub fn start(init: EngineInit, index: GraphIndex) -> Result<Self, EngineError> {
         let (producer, consumer) = RingBuffer::<ControlMsg>::new(CONTROL_RING_CAPACITY);
-        let (garbage_prod, garbage_cons) = RingBuffer::<Box<Schedule>>::new(GARBAGE_RING_CAPACITY);
+        let (garbage_prod, garbage_cons) = RingBuffer::<Garbage>::new(GARBAGE_RING_CAPACITY);
         let xruns = Arc::new(AtomicU32::new(0));
         let (shutdown_tx, shutdown_rx) = mpsc::sync_channel::<()>(0);
         let (ready_tx, ready_rx) = mpsc::channel::<Result<u32, EngineError>>();
@@ -147,7 +147,7 @@ impl AudioEngine {
 /// stream and the real sample rate obtained (never assume it).
 fn build_stream(
     mut consumer: Consumer<ControlMsg>,
-    garbage: Producer<Box<Schedule>>,
+    garbage: Producer<Garbage>,
     xruns: Arc<AtomicU32>,
     init: EngineInit,
 ) -> Result<(cpal::Stream, u32), EngineError> {

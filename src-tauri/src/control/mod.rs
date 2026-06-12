@@ -4,16 +4,18 @@
 //! Communicates with the audio thread only through lock-free ring buffers.
 
 pub mod commands;
+pub mod graph_edit;
 pub mod project;
 pub mod render;
 pub mod sequencer;
+pub mod undo;
 
 use crate::engine::graph::{compile, CompiledGraph};
 use crate::engine::node::{NodeIdx, ParamId};
 use crate::engine::EngineError;
 use crate::modules::registry;
 
-use project::GraphIndex;
+use project::{GraphIndex, Project};
 use sequencer::Schedule;
 
 /// The demo project, embedded at build time so the engine always boots with a
@@ -47,6 +49,11 @@ pub enum ControlMsg {
     /// audio thread swaps the box in and returns the old one through the garbage
     /// ring to be dropped off the real-time thread.
     SetSchedule(Box<Schedule>),
+    /// Replace the audio graph without interrupting playback (hot-swap). The
+    /// audio thread moves persistent node instances into the new graph, fades
+    /// out the old one (removed effects' tails), and returns it through the
+    /// garbage ring.
+    SwapGraph(Box<CompiledGraph>),
 }
 
 #[derive(Clone, Copy)]
@@ -68,18 +75,20 @@ fn demo_project() -> Result<project::Project, project::ProjectError> {
     Ok(serde_json::from_str(DEMO_SONG)?)
 }
 
-/// Build the engine initialiser for the demo project and the note-routing index
-/// the control side keeps for later `load_project` calls. The graph topology is
-/// computed here (sample-rate independent); the closure finishes compilation and
-/// builds the schedule once the device sample rate is known.
-pub fn build_demo() -> Result<(EngineInit, GraphIndex), EngineError> {
+/// Build the engine initialiser plus the control-side state kept for later
+/// commands: the note-routing index (`load_project`) and the editable project
+/// (graph edits / undo). The graph topology is computed here (sample-rate
+/// independent); the closure finishes compilation and builds the schedule once
+/// the device sample rate is known.
+pub fn build_demo() -> Result<(EngineInit, GraphIndex, Project), EngineError> {
     let project = demo_project()?;
     let (desc, index) = project.to_graph()?;
     let index_for_engine = index.clone();
+    let project_for_engine = project.clone();
     let init: EngineInit = Box::new(move |sample_rate, max_block| {
         let graph = compile(&desc, registry::create, sample_rate, max_block)?;
         let schedule = project.to_schedule(sample_rate as u32, &index)?;
         Ok((graph, schedule))
     });
-    Ok((init, index_for_engine))
+    Ok((init, index_for_engine, project_for_engine))
 }

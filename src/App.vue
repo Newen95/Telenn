@@ -78,6 +78,48 @@ async function exportWav() {
   }
 }
 
+// --- Hot-swap dev controls: edit the effect chains while audio plays. ---
+
+interface GraphNode {
+  trackId: string;
+  id: string;
+  module: string;
+  isInstrument: boolean;
+}
+
+const graphNodes = ref<GraphNode[]>([]);
+let fxCounter = 0;
+
+async function refreshGraph() {
+  graphNodes.value = await invoke<GraphNode[]>("graph_nodes");
+}
+
+async function runEdit(command: string, args: Record<string, unknown>, label: string) {
+  try {
+    await invoke(command, args);
+    actionMsg.value = label;
+  } catch (e) {
+    actionMsg.value = String(e);
+  }
+  await refreshGraph();
+}
+
+function insertEffect(trackId: string) {
+  fxCounter += 1;
+  // Insert the gain attenuating (~-17 dB) so the edit is audible: the track
+  // drops on insert, returns on remove — proving the swap landed, click-free.
+  void runEdit(
+    "graph_insert_effect",
+    { trackId, module: "gain", id: `${trackId}_fx${fxCounter}`, params: { gain: 0.6 } },
+    "inserted (gain -17 dB)",
+  );
+}
+
+const removeNode = (id: string) => runEdit("graph_remove_node", { id }, "removed");
+const moveNode = (id: string, dir: number) => runEdit("graph_move_node", { id, dir }, "moved");
+const graphUndo = () => runEdit("graph_undo", {}, "undo");
+const graphRedo = () => runEdit("graph_redo", {}, "redo");
+
 async function noteOn(pitch: number) {
   if (held.has(pitch)) return;
   held.add(pitch);
@@ -138,6 +180,7 @@ onMounted(async () => {
   }
   window.addEventListener("keydown", onKeyDown);
   window.addEventListener("keyup", onKeyUp);
+  void refreshGraph();
   void refreshStatus();
   statusTimer = window.setInterval(refreshStatus, 1000);
 });
@@ -162,6 +205,27 @@ onUnmounted(() => {
       <button type="button" class="tbtn wide" @click="exportWav"
         title="render the project offline to projects/demo/export.wav">export wav</button>
       <span class="action-msg">{{ actionMsg }}</span>
+    </section>
+
+    <section class="graph">
+      <div v-for="n in graphNodes" :key="n.id" class="graph-row">
+        <span class="node" :class="{ instrument: n.isInstrument }">
+          {{ n.trackId }} / {{ n.id }} <em>({{ n.module }})</em>
+        </span>
+        <template v-if="n.isInstrument">
+          <button type="button" class="gbtn" @click="insertEffect(n.trackId)"
+            title="append a gain effect to this chain and hot-swap">+ gain</button>
+        </template>
+        <template v-else>
+          <button type="button" class="gbtn" @click="moveNode(n.id, -1)" title="move earlier">◀</button>
+          <button type="button" class="gbtn" @click="moveNode(n.id, 1)" title="move later">▶</button>
+          <button type="button" class="gbtn" @click="removeNode(n.id)" title="remove">✕</button>
+        </template>
+      </div>
+      <div class="graph-actions">
+        <button type="button" class="gbtn" @click="graphUndo">undo</button>
+        <button type="button" class="gbtn" @click="graphRedo">redo</button>
+      </div>
     </section>
 
     <section class="params">
@@ -248,6 +312,52 @@ body {
 .action-msg {
   font-size: 0.8rem;
   color: #8e8e93;
+}
+
+.graph {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  width: min(640px, 100%);
+  font-size: 0.8rem;
+}
+
+.graph-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.graph-row .node {
+  flex: 1;
+  color: #c7c7cc;
+}
+
+.graph-row .node.instrument {
+  color: #f6f6f6;
+  font-weight: 600;
+}
+
+.graph-row em {
+  color: #8e8e93;
+  font-style: normal;
+}
+
+.gbtn {
+  padding: 0.15rem 0.5rem;
+  border: 1px solid #3a3a3c;
+  border-radius: 5px;
+  background: #2c2c2e;
+  color: #f6f6f6;
+  font-family: inherit;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
+.graph-actions {
+  display: flex;
+  gap: 0.4rem;
+  margin-top: 0.3rem;
 }
 
 .params {

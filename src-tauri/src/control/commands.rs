@@ -1,11 +1,16 @@
 //! Tauri commands: the typed UI → control entry points.
 
+use std::sync::Mutex;
+
 use tauri::State;
 
 use crate::control::project::Project;
-use crate::control::{render, ControlMsg, TransportCmd};
+use crate::control::undo::EditHistory;
+use crate::control::{graph_edit, render, ControlMsg, TransportCmd};
+use crate::engine::graph::{compile, GraphDesc};
 use crate::engine::node::ParamId;
-use crate::engine::AudioEngine;
+use crate::engine::{AudioEngine, MAX_BLOCK};
+use crate::modules::registry;
 
 /// Fixed sample rate for offline export: device-independent, so an exported WAV
 /// is reproducible on any machine.
@@ -44,6 +49,127 @@ pub fn export_wav(project_path: String, out_path: String) -> Result<(), String> 
     let project = Project::load(&project_path).map_err(|e| e.to_string())?;
     render::render_to_wav(&project, EXPORT_SAMPLE_RATE, EXPORT_LOOPS, &out_path)
         .map_err(|e| e.to_string())
+}
+
+/// Compile a graph description and hot-swap it onto the audio thread.
+fn swap_to(engine: &AudioEngine, desc: &GraphDesc) -> Result<(), String> {
+    let graph = compile(
+        desc,
+        registry::create,
+        engine.sample_rate() as f32,
+        MAX_BLOCK,
+    )
+    .map_err(|e| e.to_string())?;
+    if !engine.send(ControlMsg::SwapGraph(Box::new(graph))) {
+        return Err("engine busy: command dropped".into());
+    }
+    Ok(())
+}
+
+/// Apply a validated edit to the project and hot-swap the resulting graph. The
+/// edit runs on a trial clone and must compile before it is committed, so a
+/// rejected edit leaves the project and the audio thread untouched.
+fn edit_and_swap(
+    engine: &AudioEngine,
+    history: &Mutex<EditHistory>,
+    edit: impl FnOnce(&mut Project) -> Result<(), graph_edit::GraphEditError>,
+) -> Result<(), String> {
+    let mut history = history.lock().map_err(|_| "edit state poisoned")?;
+    let mut trial = history.project().clone();
+    edit(&mut trial).map_err(|e| e.to_string())?;
+    let (desc, _index) = trial.to_graph().map_err(|e| e.to_string())?;
+    swap_to(engine, &desc)?;
+    history.commit(trial);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn graph_insert_effect(
+    engine: State<'_, AudioEngine>,
+    history: State<'_, Mutex<EditHistory>>,
+    track_id: String,
+    module: String,
+    id: String,
+    params: std::collections::HashMap<String, f32>,
+) -> Result<(), String> {
+    edit_and_swap(&engine, &history, |p| {
+        graph_edit::insert_effect(p, &track_id, &module, &id, params)
+    })
+}
+
+#[tauri::command]
+pub fn graph_remove_node(
+    engine: State<'_, AudioEngine>,
+    history: State<'_, Mutex<EditHistory>>,
+    id: String,
+) -> Result<(), String> {
+    edit_and_swap(&engine, &history, |p| graph_edit::remove_node(p, &id))
+}
+
+#[tauri::command]
+pub fn graph_move_node(
+    engine: State<'_, AudioEngine>,
+    history: State<'_, Mutex<EditHistory>>,
+    id: String,
+    dir: i32,
+) -> Result<(), String> {
+    edit_and_swap(&engine, &history, |p| graph_edit::move_node(p, &id, dir))
+}
+
+#[tauri::command]
+pub fn graph_undo(
+    engine: State<'_, AudioEngine>,
+    history: State<'_, Mutex<EditHistory>>,
+) -> Result<(), String> {
+    let mut history = history.lock().map_err(|_| "edit state poisoned")?;
+    let desc = match history.undo() {
+        Some(project) => project.to_graph().map_err(|e| e.to_string())?.0,
+        None => return Ok(()), // nothing to undo
+    };
+    swap_to(&engine, &desc)
+}
+
+#[tauri::command]
+pub fn graph_redo(
+    engine: State<'_, AudioEngine>,
+    history: State<'_, Mutex<EditHistory>>,
+) -> Result<(), String> {
+    let mut history = history.lock().map_err(|_| "edit state poisoned")?;
+    let desc = match history.redo() {
+        Some(project) => project.to_graph().map_err(|e| e.to_string())?.0,
+        None => return Ok(()),
+    };
+    swap_to(&engine, &desc)
+}
+
+/// A node in the current graph, for the UI to list and target edits.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphNodeInfo {
+    pub track_id: String,
+    pub id: String,
+    pub module: String,
+    pub is_instrument: bool,
+}
+
+#[tauri::command]
+pub fn graph_nodes(history: State<'_, Mutex<EditHistory>>) -> Vec<GraphNodeInfo> {
+    let history = match history.lock() {
+        Ok(h) => h,
+        Err(_) => return Vec::new(),
+    };
+    let mut nodes = Vec::new();
+    for track in &history.project().tracks {
+        for (i, node) in track.chain.iter().enumerate() {
+            nodes.push(GraphNodeInfo {
+                track_id: track.id.clone(),
+                id: node.id.clone(),
+                module: node.module.clone(),
+                is_instrument: i == 0,
+            });
+        }
+    }
+    nodes
 }
 
 #[tauri::command]

@@ -395,6 +395,14 @@ impl AudioNode for Subtractive {
         }
     }
 
+    fn all_notes_off(&mut self) {
+        for v in &mut self.voices {
+            if v.active {
+                v.env.note_off();
+            }
+        }
+    }
+
     fn prepare(&mut self, sample_rate: f32, _max_block: usize) {
         self.sample_rate = sample_rate;
         let coef = (-1.0 / (SMOOTH_S * sample_rate)).exp();
@@ -498,6 +506,30 @@ mod tests {
         let pitches = s.active_pitches();
         assert!(pitches.contains(&72), "new note should be present");
         assert!(!pitches.contains(&60), "oldest note should be stolen");
+    }
+
+    #[test]
+    fn all_notes_off_releases_every_voice() {
+        // Regression: stopping the transport must not leave sequenced voices
+        // ringing — every active voice goes to release and falls silent.
+        let mut s = synth();
+        let mut buf = Vec::new();
+        let ons: Vec<NoteEvent> = (60u8..64)
+            .map(|p| NoteEvent {
+                frame: 0,
+                kind: NoteKind::On { pitch: p, vel: 100 },
+            })
+            .collect();
+        render_notes(&mut s, &ons, 256, &mut buf);
+        assert_eq!(s.active_voice_count(), 4);
+
+        s.all_notes_off();
+        render_notes(&mut s, &[], 48_000, &mut buf); // well past the release
+        assert_eq!(
+            s.active_voice_count(),
+            0,
+            "a voice rang on after all_notes_off"
+        );
     }
 
     #[test]

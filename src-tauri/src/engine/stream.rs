@@ -4,8 +4,8 @@
 //! dedicated audio thread builds the stream, starts it, then parks until the
 //! engine is dropped — at which point the stream is dropped on that thread,
 //! never inside the callback. The handle kept by the control side holds only
-//! `Send + Sync` parts: the ring producer, the xrun counter and the real
-//! sample rate.
+//! `Send + Sync` parts: the ring producer, the garbage consumer, the xrun
+//! counter, the note-routing index and the real sample rate.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, SyncSender};
@@ -14,13 +14,17 @@ use std::sync::{Arc, Mutex};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use rtrb::{Consumer, Producer, RingBuffer};
 
-use crate::control::ControlMsg;
-use crate::engine::graph::{CompiledGraph, GraphError};
+use crate::control::project::{GraphIndex, ProjectError};
+use crate::control::sequencer::Schedule;
+use crate::control::{ControlMsg, EngineInit};
+use crate::engine::graph::GraphError;
 use crate::engine::rt::RtState;
 use crate::engine::MAX_BLOCK;
 
 /// Capacity of the control→audio ring (per ARCHITECTURE.md).
 const CONTROL_RING_CAPACITY: usize = 1024;
+/// Capacity of the audio→control garbage ring for displaced schedules.
+const GARBAGE_RING_CAPACITY: usize = 8;
 /// Block size requested from the device where it advertises a usable range.
 const DESIRED_BUFFER: u32 = 256;
 
@@ -40,11 +44,18 @@ pub enum EngineError {
     ThreadSpawn,
     #[error(transparent)]
     Graph(#[from] GraphError),
+    #[error(transparent)]
+    Project(#[from] ProjectError),
 }
 
 /// Control-side handle to the running audio engine.
 pub struct AudioEngine {
     commands: Mutex<Producer<ControlMsg>>,
+    /// Displaced schedules returned by the audio thread, dropped here off-RT.
+    garbage: Mutex<Consumer<Box<Schedule>>>,
+    /// Track → node routing of the running graph, used to resolve a reloaded
+    /// project's notes against the topology already on the audio thread.
+    index: GraphIndex,
     xruns: Arc<AtomicU32>,
     sample_rate: u32,
     /// Kept alive to hold the audio thread open; dropping it releases the
@@ -54,13 +65,12 @@ pub struct AudioEngine {
 }
 
 impl AudioEngine {
-    /// Start the engine. `make_graph` compiles the audio graph once the real
-    /// sample rate is known, on the audio thread.
-    pub fn start<F>(make_graph: F) -> Result<Self, EngineError>
-    where
-        F: FnOnce(f32, usize) -> Result<CompiledGraph, GraphError> + Send + 'static,
-    {
+    /// Start the engine. `init` compiles the graph and builds the schedule once
+    /// the real sample rate is known, on the audio thread; `index` is the
+    /// note-routing of that graph, kept for later `load_project` calls.
+    pub fn start(init: EngineInit, index: GraphIndex) -> Result<Self, EngineError> {
         let (producer, consumer) = RingBuffer::<ControlMsg>::new(CONTROL_RING_CAPACITY);
+        let (garbage_prod, garbage_cons) = RingBuffer::<Box<Schedule>>::new(GARBAGE_RING_CAPACITY);
         let xruns = Arc::new(AtomicU32::new(0));
         let (shutdown_tx, shutdown_rx) = mpsc::sync_channel::<()>(0);
         let (ready_tx, ready_rx) = mpsc::channel::<Result<u32, EngineError>>();
@@ -69,7 +79,7 @@ impl AudioEngine {
         std::thread::Builder::new()
             .name("telenn-audio".into())
             .spawn(
-                move || match build_stream(consumer, xruns_audio, make_graph) {
+                move || match build_stream(consumer, garbage_prod, xruns_audio, init) {
                     Ok((stream, sample_rate)) => {
                         if stream.play().is_err() {
                             let _ = ready_tx.send(Err(EngineError::StreamPlay));
@@ -91,6 +101,8 @@ impl AudioEngine {
 
         Ok(Self {
             commands: Mutex::new(producer),
+            garbage: Mutex::new(garbage_cons),
+            index,
             xruns,
             sample_rate,
             shutdown: shutdown_tx,
@@ -98,12 +110,28 @@ impl AudioEngine {
     }
 
     /// Push a control message to the audio thread. Returns `false` if the ring
-    /// is full (message dropped) or the lock is unavailable.
+    /// is full (message dropped) or the lock is unavailable. Also drains any
+    /// schedules the audio thread returned, dropping them here (off-RT).
     pub fn send(&self, msg: ControlMsg) -> bool {
+        self.drain_garbage();
         match self.commands.lock() {
             Ok(mut producer) => producer.push(msg).is_ok(),
             Err(_) => false,
         }
+    }
+
+    /// Drop every schedule the audio thread handed back. Off the real-time path.
+    fn drain_garbage(&self) {
+        if let Ok(mut cons) = self.garbage.lock() {
+            while let Ok(old) = cons.pop() {
+                drop(old);
+            }
+        }
+    }
+
+    /// Note-routing index of the running graph.
+    pub fn index(&self) -> &GraphIndex {
+        &self.index
     }
 
     pub fn xruns(&self) -> u32 {
@@ -117,14 +145,12 @@ impl AudioEngine {
 
 /// Open the default output device and build the f32 output stream. Returns the
 /// stream and the real sample rate obtained (never assume it).
-fn build_stream<F>(
+fn build_stream(
     mut consumer: Consumer<ControlMsg>,
+    garbage: Producer<Box<Schedule>>,
     xruns: Arc<AtomicU32>,
-    make_graph: F,
-) -> Result<(cpal::Stream, u32), EngineError>
-where
-    F: FnOnce(f32, usize) -> Result<CompiledGraph, GraphError>,
-{
+    init: EngineInit,
+) -> Result<(cpal::Stream, u32), EngineError> {
     let host = cpal::default_host();
     let device = host.default_output_device().ok_or(EngineError::NoDevice)?;
     let supported = device
@@ -151,8 +177,8 @@ where
     let sample_rate = config.sample_rate;
     let channels = config.channels as usize;
 
-    let graph = make_graph(sample_rate as f32, MAX_BLOCK)?;
-    let mut rt = RtState::new(sample_rate as f32, graph);
+    let (graph, schedule) = init(sample_rate as f32, MAX_BLOCK)?;
+    let mut rt = RtState::new(sample_rate as f32, graph, schedule, garbage);
     let err_xruns = Arc::clone(&xruns);
 
     let stream = device

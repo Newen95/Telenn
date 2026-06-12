@@ -87,6 +87,13 @@ impl CompiledGraph {
         }
     }
 
+    /// Release every sounding voice across all nodes (transport stop). // RT-SAFE
+    pub fn all_notes_off(&mut self) {
+        for n in &mut self.nodes {
+            n.all_notes_off();
+        }
+    }
+
     /// Drop all queued notes (called once the block has consumed them). // RT-SAFE
     pub fn clear_notes(&mut self) {
         for buf in &mut self.node_notes {

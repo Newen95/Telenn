@@ -9,6 +9,10 @@ import { invoke } from "@tauri-apps/api/core";
 const SYNTH_NODE = 0;
 const FIRST_PITCH = 60; // middle C
 
+// Dev paths, relative to the backend working directory (src-tauri/ in dev).
+const DEMO_PATH = "../projects/demo/song.json";
+const EXPORT_PATH = "../projects/demo/export.wav";
+
 // Computer-keyboard layout, by physical key code (layout-independent, so it
 // works on AZERTY too). Lets you hold a note on the keyboard while sweeping a
 // slider with the mouse. White keys on the home row, black keys above.
@@ -42,6 +46,37 @@ const paramValues = reactive<Record<number, number>>({});
 const xruns = ref(0);
 const sampleRate = ref(0);
 let statusTimer: number | undefined;
+
+const playing = ref(false);
+const actionMsg = ref("");
+
+async function play() {
+  await invoke("transport_play");
+  playing.value = true;
+}
+
+async function stop() {
+  await invoke("transport_stop");
+  playing.value = false;
+}
+
+async function loadDemo() {
+  try {
+    await invoke("load_project", { path: DEMO_PATH });
+    actionMsg.value = "loaded";
+  } catch (e) {
+    actionMsg.value = String(e);
+  }
+}
+
+async function exportWav() {
+  try {
+    await invoke("export_wav", { projectPath: DEMO_PATH, outPath: EXPORT_PATH });
+    actionMsg.value = "exported";
+  } catch (e) {
+    actionMsg.value = String(e);
+  }
+}
 
 async function noteOn(pitch: number) {
   if (held.has(pitch)) return;
@@ -118,6 +153,17 @@ onUnmounted(() => {
 
 <template>
   <main class="app">
+    <section class="transport">
+      <button type="button" class="tbtn" :class="{ active: playing }" @click="play"
+        title="play the song.json sequence">▶</button>
+      <button type="button" class="tbtn" @click="stop" title="stop">⏹</button>
+      <button type="button" class="tbtn wide" @click="loadDemo"
+        title="re-read projects/demo/song.json from disk and swap the sequence live">reload json</button>
+      <button type="button" class="tbtn wide" @click="exportWav"
+        title="render the project offline to projects/demo/export.wav">export wav</button>
+      <span class="action-msg">{{ actionMsg }}</span>
+    </section>
+
     <section class="params">
       <label v-for="p in params" :key="p.id" class="param">
         <span class="param-name">{{ p.name }}<em v-if="p.unit"> ({{ p.unit }})</em></span>
@@ -174,6 +220,34 @@ body {
   gap: 2rem;
   padding: 2rem;
   box-sizing: border-box;
+}
+
+.transport {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.tbtn {
+  min-width: 2.6rem;
+  padding: 0.4rem 0.7rem;
+  font-family: inherit;
+  border: 1px solid #3a3a3c;
+  border-radius: 6px;
+  background: #2c2c2e;
+  color: #f6f6f6;
+  font-size: 1rem;
+  cursor: pointer;
+}
+
+.tbtn.active {
+  background: #2f7d5b;
+  border-color: #2f7d5b;
+}
+
+.action-msg {
+  font-size: 0.8rem;
+  color: #8e8e93;
 }
 
 .params {

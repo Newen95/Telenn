@@ -4,16 +4,29 @@
 //! Communicates with the audio thread only through lock-free ring buffers.
 
 pub mod commands;
+pub mod project;
+pub mod render;
+pub mod sequencer;
 
-use crate::engine::graph::{compile, CompiledGraph, Connection, GraphDesc, GraphError, NodeDesc};
+use crate::engine::graph::{compile, CompiledGraph};
 use crate::engine::node::{NodeIdx, ParamId};
+use crate::engine::EngineError;
+use crate::modules::registry;
+
+use project::GraphIndex;
+use sequencer::Schedule;
+
+/// The demo project, embedded at build time so the engine always boots with a
+/// playable sequence regardless of the working directory. The same file lives on
+/// disk (`projects/demo/song.json`) for the user to edit and reload via
+/// `load_project`.
+const DEMO_SONG: &str = include_str!("../../../projects/demo/song.json");
 
 /// Compact, allocation-free messages sent from the control side to the audio
 /// thread through an `rtrb` ring buffer. The callback drains all pending
 /// messages at the start of each block before rendering.
 ///
-/// This enum grows over later milestones (per ARCHITECTURE.md: `Seek` at M3,
-/// `SwapGraph` at M4).
+/// `SwapGraph` (topology hot-swap) arrives at M4; M3 only swaps the schedule.
 pub enum ControlMsg {
     Transport(TransportCmd),
     NoteOn {
@@ -30,40 +43,43 @@ pub enum ControlMsg {
         param: ParamId,
         value: f32,
     },
+    /// Replace the playing sequence without interrupting sounding voices. The
+    /// audio thread swaps the box in and returns the old one through the garbage
+    /// ring to be dropped off the real-time thread.
+    SetSchedule(Box<Schedule>),
 }
 
 #[derive(Clone, Copy)]
 pub enum TransportCmd {
     Play,
     Stop,
+    /// Move the playhead to an absolute sample position.
+    Seek(u64),
 }
 
-/// Build the M2 test graph: subtractive synth (node 0) → gain (node 1) → output.
-/// M3 replaces this with a graph compiled from `song.json`.
-pub fn build_test_graph(sample_rate: f32, max_block: usize) -> Result<CompiledGraph, GraphError> {
-    let desc = GraphDesc {
-        nodes: vec![
-            NodeDesc {
-                module_id: "subtractive".into(),
-                params: vec![],
-            },
-            NodeDesc {
-                module_id: "gain".into(),
-                params: vec![],
-            },
-        ],
-        connections: vec![Connection {
-            src_node: 0,
-            src_port: 0,
-            dst_node: 1,
-            dst_port: 0,
-        }],
-        output: 1,
-    };
-    compile(
-        &desc,
-        crate::modules::registry::create,
-        sample_rate,
-        max_block,
-    )
+/// Boxed graph/schedule factory: compiles both once the real sample rate is
+/// known, on the audio thread. Returning a `Box` keeps `AudioEngine::start`
+/// independent of the project layer.
+pub type EngineInit =
+    Box<dyn FnOnce(f32, usize) -> Result<(CompiledGraph, Schedule), EngineError> + Send>;
+
+/// Parse the embedded demo project.
+fn demo_project() -> Result<project::Project, project::ProjectError> {
+    Ok(serde_json::from_str(DEMO_SONG)?)
+}
+
+/// Build the engine initialiser for the demo project and the note-routing index
+/// the control side keeps for later `load_project` calls. The graph topology is
+/// computed here (sample-rate independent); the closure finishes compilation and
+/// builds the schedule once the device sample rate is known.
+pub fn build_demo() -> Result<(EngineInit, GraphIndex), EngineError> {
+    let project = demo_project()?;
+    let (desc, index) = project.to_graph()?;
+    let index_for_engine = index.clone();
+    let init: EngineInit = Box::new(move |sample_rate, max_block| {
+        let graph = compile(&desc, registry::create, sample_rate, max_block)?;
+        let schedule = project.to_schedule(sample_rate as u32, &index)?;
+        Ok((graph, schedule))
+    });
+    Ok((init, index_for_engine))
 }

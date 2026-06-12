@@ -178,6 +178,11 @@ pub trait AudioNode: Send {
     /// smoothing happens inside the node. // RT-SAFE
     fn set_param(&mut self, id: ParamId, value: f32);
 
+    /// Release every sounding voice (transport stop / panic). Voices fade out
+    /// through their normal release, so this stays click-free. Default no-op for
+    /// nodes that hold no voices (effects). // RT-SAFE
+    fn all_notes_off(&mut self) {}
+
     /// Off-thread preparation. All allocation belongs here, never in `process`.
     fn prepare(&mut self, sample_rate: f32, max_block: usize);
 }

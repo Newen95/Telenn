@@ -1,0 +1,7 @@
+# Pinned toolchain so every machine lints and builds identically.
+# rustup reads this file automatically and installs the exact version on first
+# use. Bump `channel` deliberately (and run ./check.sh) when upgrading Rust.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

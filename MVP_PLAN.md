@@ -43,12 +43,12 @@ modèle de données avec le futur graphe libre — on ne jette rien.*
    prendre les dernières stables.
 3. Créer l'arborescence vide de CONTRIBUTING.md (`engine/`, `modules/`, `control/`,
    `telemetry/`) avec des `mod.rs` et un test bidon par dossier.
-4. CI locale : script `check.sh` = `cargo fmt --check && cargo clippy -- -D
+4. CI locale : script `scripts/check.sh` = `cargo fmt --check && cargo clippy -- -D
    warnings && cargo test && npm run build`.
 
 **CA**
 - [ ] `npm run tauri dev` ouvre une fenêtre sur Windows et Linux.
-- [ ] `./check.sh` passe.
+- [ ] `scripts/check.sh` passe.
 
 ---
 
@@ -391,7 +391,7 @@ pendant la lecture.
 - [ ] Export WAV du projet démo : aucun clip > 0 dBFS, pas de DC offset.
 - [ ] 8 pistes + 16 effets à buffer 256 : charge audio < 40 %, zéro xrun
       sur 10 minutes.
-- [ ] `./check.sh` vert, tous les tests des jalons précédents verts.
+- [ ] `scripts/check.sh` vert, tous les tests des jalons précédents verts.
 
 ---
 

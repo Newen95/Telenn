@@ -7,7 +7,7 @@ set -e
 CARGO="${CARGO:-cargo}"
 command -v "$CARGO" >/dev/null 2>&1 || CARGO="$HOME/.cargo/bin/cargo"
 
-ROOT="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 
 (
   cd "$ROOT/src-tauri"

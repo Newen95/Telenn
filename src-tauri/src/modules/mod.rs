@@ -3,8 +3,6 @@
 //! Each module implements the `AudioNode` trait and registers itself in the
 //! module registry. Adding or removing a module never touches the engine core.
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn placeholder() {}
-}
+pub mod _template;
+pub mod registry;
+pub mod subtractive;

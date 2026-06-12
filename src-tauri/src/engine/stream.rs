@@ -15,7 +15,9 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use rtrb::{Consumer, Producer, RingBuffer};
 
 use crate::control::ControlMsg;
+use crate::engine::graph::{CompiledGraph, GraphError};
 use crate::engine::rt::RtState;
+use crate::engine::MAX_BLOCK;
 
 /// Capacity of the control→audio ring (per ARCHITECTURE.md).
 const CONTROL_RING_CAPACITY: usize = 1024;
@@ -36,6 +38,8 @@ pub enum EngineError {
     StreamPlay,
     #[error("could not spawn the audio thread")]
     ThreadSpawn,
+    #[error(transparent)]
+    Graph(#[from] GraphError),
 }
 
 /// Control-side handle to the running audio engine.
@@ -50,7 +54,12 @@ pub struct AudioEngine {
 }
 
 impl AudioEngine {
-    pub fn start() -> Result<Self, EngineError> {
+    /// Start the engine. `make_graph` compiles the audio graph once the real
+    /// sample rate is known, on the audio thread.
+    pub fn start<F>(make_graph: F) -> Result<Self, EngineError>
+    where
+        F: FnOnce(f32, usize) -> Result<CompiledGraph, GraphError> + Send + 'static,
+    {
         let (producer, consumer) = RingBuffer::<ControlMsg>::new(CONTROL_RING_CAPACITY);
         let xruns = Arc::new(AtomicU32::new(0));
         let (shutdown_tx, shutdown_rx) = mpsc::sync_channel::<()>(0);
@@ -59,21 +68,23 @@ impl AudioEngine {
         let xruns_audio = Arc::clone(&xruns);
         std::thread::Builder::new()
             .name("telenn-audio".into())
-            .spawn(move || match build_stream(consumer, xruns_audio) {
-                Ok((stream, sample_rate)) => {
-                    if stream.play().is_err() {
-                        let _ = ready_tx.send(Err(EngineError::StreamPlay));
-                        return;
+            .spawn(
+                move || match build_stream(consumer, xruns_audio, make_graph) {
+                    Ok((stream, sample_rate)) => {
+                        if stream.play().is_err() {
+                            let _ = ready_tx.send(Err(EngineError::StreamPlay));
+                            return;
+                        }
+                        let _ = ready_tx.send(Ok(sample_rate));
+                        // Park until the engine is dropped; `stream` is then dropped
+                        // here, on this thread, never inside the callback.
+                        let _ = shutdown_rx.recv();
                     }
-                    let _ = ready_tx.send(Ok(sample_rate));
-                    // Park until the engine is dropped; `stream` is then dropped
-                    // here, on this thread, never inside the callback.
-                    let _ = shutdown_rx.recv();
-                }
-                Err(e) => {
-                    let _ = ready_tx.send(Err(e));
-                }
-            })
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(e));
+                    }
+                },
+            )
             .map_err(|_| EngineError::ThreadSpawn)?;
 
         let sample_rate = ready_rx.recv().map_err(|_| EngineError::ThreadSpawn)??;
@@ -106,10 +117,14 @@ impl AudioEngine {
 
 /// Open the default output device and build the f32 output stream. Returns the
 /// stream and the real sample rate obtained (never assume it).
-fn build_stream(
+fn build_stream<F>(
     mut consumer: Consumer<ControlMsg>,
     xruns: Arc<AtomicU32>,
-) -> Result<(cpal::Stream, u32), EngineError> {
+    make_graph: F,
+) -> Result<(cpal::Stream, u32), EngineError>
+where
+    F: FnOnce(f32, usize) -> Result<CompiledGraph, GraphError>,
+{
     let host = cpal::default_host();
     let device = host.default_output_device().ok_or(EngineError::NoDevice)?;
     let supported = device
@@ -136,7 +151,8 @@ fn build_stream(
     let sample_rate = config.sample_rate;
     let channels = config.channels as usize;
 
-    let mut rt = RtState::new(sample_rate as f32);
+    let graph = make_graph(sample_rate as f32, MAX_BLOCK)?;
+    let mut rt = RtState::new(sample_rate as f32, graph);
     let err_xruns = Arc::clone(&xruns);
 
     let stream = device

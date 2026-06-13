@@ -6,6 +6,7 @@
 
 use crate::engine::node::AudioNode;
 use crate::modules::_template::Gain;
+use crate::modules::plucked::Plucked;
 use crate::modules::subtractive::Subtractive;
 
 fn boxed<N: AudioNode + Default + 'static>() -> Box<dyn AudioNode> {
@@ -16,6 +17,7 @@ fn boxed<N: AudioNode + Default + 'static>() -> Box<dyn AudioNode> {
 pub fn create(module_id: &str) -> Option<Box<dyn AudioNode>> {
     match module_id {
         "subtractive" => Some(boxed::<Subtractive>()),
+        "plucked" => Some(boxed::<Plucked>()),
         "gain" => Some(boxed::<Gain>()),
         _ => None,
     }

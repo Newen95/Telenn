@@ -4,5 +4,6 @@
 //! module registry. Adding or removing a module never touches the engine core.
 
 pub mod _template;
+pub mod plucked;
 pub mod registry;
 pub mod subtractive;

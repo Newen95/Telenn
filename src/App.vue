@@ -173,7 +173,7 @@ async function refreshStatus() {
 
 onMounted(async () => {
   params.value = await invoke<ParamInfo[]>("module_params", {
-    moduleId: "subtractive",
+    moduleId: "plucked",
   });
   for (const p of params.value) {
     paramValues[p.id] = p.default;

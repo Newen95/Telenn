@@ -7,8 +7,8 @@
       "id": "lead",
       "name": "Lead",
       "chain": [
-        { "id": "lead_synth", "module": "subtractive",
-          "params": { "cutoff": 0.66, "resonance": 0.18, "release": 0.28, "level": 0.7 } }
+        { "id": "lead_synth", "module": "plucked",
+          "params": { "brightness": 0.42, "decay": 0.78, "release": 0.5, "level": 0.72 } }
       ],
       "clips": [
         {
@@ -38,8 +38,8 @@
       "id": "bass",
       "name": "Bass",
       "chain": [
-        { "id": "bass_synth", "module": "subtractive",
-          "params": { "cutoff": 0.4, "resonance": 0.12, "decay": 0.4, "sustain": 0.4, "level": 0.78 } }
+        { "id": "bass_synth", "module": "plucked",
+          "params": { "brightness": 0.28, "decay": 0.86, "release": 0.4, "level": 0.78 } }
       ],
       "clips": [
         {

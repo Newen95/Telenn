@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::control::sequencer::{ticks_to_samples, Schedule, ScheduledEvent, PPQ};
 use crate::engine::graph::{Connection, GraphDesc, NodeDesc};
@@ -55,7 +55,6 @@ pub struct Project {
 pub struct Track {
     pub id: String,
     #[serde(default)]
-    #[allow(dead_code)]
     pub name: String,
     pub chain: Vec<NodeSpec>,
     #[serde(default)]
@@ -75,9 +74,7 @@ pub struct NodeSpec {
 pub struct Clip {
     /// Clip placement and length. In M3 clips are containers only: notes carry
     /// absolute positions and are not windowed by the clip yet.
-    #[allow(dead_code)]
     pub start: String,
-    #[allow(dead_code)]
     pub length: String,
     #[serde(default)]
     pub notes: Vec<Note>,
@@ -110,6 +107,44 @@ fn default_vel() -> u8 {
 #[derive(Debug, Clone, Default)]
 pub struct GraphIndex {
     pub instrument: HashMap<String, NodeIdx>,
+}
+
+/// Render-friendly snapshot of the project for the UI: positions resolved to
+/// **ticks** (so the frontend never reparses `"bar.beat.tick"`). Distinct from
+/// the on-disk shape so the render format can evolve independently.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectView {
+    pub bpm: u32,
+    pub ppq: u64,
+    pub time_signature: [u32; 2],
+    pub tracks: Vec<TrackView>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrackView {
+    pub id: String,
+    pub name: String,
+    pub clips: Vec<ClipView>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClipView {
+    pub start_ticks: u64,
+    pub length_ticks: u64,
+    pub notes: Vec<NoteView>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteView {
+    pub pitch: u8,
+    /// Absolute start in ticks from the song start.
+    pub start_ticks: u64,
+    pub length_ticks: u64,
+    pub vel: u8,
 }
 
 impl Project {
@@ -204,6 +239,43 @@ impl Project {
             },
             index,
         ))
+    }
+
+    /// Render-friendly view with every position resolved to ticks. // off-RT
+    pub fn view(&self) -> Result<ProjectView, ProjectError> {
+        let tpbar = self.ticks_per_bar()?;
+        let tpbeat = self.ticks_per_beat()?;
+        let mut tracks = Vec::with_capacity(self.tracks.len());
+        for track in &self.tracks {
+            let mut clips = Vec::with_capacity(track.clips.len());
+            for clip in &track.clips {
+                let mut notes = Vec::with_capacity(clip.notes.len());
+                for note in &clip.notes {
+                    notes.push(NoteView {
+                        pitch: note.pitch,
+                        start_ticks: position_to_ticks(&note.start, tpbar, tpbeat)?,
+                        length_ticks: duration_to_ticks(&note.length, tpbar, tpbeat)?,
+                        vel: note.vel,
+                    });
+                }
+                clips.push(ClipView {
+                    start_ticks: position_to_ticks(&clip.start, tpbar, tpbeat)?,
+                    length_ticks: duration_to_ticks(&clip.length, tpbar, tpbeat)?,
+                    notes,
+                });
+            }
+            tracks.push(TrackView {
+                id: track.id.clone(),
+                name: track.name.clone(),
+                clips,
+            });
+        }
+        Ok(ProjectView {
+            bpm: self.bpm,
+            ppq: PPQ,
+            time_signature: self.time_signature,
+            tracks,
+        })
     }
 
     /// Build a `NodeDesc` from a chain node spec (validates module + params).
@@ -440,6 +512,19 @@ mod tests {
             schedule.events.iter().all(|e| e.pos < schedule.loop_len),
             "an event sits on or past the loop boundary"
         );
+    }
+
+    #[test]
+    fn view_resolves_positions_to_ticks() {
+        let project: Project = serde_json::from_str(DEMO).unwrap();
+        let view = project.view().unwrap();
+        assert_eq!(view.bpm, 120);
+        assert_eq!(view.ppq, 960);
+        let note = &view.tracks[0].clips[0].notes[0];
+        // "1.1.0" → tick 0 ; length "0.1.0" → one beat = 960 ticks.
+        assert_eq!(note.start_ticks, 0);
+        assert_eq!(note.length_ticks, 960);
+        assert_eq!(note.pitch, 60);
     }
 
     #[test]

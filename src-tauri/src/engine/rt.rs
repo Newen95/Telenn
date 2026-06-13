@@ -14,6 +14,7 @@ use crate::engine::node::{NodeIdx, NoteEvent, NoteKind};
 use crate::engine::params::LinearRamp;
 use crate::engine::swap::{Declick, Garbage};
 use crate::engine::MAX_BLOCK;
+use crate::telemetry::frame::TelemetryFrame;
 
 /// Upper bound on simultaneously sounding sequencer notes we track for release.
 const MAX_SCHEDULED_NOTES: usize = 128;
@@ -101,6 +102,8 @@ pub struct RtState {
     scheduled_on: ActiveNotes,
     /// Audio→control channel carrying displaced schedules and graphs for off-RT drop.
     garbage: Producer<Garbage>,
+    /// Audio→control telemetry ring (one frame per callback; dropped if full).
+    telemetry: Producer<TelemetryFrame>,
 }
 
 impl RtState {
@@ -109,6 +112,7 @@ impl RtState {
         graph: CompiledGraph,
         schedule: Schedule,
         garbage: Producer<Garbage>,
+        telemetry: Producer<TelemetryFrame>,
     ) -> Self {
         let mut master = LinearRamp::new(1.0, 10.0, sample_rate);
         master.set_target(1.0);
@@ -125,6 +129,7 @@ impl RtState {
             playing: false,
             scheduled_on: ActiveNotes::new(),
             garbage,
+            telemetry,
         }
     }
 
@@ -232,6 +237,7 @@ impl RtState {
         }
         let total = out.len() / channels;
         let mut off = 0;
+        let mut peak = 0.0f32;
         while off < total {
             let n = (total - off).min(MAX_BLOCK);
 
@@ -284,6 +290,7 @@ impl RtState {
             let slice = &mut out[off * channels..(off + n) * channels];
             for (frame, &m) in slice.chunks_mut(channels).zip(&self.mix[..n]) {
                 let value = self.declick.apply(m) * self.master.tick();
+                peak = peak.max(value.abs());
                 for c in frame.iter_mut() {
                     *c = value;
                 }
@@ -296,6 +303,14 @@ impl RtState {
         if total == 0 {
             self.graph.clear_notes();
         }
+
+        // One telemetry frame per callback (latest playhead, block peak). Dropped
+        // if the ring is full — the pump drains far faster in practice. // RT-SAFE
+        let _ = self.telemetry.push(TelemetryFrame {
+            playhead_samples: self.cursor.playhead(),
+            playing: self.playing,
+            master_peak: peak,
+        });
     }
 }
 
@@ -320,7 +335,8 @@ pub fn render_offline_via_rtstate(
     let total = schedule.loop_len as usize;
 
     let (prod, _cons) = rtrb::RingBuffer::<Garbage>::new(8);
-    let mut rt = RtState::new(sample_rate as f32, graph, schedule, prod);
+    let (tprod, _t) = rtrb::RingBuffer::<TelemetryFrame>::new(64);
+    let mut rt = RtState::new(sample_rate as f32, graph, schedule, prod, tprod);
     rt.handle(ControlMsg::Transport(TransportCmd::Play));
 
     let mut out = Vec::with_capacity(total);
@@ -382,7 +398,8 @@ mod tests {
         let (init, _index, _project) = crate::control::build_demo().expect("demo builds");
         let (graph, schedule) = init(48_000.0, MAX_BLOCK).expect("graph compiles");
         let (prod, cons) = rtrb::RingBuffer::<Garbage>::new(8);
-        (RtState::new(48_000.0, graph, schedule, prod), cons)
+        let (tprod, _t) = rtrb::RingBuffer::<TelemetryFrame>::new(64);
+        (RtState::new(48_000.0, graph, schedule, prod, tprod), cons)
     }
 
     #[test]
@@ -477,7 +494,8 @@ mod tests {
             events: vec![],
             loop_len: 192_000,
         };
-        let mut rt = RtState::new(48_000.0, graph, empty, prod);
+        let (tprod, _t) = rtrb::RingBuffer::<TelemetryFrame>::new(64);
+        let mut rt = RtState::new(48_000.0, graph, empty, prod, tprod);
 
         rt.handle(ControlMsg::Transport(TransportCmd::Play));
         let mut out = vec![0.0f32; 4096 * 2];
@@ -643,7 +661,8 @@ mod tests {
         };
         let graph_a = compile(&tail, test_support::create, 48_000.0, MAX_BLOCK).unwrap();
         let (prod, _cons) = rtrb::RingBuffer::<Garbage>::new(8);
-        let mut rt = RtState::new(48_000.0, graph_a, Schedule::default(), prod);
+        let (tprod, _t) = rtrb::RingBuffer::<TelemetryFrame>::new(64);
+        let mut rt = RtState::new(48_000.0, graph_a, Schedule::default(), prod, tprod);
 
         let mut buf = vec![0.0f32; 256];
         rt.process(&mut buf, 1);

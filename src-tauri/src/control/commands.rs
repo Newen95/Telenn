@@ -4,7 +4,7 @@ use std::sync::Mutex;
 
 use tauri::State;
 
-use crate::control::project::Project;
+use crate::control::project::{Project, ProjectView};
 use crate::control::undo::EditHistory;
 use crate::control::{graph_edit, render, ControlMsg, TransportCmd};
 use crate::engine::graph::{compile, GraphDesc};
@@ -150,6 +150,13 @@ pub struct GraphNodeInfo {
     pub id: String,
     pub module: String,
     pub is_instrument: bool,
+}
+
+/// The current project as a render-friendly view (positions in ticks) for the UI.
+#[tauri::command]
+pub fn project_view(history: State<'_, Mutex<EditHistory>>) -> Result<ProjectView, String> {
+    let history = history.lock().map_err(|_| "edit state poisoned")?;
+    history.project().view().map_err(|e| e.to_string())
 }
 
 #[tauri::command]

@@ -20,13 +20,12 @@ use crate::engine::graph::GraphError;
 use crate::engine::rt::RtState;
 use crate::engine::swap::Garbage;
 use crate::engine::MAX_BLOCK;
+use crate::telemetry::frame::TelemetryFrame;
 
 /// Capacity of the control→audio ring (per ARCHITECTURE.md).
 const CONTROL_RING_CAPACITY: usize = 1024;
 /// Capacity of the audio→control garbage ring for displaced schedules and graphs.
 const GARBAGE_RING_CAPACITY: usize = 8;
-/// Block size requested from the device where it advertises a usable range.
-const DESIRED_BUFFER: u32 = 256;
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -36,8 +35,8 @@ pub enum EngineError {
     Config,
     #[error("unsupported sample format (f32 expected)")]
     UnsupportedFormat,
-    #[error("could not build the output stream")]
-    BuildStream,
+    #[error("could not build the output stream: {0}")]
+    BuildStream(String),
     #[error("could not start the output stream")]
     StreamPlay,
     #[error("could not spawn the audio thread")]
@@ -68,7 +67,11 @@ impl AudioEngine {
     /// Start the engine. `init` compiles the graph and builds the schedule once
     /// the real sample rate is known, on the audio thread; `index` is the
     /// note-routing of that graph, kept for later `load_project` calls.
-    pub fn start(init: EngineInit, index: GraphIndex) -> Result<Self, EngineError> {
+    pub fn start(
+        init: EngineInit,
+        index: GraphIndex,
+        telemetry: Producer<TelemetryFrame>,
+    ) -> Result<Self, EngineError> {
         let (producer, consumer) = RingBuffer::<ControlMsg>::new(CONTROL_RING_CAPACITY);
         let (garbage_prod, garbage_cons) = RingBuffer::<Garbage>::new(GARBAGE_RING_CAPACITY);
         let xruns = Arc::new(AtomicU32::new(0));
@@ -78,8 +81,8 @@ impl AudioEngine {
         let xruns_audio = Arc::clone(&xruns);
         std::thread::Builder::new()
             .name("telenn-audio".into())
-            .spawn(
-                move || match build_stream(consumer, garbage_prod, xruns_audio, init) {
+            .spawn(move || {
+                match build_stream(consumer, garbage_prod, telemetry, xruns_audio, init) {
                     Ok((stream, sample_rate)) => {
                         if stream.play().is_err() {
                             let _ = ready_tx.send(Err(EngineError::StreamPlay));
@@ -93,8 +96,8 @@ impl AudioEngine {
                     Err(e) => {
                         let _ = ready_tx.send(Err(e));
                     }
-                },
-            )
+                }
+            })
             .map_err(|_| EngineError::ThreadSpawn)?;
 
         let sample_rate = ready_rx.recv().map_err(|_| EngineError::ThreadSpawn)??;
@@ -148,6 +151,7 @@ impl AudioEngine {
 fn build_stream(
     mut consumer: Consumer<ControlMsg>,
     garbage: Producer<Garbage>,
+    telemetry: Producer<TelemetryFrame>,
     xruns: Arc<AtomicU32>,
     init: EngineInit,
 ) -> Result<(cpal::Stream, u32), EngineError> {
@@ -161,24 +165,18 @@ fn build_stream(
         return Err(EngineError::UnsupportedFormat);
     }
 
-    // Request 256-frame blocks where the device advertises a usable range; fall
-    // back to the host default when the range is unknown (e.g. WASAPI), so the
-    // stream never fails to build over buffer sizing alone.
-    let buffer_size = match supported.buffer_size() {
-        cpal::SupportedBufferSize::Range { min, max } => {
-            cpal::BufferSize::Fixed(DESIRED_BUFFER.clamp(*min, *max))
-        }
-        cpal::SupportedBufferSize::Unknown => cpal::BufferSize::Default,
-    };
-
     let mut config: cpal::StreamConfig = supported.into();
-    config.buffer_size = buffer_size;
+    // Use the device's native buffer size. A `Fixed` request is rejected by
+    // WASAPI shared mode ("not supported in shared mode") even when the device
+    // advertises a range, so we don't force one; the engine processes any block
+    // size in `MAX_BLOCK` chunks and the default latency (~10 ms) is fine.
+    config.buffer_size = cpal::BufferSize::Default;
 
     let sample_rate = config.sample_rate;
     let channels = config.channels as usize;
 
     let (graph, schedule) = init(sample_rate as f32, MAX_BLOCK)?;
-    let mut rt = RtState::new(sample_rate as f32, graph, schedule, garbage);
+    let mut rt = RtState::new(sample_rate as f32, graph, schedule, garbage, telemetry);
     let err_xruns = Arc::clone(&xruns);
 
     let stream = device
@@ -198,7 +196,7 @@ fn build_stream(
             },
             None,
         )
-        .map_err(|_| EngineError::BuildStream)?;
+        .map_err(|e| EngineError::BuildStream(e.to_string()))?;
 
     Ok((stream, sample_rate))
 }

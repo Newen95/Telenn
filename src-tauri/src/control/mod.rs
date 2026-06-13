@@ -8,6 +8,7 @@ pub mod graph_edit;
 pub mod project;
 pub mod render;
 pub mod sequencer;
+pub mod telemetry_pump;
 pub mod undo;
 
 use crate::engine::graph::{compile, CompiledGraph};

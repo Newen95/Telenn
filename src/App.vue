@@ -1,21 +1,27 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, reactive, ref } from "vue";
+import { useI18n } from "vue-i18n";
 import { invoke } from "@tauri-apps/api/core";
 
-// Dev UI for M2: a one-octave keyboard playing the subtractive synth (node 0)
-// and a slider per declared parameter. Glyphs and raw technical labels on
-// purpose — vue-i18n lands with the real UI at M5.
+import TransportBar from "./views/transport/TransportBar.vue";
+import TimelineCanvas from "./views/timeline/TimelineCanvas.vue";
+import PianoRollCanvas from "./views/pianoroll/PianoRollCanvas.vue";
+import { useProjectStore } from "./stores/project";
+import { useTelemetryStore } from "./stores/telemetry";
+
+const { t } = useI18n();
+const project = useProjectStore();
+const telemetry = useTelemetryStore();
+const selectedTrackId = ref("");
+
+// --- Dev panel (raw technical labels, not i18n): keyboard, graph edit, sliders.
 
 const SYNTH_NODE = 0;
 const FIRST_PITCH = 60; // middle C
-
-// Dev paths, relative to the backend working directory (src-tauri/ in dev).
 const DEMO_PATH = "../projects/demo/song.json";
 const EXPORT_PATH = "../projects/demo/export.wav";
 
-// Computer-keyboard layout, by physical key code (layout-independent, so it
-// works on AZERTY too). Lets you hold a note on the keyboard while sweeping a
-// slider with the mouse. White keys on the home row, black keys above.
+// Computer-keyboard layout by physical key code (works on AZERTY too).
 const KEYMAP: Record<string, number> = {
   KeyA: 0, KeyW: 1, KeyS: 2, KeyE: 3, KeyD: 4, KeyF: 5,
   KeyT: 6, KeyG: 7, KeyY: 8, KeyH: 9, KeyU: 10, KeyJ: 11, KeyK: 12,
@@ -28,12 +34,13 @@ interface ParamInfo {
   default: number;
 }
 
-interface EngineStatus {
-  xruns: number;
-  sampleRate: number;
+interface GraphNode {
+  trackId: string;
+  id: string;
+  module: string;
+  isInstrument: boolean;
 }
 
-// One octave of keys (C to C). `black` drives styling only.
 const keys = Array.from({ length: 13 }, (_, i) => ({
   pitch: FIRST_PITCH + i,
   black: [1, 3, 6, 8, 10].includes(i % 12),
@@ -42,23 +49,11 @@ const keys = Array.from({ length: 13 }, (_, i) => ({
 const held = reactive(new Set<number>());
 const params = ref<ParamInfo[]>([]);
 const paramValues = reactive<Record<number, number>>({});
-
+const graphNodes = ref<GraphNode[]>([]);
 const xruns = ref(0);
-const sampleRate = ref(0);
-let statusTimer: number | undefined;
-
-const playing = ref(false);
 const actionMsg = ref("");
-
-async function play() {
-  await invoke("transport_play");
-  playing.value = true;
-}
-
-async function stop() {
-  await invoke("transport_stop");
-  playing.value = false;
-}
+let fxCounter = 0;
+let statusTimer: number | undefined;
 
 async function loadDemo() {
   try {
@@ -78,18 +73,6 @@ async function exportWav() {
   }
 }
 
-// --- Hot-swap dev controls: edit the effect chains while audio plays. ---
-
-interface GraphNode {
-  trackId: string;
-  id: string;
-  module: string;
-  isInstrument: boolean;
-}
-
-const graphNodes = ref<GraphNode[]>([]);
-let fxCounter = 0;
-
 async function refreshGraph() {
   graphNodes.value = await invoke<GraphNode[]>("graph_nodes");
 }
@@ -102,12 +85,11 @@ async function runEdit(command: string, args: Record<string, unknown>, label: st
     actionMsg.value = String(e);
   }
   await refreshGraph();
+  await project.load(); // reflect the edit in the views
 }
 
 function insertEffect(trackId: string) {
   fxCounter += 1;
-  // Insert the gain attenuating (~-17 dB) so the edit is audible: the track
-  // drops on insert, returns on remove — proving the swap landed, click-free.
   void runEdit(
     "graph_insert_effect",
     { trackId, module: "gain", id: `${trackId}_fx${fxCounter}`, params: { gain: 0.6 } },
@@ -133,14 +115,9 @@ async function noteOff(pitch: number) {
 }
 
 function releaseAll() {
-  // Snapshot: noteOff mutates `held` while we iterate.
-  for (const pitch of [...held]) {
-    void noteOff(pitch);
-  }
+  for (const pitch of [...held]) void noteOff(pitch);
 }
 
-// Press a key with the pointer. Release the implicit pointer capture so that
-// dragging fires enter/leave on the *other* keys (glissando), one note at a time.
 function pressPointer(event: PointerEvent, pitch: number) {
   const target = event.target as Element;
   if (target.hasPointerCapture?.(event.pointerId)) {
@@ -166,18 +143,16 @@ function onKeyUp(event: KeyboardEvent) {
 }
 
 async function refreshStatus() {
-  const status = await invoke<EngineStatus>("engine_status");
+  const status = await invoke<{ xruns: number; sampleRate: number }>("engine_status");
   xruns.value = status.xruns;
-  sampleRate.value = status.sampleRate;
 }
 
 onMounted(async () => {
-  params.value = await invoke<ParamInfo[]>("module_params", {
-    moduleId: "plucked",
-  });
-  for (const p of params.value) {
-    paramValues[p.id] = p.default;
-  }
+  await telemetry.init();
+  await project.load();
+  selectedTrackId.value = project.tracks[0]?.id ?? "";
+  params.value = await invoke<ParamInfo[]>("module_params", { moduleId: "plucked" });
+  for (const p of params.value) paramValues[p.id] = p.default;
   window.addEventListener("keydown", onKeyDown);
   window.addEventListener("keyup", onKeyUp);
   void refreshGraph();
@@ -188,80 +163,92 @@ onMounted(async () => {
 onUnmounted(() => {
   window.removeEventListener("keydown", onKeyDown);
   window.removeEventListener("keyup", onKeyUp);
-  if (statusTimer !== undefined) {
-    window.clearInterval(statusTimer);
-  }
+  if (statusTimer !== undefined) window.clearInterval(statusTimer);
 });
 </script>
 
 <template>
-  <main class="app">
-    <section class="transport">
-      <button type="button" class="tbtn" :class="{ active: playing }" @click="play"
-        title="play the song.json sequence">▶</button>
-      <button type="button" class="tbtn" @click="stop" title="stop">⏹</button>
-      <button type="button" class="tbtn wide" @click="loadDemo"
-        title="re-read projects/demo/song.json from disk and swap the sequence live">reload json</button>
-      <button type="button" class="tbtn wide" @click="exportWav"
-        title="render the project offline to projects/demo/export.wav">export wav</button>
-      <span class="action-msg">{{ actionMsg }}</span>
+  <div class="app">
+    <TransportBar />
+
+    <section class="view">
+      <h2 class="view-title">{{ t("view.timeline") }}</h2>
+      <div class="timeline-pane"><TimelineCanvas /></div>
     </section>
 
-    <section class="graph">
-      <div v-for="n in graphNodes" :key="n.id" class="graph-row">
-        <span class="node" :class="{ instrument: n.isInstrument }">
-          {{ n.trackId }} / {{ n.id }} <em>({{ n.module }})</em>
-        </span>
-        <template v-if="n.isInstrument">
-          <button type="button" class="gbtn" @click="insertEffect(n.trackId)"
-            title="append a gain effect to this chain and hot-swap">+ gain</button>
-        </template>
-        <template v-else>
-          <button type="button" class="gbtn" @click="moveNode(n.id, -1)" title="move earlier">◀</button>
-          <button type="button" class="gbtn" @click="moveNode(n.id, 1)" title="move later">▶</button>
-          <button type="button" class="gbtn" @click="removeNode(n.id)" title="remove">✕</button>
-        </template>
-      </div>
-      <div class="graph-actions">
-        <button type="button" class="gbtn" @click="graphUndo">undo</button>
-        <button type="button" class="gbtn" @click="graphRedo">redo</button>
+    <section class="view grow">
+      <header class="view-head">
+        <h2 class="view-title">{{ t("view.pianoRoll") }}</h2>
+        <select v-model="selectedTrackId" class="track-select">
+          <option v-for="t in project.tracks" :key="t.id" :value="t.id">{{ t.name || t.id }}</option>
+        </select>
+      </header>
+      <div class="pianoroll-pane">
+        <PianoRollCanvas v-if="selectedTrackId" :track-id="selectedTrackId" />
       </div>
     </section>
 
-    <section class="params">
-      <label v-for="p in params" :key="p.id" class="param">
-        <span class="param-name">{{ p.name }}<em v-if="p.unit"> ({{ p.unit }})</em></span>
-        <input
-          type="range"
-          min="0"
-          max="1"
-          step="0.001"
-          :value="paramValues[p.id]"
-          @input="onParam(p.id, ($event.target as HTMLInputElement).valueAsNumber)"
-        />
-      </label>
-    </section>
+    <details class="dev">
+      <summary>dev</summary>
+      <div class="dev-body">
+        <div class="dev-actions">
+          <button type="button" class="gbtn" @click="loadDemo">reload json</button>
+          <button type="button" class="gbtn" @click="exportWav">export wav</button>
+          <span class="action-msg">{{ actionMsg }}</span>
+          <span class="action-msg">xruns {{ xruns }}</span>
+        </div>
 
-    <section class="keyboard" @pointerleave="releaseAll">
-      <button
-        v-for="k in keys"
-        :key="k.pitch"
-        class="key"
-        :class="{ black: k.black, held: held.has(k.pitch) }"
-        type="button"
-        @pointerdown="pressPointer($event, k.pitch)"
-        @pointerenter="$event.buttons === 1 && noteOn(k.pitch)"
-        @pointerleave="noteOff(k.pitch)"
-        @pointerup="noteOff(k.pitch)"
-        @pointercancel="noteOff(k.pitch)"
-      ></button>
-    </section>
+        <div class="graph">
+          <div v-for="n in graphNodes" :key="n.id" class="graph-row">
+            <span class="node" :class="{ instrument: n.isInstrument }">
+              {{ n.trackId }} / {{ n.id }} <em>({{ n.module }})</em>
+            </span>
+            <template v-if="n.isInstrument">
+              <button type="button" class="gbtn" @click="insertEffect(n.trackId)">+ gain</button>
+            </template>
+            <template v-else>
+              <button type="button" class="gbtn" @click="moveNode(n.id, -1)">◀</button>
+              <button type="button" class="gbtn" @click="moveNode(n.id, 1)">▶</button>
+              <button type="button" class="gbtn" @click="removeNode(n.id)">✕</button>
+            </template>
+          </div>
+          <div class="graph-actions">
+            <button type="button" class="gbtn" @click="graphUndo">undo</button>
+            <button type="button" class="gbtn" @click="graphRedo">redo</button>
+          </div>
+        </div>
 
-    <dl class="status">
-      <div><dt>kHz</dt><dd>{{ (sampleRate / 1000).toFixed(1) }}</dd></div>
-      <div><dt>xruns</dt><dd>{{ xruns }}</dd></div>
-    </dl>
-  </main>
+        <div class="params">
+          <label v-for="p in params" :key="p.id" class="param">
+            <span class="param-name">{{ p.name }}<em v-if="p.unit"> ({{ p.unit }})</em></span>
+            <input
+              type="range"
+              min="0"
+              max="1"
+              step="0.001"
+              :value="paramValues[p.id]"
+              @input="onParam(p.id, ($event.target as HTMLInputElement).valueAsNumber)"
+            />
+          </label>
+        </div>
+
+        <div class="keyboard" @pointerleave="releaseAll">
+          <button
+            v-for="k in keys"
+            :key="k.pitch"
+            class="key"
+            :class="{ black: k.black, held: held.has(k.pitch) }"
+            type="button"
+            @pointerdown="pressPointer($event, k.pitch)"
+            @pointerenter="$event.buttons === 1 && noteOn(k.pitch)"
+            @pointerleave="noteOff(k.pitch)"
+            @pointerup="noteOff(k.pitch)"
+            @pointercancel="noteOff(k.pitch)"
+          ></button>
+        </div>
+      </div>
+    </details>
+  </div>
 </template>
 
 <style>
@@ -276,37 +263,82 @@ body {
 }
 
 .app {
-  min-height: 100vh;
+  height: 100vh;
   display: flex;
   flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 2rem;
-  padding: 2rem;
   box-sizing: border-box;
 }
 
-.transport {
+.view {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.view.grow {
+  flex: 1;
+}
+
+.view-head {
   display: flex;
   align-items: center;
   gap: 0.6rem;
 }
 
-.tbtn {
-  min-width: 2.6rem;
-  padding: 0.4rem 0.7rem;
-  font-family: inherit;
-  border: 1px solid #3a3a3c;
-  border-radius: 6px;
-  background: #2c2c2e;
-  color: #f6f6f6;
-  font-size: 1rem;
-  cursor: pointer;
+.view-title {
+  margin: 0;
+  padding: 0.3rem 0.8rem;
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #8e8e93;
 }
 
-.tbtn.active {
-  background: #2f7d5b;
-  border-color: #2f7d5b;
+.track-select {
+  background: #2c2c2e;
+  color: #f6f6f6;
+  border: 1px solid #3a3a3c;
+  border-radius: 4px;
+  font-family: inherit;
+  font-size: 0.8rem;
+  padding: 0.1rem 0.3rem;
+}
+
+.timeline-pane {
+  height: 110px;
+}
+
+.pianoroll-pane {
+  flex: 1;
+  min-height: 0;
+}
+
+/* --- dev panel --- */
+.dev {
+  border-top: 1px solid #2c2c2e;
+  background: #161618;
+  font-size: 0.8rem;
+}
+
+.dev > summary {
+  cursor: pointer;
+  padding: 0.3rem 0.8rem;
+  color: #8e8e93;
+  user-select: none;
+}
+
+.dev-body {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  padding: 0.8rem;
+}
+
+.dev-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
 }
 
 .action-msg {
@@ -319,7 +351,6 @@ body {
   flex-direction: column;
   gap: 0.3rem;
   width: min(640px, 100%);
-  font-size: 0.8rem;
 }
 
 .graph-row {
@@ -371,7 +402,6 @@ body {
   display: flex;
   flex-direction: column;
   gap: 0.3rem;
-  font-size: 0.8rem;
 }
 
 .param-name {
@@ -389,7 +419,7 @@ body {
 
 .keyboard {
   display: flex;
-  height: 9rem;
+  height: 7rem;
   touch-action: none;
 }
 
@@ -407,28 +437,5 @@ body {
 
 .key.held {
   background: #2f7d5b;
-}
-
-.status {
-  display: flex;
-  gap: 2rem;
-  margin: 0;
-  font-variant-numeric: tabular-nums;
-}
-
-.status div {
-  text-align: center;
-}
-
-.status dt {
-  font-size: 0.7rem;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-  color: #8e8e93;
-}
-
-.status dd {
-  margin: 0.2rem 0 0;
-  font-size: 1.3rem;
 }
 </style>

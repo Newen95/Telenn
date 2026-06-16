@@ -56,7 +56,7 @@ pub fn insert_effect(
     track.chain.push(NodeSpec {
         id: node_id.to_string(),
         module: module.to_string(),
-        params,
+        params: params.into_iter().collect(),
     });
     Ok(())
 }

@@ -11,6 +11,8 @@ export interface Block {
   lenTick: number;
   lane: number;
   color: string;
+  /** Opaque handle the view's edit adapter interprets (a note or clip id). */
+  ref?: unknown;
 }
 
 export interface Grid {
@@ -18,11 +20,42 @@ export interface Grid {
   ticksPerBeat: number;
 }
 
+/** Transient editing overlay: the drag ghost and the current selection. */
+export interface Overlay {
+  ghost?: Block | null;
+  selected?: Block | null;
+}
+
+/** Per-lane look of one gutter row (the piano roll's keyboard column). */
+export interface LaneKey {
+  /** A black key (drawn darker). */
+  dark: boolean;
+  /** Octave label, drawn on this row only when set (e.g. "C4"). */
+  label?: string;
+  /** This pitch is currently sounding (brief highlight). */
+  lit?: boolean;
+}
+
+/** Left keyboard gutter for the piano roll. Width must equal `vp.originX`. */
+export interface GutterStyle {
+  width: number;
+  lane(lane: number): LaneKey;
+}
+
 const BG = "#161618";
 const LANE_LINE = "#232325";
 const BEAT_LINE = "#2a2a2c";
 const BAR_LINE = "#3c3c3f";
 const PLAYHEAD = "#e0b050";
+const SELECTED = "#f6f6f6";
+const GHOST_FILL = "rgba(246, 246, 246, 0.35)";
+const GUTTER_BG = "#161618";
+const GUTTER_WHITE = "#e6e6e9"; // bright white keys, read at a glance
+const GUTTER_BLACK = "#1b1b1d"; // near-black keys
+const GUTTER_ROW = "#0d0d0e"; // crisp separation between key rows
+const GUTTER_EDGE = "#000000"; // border between gutter and grid
+const GUTTER_LABEL = "#4a4a4c"; // dark label, legible on a white key
+const GUTTER_LIT = "#e0b050"; // a sounding key lights up (shared with playback)
 
 /** Draw a frame. `w`/`h` are CSS pixels; `ctx` is already scaled by the dpr. */
 export function draw(
@@ -34,6 +67,8 @@ export function draw(
   blocks: Block[],
   laneCount: number,
   playheadTick: number,
+  overlay?: Overlay,
+  gutter?: GutterStyle,
 ): void {
   ctx.fillStyle = BG;
   ctx.fillRect(0, 0, w, h);
@@ -76,6 +111,17 @@ export function draw(
     ctx.fillRect(x, y + 1, Math.max(bw, 1.5), vp.laneHeight - 2);
   }
 
+  // Selection outline and the drag ghost, on top of the blocks.
+  if (overlay?.selected) outline(ctx, vp, overlay.selected, SELECTED);
+  if (overlay?.ghost) {
+    const g = overlay.ghost;
+    const x = tickToX(vp, g.startTick);
+    const y = laneToY(vp, g.lane);
+    ctx.fillStyle = GHOST_FILL;
+    ctx.fillRect(x, y + 1, Math.max(g.lenTick * vp.pxPerTick, 1.5), vp.laneHeight - 2);
+    outline(ctx, vp, g, SELECTED);
+  }
+
   // Playhead.
   const px = Math.round(tickToX(vp, playheadTick)) + 0.5;
   if (px >= 0 && px <= w) {
@@ -85,6 +131,71 @@ export function draw(
     ctx.lineTo(px, h);
     ctx.stroke();
   }
+
+  // Left inset, painted last and opaque so any grid/notes scrolled behind it are
+  // covered; it owns the [0, originX) column. The piano roll fills it with its
+  // keyboard; other views (timeline) reserve a plain strip so the time axes — and
+  // thus the playheads — line up across both.
+  const gw = vp.originX ?? 0;
+  if (gutter) {
+    drawGutter(ctx, h, vp, gutter, laneCount);
+  } else if (gw > 0) {
+    ctx.fillStyle = GUTTER_BG;
+    ctx.fillRect(0, 0, gw, h);
+    gutterEdge(ctx, h, gw);
+  }
+}
+
+/** Draw the left keyboard gutter: one keycap per visible lane, octave labels. */
+function drawGutter(
+  ctx: CanvasRenderingContext2D,
+  h: number,
+  vp: Viewport,
+  gutter: GutterStyle,
+  laneCount: number,
+): void {
+  const gw = gutter.width;
+  ctx.fillStyle = GUTTER_BG;
+  ctx.fillRect(0, 0, gw, h);
+
+  const first = Math.max(0, yToLane(vp, 0));
+  const last = Math.min(laneCount - 1, yToLane(vp, h));
+  ctx.textBaseline = "middle";
+  ctx.font = "10px sans-serif";
+  for (let lane = first; lane <= last; lane += 1) {
+    const key = gutter.lane(lane);
+    const y = laneToY(vp, lane);
+    // Row separator first, then the keycap inset by 1px so rows read distinctly.
+    ctx.fillStyle = GUTTER_ROW;
+    ctx.fillRect(0, y, gw, vp.laneHeight);
+    ctx.fillStyle = key.lit ? GUTTER_LIT : key.dark ? GUTTER_BLACK : GUTTER_WHITE;
+    ctx.fillRect(0, y + 1, gw - 1, vp.laneHeight - 1);
+    if (key.label) {
+      ctx.fillStyle = GUTTER_LABEL;
+      ctx.fillText(key.label, 4, y + vp.laneHeight / 2 + 0.5);
+    }
+  }
+
+  gutterEdge(ctx, h, gw);
+}
+
+/** The 1px border separating the gutter/inset from the grid. */
+function gutterEdge(ctx: CanvasRenderingContext2D, h: number, gw: number): void {
+  ctx.strokeStyle = GUTTER_EDGE;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(gw - 0.5, 0);
+  ctx.lineTo(gw - 0.5, h);
+  ctx.stroke();
+}
+
+/** Stroke a 1px outline around a block (selection / ghost). */
+function outline(ctx: CanvasRenderingContext2D, vp: Viewport, b: Block, color: string): void {
+  const x = Math.round(tickToX(vp, b.startTick)) + 0.5;
+  const y = Math.round(laneToY(vp, b.lane)) + 0.5;
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(x, y + 1, Math.max(b.lenTick * vp.pxPerTick, 1.5), vp.laneHeight - 2);
 }
 
 /** Topmost block under a point, or `null`. Used by the 5b gesture machine. */

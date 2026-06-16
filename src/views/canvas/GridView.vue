@@ -8,9 +8,30 @@ import { onMounted, ref, watch } from "vue";
 
 import { useProjectStore } from "../../stores/project";
 import { useTelemetryStore } from "../../stores/telemetry";
-import { draw, type Block, type Grid } from "./renderer";
+import { draw, type Block, type Grid, type GutterStyle } from "./renderer";
+import { adaptiveSnap, GridInteractions, snapStepTicks, type EditAdapter } from "./interactions";
 import { useGridCanvas } from "./useGridCanvas";
-import { samplesToTicks, xToTick, type Viewport } from "./viewport";
+import { applyAxis, type TimeAxis } from "./timeAxis";
+import { samplesToTicks, yToLane, type Viewport } from "./viewport";
+import {
+  DEFAULT_PX_PER_TICK,
+  fitView,
+  keyZoomFactor,
+  panBy,
+  readWheel,
+  zoomAt,
+} from "./navigation";
+
+/** A keyboard gutter plus its non-destructive, held preview (piano roll only). */
+export interface GutterSpec extends GutterStyle {
+  /** Press (and hold) the lane's pitch — sounds until `release`. A new lane while
+   *  held is a glissando: the previous pitch stops, the new one sounds. */
+  press(lane: number): void;
+  /** Release the held pitch (pointer up / leaving the view). */
+  release(): void;
+  /** Whether any preview voice is sounding (keeps the highlight animating). */
+  sounding?(): boolean;
+}
 
 const props = defineProps<{
   blocks: Block[];
@@ -19,6 +40,13 @@ const props = defineProps<{
   grid: Grid;
   initialScrollLane?: number;
   initialPxPerTick?: number;
+  /** When set, the view is editable: gestures route through this adapter. */
+  adapter?: EditAdapter;
+  /** When set, a left keyboard gutter is drawn and audible (piano roll). */
+  gutter?: GutterSpec;
+  /** Shared horizontal axis: when set, scroll/zoom/origin are common to all
+   *  views using it, so the playhead lands at the same X everywhere. */
+  axis?: TimeAxis;
 }>();
 
 const project = useProjectStore();
@@ -28,62 +56,289 @@ const canvas = ref<HTMLCanvasElement | null>(null);
 // Plain (non-reactive) viewport: the renderer reads it directly and we redraw
 // explicitly via markDirty, avoiding deep Pinia reactivity on the hot path.
 const vp: Viewport = {
-  scrollTicks: 0,
-  pxPerTick: props.initialPxPerTick ?? 0.03,
+  scrollTicks: props.axis?.scrollTicks ?? 0,
+  pxPerTick: props.axis?.pxPerTick ?? props.initialPxPerTick ?? DEFAULT_PX_PER_TICK,
   scrollLane: props.initialScrollLane ?? 0,
   laneHeight: props.laneHeight,
+  originX: props.axis?.originX ?? props.gutter?.width ?? 0,
 };
 
-const MIN_PX_PER_TICK = 0.004;
-const MAX_PX_PER_TICK = 0.5;
+/** Pull the shared horizontal axis into the local viewport (no-op if unshared).
+ *  Called before every read so pointer maths and drawing see the live axis. */
+function syncAxis(): void {
+  if (props.axis) applyAxis(vp, props.axis);
+}
+
+/** Push the local viewport's horizontal scroll/zoom back to the shared axis. */
+function commitAxis(): void {
+  if (!props.axis) return;
+  props.axis.scrollTicks = vp.scrollTicks;
+  props.axis.pxPerTick = vp.pxPerTick;
+}
+
+// --- Navigation state (mouse + trackpad + keyboard aliases) ---
+// A pan drag in progress (middle button, or the Space "hand tool").
+let panning = false;
+let panLastX = 0;
+let panLastY = 0;
+// Space held → hand tool: a left-drag pans instead of editing (the trackpad's
+// pan, since it has no middle button).
+let spaceHeld = false;
+// Last cursor X, so keyboard zoom (+/-) stays centred where the user is looking.
+let lastPointerX = 0;
+// A held gutter key (the keyboard preview): sounds while pressed, glissandos as
+// the pointer slides to other rows, releases on pointer up.
+let gutterPressing = false;
+let gutterLane = NaN;
+
+/** Topmost lane the view may scroll to, so the last lane can't pass the top. */
+function maxScrollLane(): number {
+  const h = canvas.value?.clientHeight ?? 0;
+  return Math.max(0, props.laneCount - h / vp.laneHeight);
+}
+
+// Editing gesture machine (shared with the timeline). Built only when editable;
+// it reads the live viewport/data so it always sees the current zoom and blocks.
+const fsm = props.adapter
+  ? new GridInteractions({
+      viewport: () => vp,
+      blocks: () => props.blocks,
+      laneCount: () => props.laneCount,
+      snap: (tick, free) => adaptiveSnap(tick, props.grid.ticksPerBeat, vp.pxPerTick, free),
+      snapStep: () => snapStepTicks(props.grid.ticksPerBeat, vp.pxPerTick),
+      adapter: props.adapter,
+    })
+  : null;
 
 function frame(ctx: CanvasRenderingContext2D, w: number, h: number): void {
+  syncAxis();
   const samples = telemetry.currentSamples(performance.now());
   const tick = samplesToTicks(samples, project.bpm, telemetry.sampleRate, project.ppq);
-  draw(ctx, w, h, vp, props.grid, props.blocks, props.laneCount, tick);
+  const overlay = fsm ? { ghost: fsm.ghost(), selected: fsm.selected } : undefined;
+  draw(ctx, w, h, vp, props.grid, props.blocks, props.laneCount, tick, overlay, props.gutter);
 }
 
-const { markDirty } = useGridCanvas(canvas, frame, () => telemetry.playing);
-
-function clamp(v: number, lo: number, hi: number): number {
-  return Math.min(hi, Math.max(lo, v));
+/** True if `x` falls in the keyboard gutter column. */
+function inGutter(x: number): boolean {
+  return !!props.gutter && x < (vp.originX ?? 0);
 }
 
-function onWheel(e: WheelEvent): void {
-  e.preventDefault();
-  if (e.ctrlKey) {
-    // Zoom horizontally around the cursor.
-    const cursorTick = xToTick(vp, e.offsetX);
-    const factor = e.deltaY < 0 ? 1.1 : 1 / 1.1;
-    vp.pxPerTick = clamp(vp.pxPerTick * factor, MIN_PX_PER_TICK, MAX_PX_PER_TICK);
-    vp.scrollTicks = Math.max(0, cursorTick - e.offsetX / vp.pxPerTick);
-  } else if (e.shiftKey) {
-    // Scroll lanes (vertical).
-    const maxLane = Math.max(0, props.laneCount - 1);
-    vp.scrollLane = clamp(vp.scrollLane + Math.sign(e.deltaY), 0, maxLane);
-  } else {
-    // Scroll time (horizontal).
-    vp.scrollTicks = Math.max(0, vp.scrollTicks + e.deltaY / vp.pxPerTick);
+// Redraw every frame while the transport plays or a preview voice is flashing
+// (so the gutter highlight fades on its own without explicit invalidation).
+const { markDirty } = useGridCanvas(
+  canvas,
+  frame,
+  () => telemetry.playing || (props.gutter?.sounding?.() ?? false),
+);
+
+function onPointerDown(e: PointerEvent): void {
+  syncAxis();
+  canvas.value?.focus();
+  // Pan: middle button, or the Space hand tool on the primary button. Both give
+  // the trackpad (no middle button) a drag-to-pan, and never start an edit.
+  if (e.button === 1 || (spaceHeld && e.button === 0)) {
+    e.preventDefault();
+    panning = true;
+    panLastX = e.offsetX;
+    panLastY = e.offsetY;
+    canvas.value?.setPointerCapture(e.pointerId);
+    if (canvas.value) canvas.value.style.cursor = "grabbing";
+    return;
   }
+  // A press on the keyboard gutter plays the lane's pitch and holds it — never an
+  // edit. Capture the pointer so a slide onto other rows (glissando) and the
+  // release are tracked even if the cursor leaves the gutter column.
+  if (inGutter(e.offsetX)) {
+    const lane = yToLane(vp, e.offsetY);
+    if (lane >= 0 && lane < props.laneCount) {
+      gutterPressing = true;
+      gutterLane = lane;
+      canvas.value?.setPointerCapture(e.pointerId);
+      props.gutter?.press(lane);
+      markDirty();
+    }
+    return;
+  }
+  if (!fsm) return;
+  canvas.value?.setPointerCapture(e.pointerId);
+  fsm.onPointerDown(e.offsetX, e.offsetY);
   markDirty();
 }
 
-// Redraw on data changes and on transport start/stop transitions.
-watch(() => props.blocks, markDirty, { deep: false });
-watch(() => telemetry.playing, markDirty);
-
-// Re-center vertically when the data-derived initial lane changes (the project
-// loads asynchronously, after this component has mounted).
-watch(
-  () => props.initialScrollLane,
-  (lane) => {
-    if (lane !== undefined) {
-      vp.scrollLane = lane;
+function onPointerMove(e: PointerEvent): void {
+  lastPointerX = e.offsetX;
+  syncAxis();
+  // A pan drag: move the content with the cursor (drag right → reveal earlier
+  // time / higher lanes), on both axes at once.
+  if (panning) {
+    panBy(vp, panLastX - e.offsetX, panLastY - e.offsetY, maxScrollLane());
+    panLastX = e.offsetX;
+    panLastY = e.offsetY;
+    commitAxis();
+    markDirty();
+    return;
+  }
+  // Glissando while a gutter key is held: switch to the row under the pointer.
+  if (gutterPressing) {
+    const lane = yToLane(vp, e.offsetY);
+    if (lane >= 0 && lane < props.laneCount && lane !== gutterLane) {
+      gutterLane = lane;
+      props.gutter?.press(lane);
       markDirty();
     }
+    return;
+  }
+  if (canvas.value && spaceHeld) {
+    canvas.value.style.cursor = "grab"; // hand tool armed, not yet dragging
+    return;
+  }
+  if (!fsm) return;
+  if (inGutter(e.offsetX)) {
+    if (canvas.value) canvas.value.style.cursor = "pointer";
+    return;
+  }
+  if (fsm.onPointerMove(e.offsetX, e.offsetY, { alt: e.altKey })) {
+    markDirty();
+  } else if (canvas.value) {
+    canvas.value.style.cursor = fsm.cursorAt(e.offsetX, e.offsetY);
+  }
+}
+
+function onPointerUp(e: PointerEvent): void {
+  if (gutterPressing) {
+    gutterPressing = false;
+    gutterLane = NaN;
+    canvas.value?.releasePointerCapture(e.pointerId);
+    props.gutter?.release();
+    markDirty();
+    return;
+  }
+  if (panning) {
+    panning = false;
+    canvas.value?.releasePointerCapture(e.pointerId);
+    if (canvas.value) canvas.value.style.cursor = spaceHeld ? "grab" : "default";
+    return;
+  }
+  if (!fsm) return;
+  canvas.value?.releasePointerCapture(e.pointerId);
+  if (fsm.onPointerUp()) markDirty();
+}
+
+function onDoubleClick(e: MouseEvent): void {
+  if (!fsm || inGutter(e.offsetX)) return;
+  syncAxis();
+  fsm.onDoubleClick(e.offsetX, e.offsetY);
+  markDirty();
+}
+
+function onKeyDown(e: KeyboardEvent): void {
+  // Navigation aliases — available in any grid view, edit adapter or not.
+  // `stopPropagation` keeps these keys from also reaching the dev keyboard
+  // listener on window (e.g. F is mapped there to a synth note).
+  if (e.code === "Space") {
+    if (!spaceHeld) {
+      spaceHeld = true;
+      if (canvas.value) canvas.value.style.cursor = "grab";
+    }
+    e.preventDefault(); // don't scroll the page or click a focused control
+    e.stopPropagation();
+    return;
+  }
+  if (e.key === "+" || e.key === "=") {
+    e.preventDefault();
+    e.stopPropagation();
+    zoomKey(1);
+    return;
+  }
+  if (e.key === "-" || e.key === "_") {
+    e.preventDefault();
+    e.stopPropagation();
+    zoomKey(-1);
+    return;
+  }
+  if (e.key === "f" || e.key === "F") {
+    e.preventDefault();
+    e.stopPropagation();
+    fitToContent();
+    return;
+  }
+  // Editing.
+  if (!fsm) return;
+  if (e.key === "Escape" && fsm.cancel()) {
+    markDirty();
+  } else if ((e.key === "Delete" || e.key === "Backspace") && fsm.deleteSelected()) {
+    e.preventDefault();
+    markDirty();
+  }
+}
+
+function onKeyUp(e: KeyboardEvent): void {
+  if (e.code === "Space") {
+    spaceHeld = false;
+    if (canvas.value && !panning) canvas.value.style.cursor = "default";
+  }
+}
+
+/** Zoom by one keyboard step, centred where the cursor last was. */
+function zoomKey(dir: number): void {
+  syncAxis();
+  zoomAt(vp, lastPointerX, keyZoomFactor(dir));
+  commitAxis();
+  markDirty();
+}
+
+/** Frame all of this view's content (the "tout cadrer" / F command). */
+function fitToContent(): void {
+  syncAxis();
+  const el = canvas.value;
+  fitView(vp, props.blocks, el?.clientWidth ?? 0, el?.clientHeight ?? 0, props.laneCount);
+  commitAxis();
+  markDirty();
+}
+
+function onWheel(e: WheelEvent): void {
+  // Always prevent the browser default: a plain wheel would scroll the page and,
+  // crucially, a trackpad pinch (a wheel event with ctrlKey) would zoom the whole
+  // UI instead of the grid.
+  e.preventDefault();
+  syncAxis();
+  const intent = readWheel(e);
+  if (intent.kind === "zoom") {
+    zoomAt(vp, e.offsetX, intent.factor); // centred on the cursor / pinch point
+  } else {
+    panBy(vp, intent.dxPx, intent.dyPx, maxScrollLane());
+  }
+  commitAxis();
+  markDirty();
+}
+
+// Redraw on data changes and on transport start/stop transitions. After an edit
+// reloads the blocks, re-bind the selection to the fresh block with the same ref
+// (so its outline follows the edit), or drop it if the block is gone.
+watch(
+  () => props.blocks,
+  (blocks) => {
+    if (fsm && fsm.selected) {
+      const ref = fsm.selected.ref;
+      fsm.selected = blocks.find((b) => b.ref === ref) ?? null;
+    }
+    markDirty();
   },
+  { deep: false },
+);
+watch(() => telemetry.playing, markDirty);
+
+// Redraw when another view changes the shared horizontal axis (so a scroll or
+// zoom in one view keeps both in step even while the transport is stopped).
+watch(
+  () => props.axis && [props.axis.scrollTicks, props.axis.pxPerTick, props.axis.originX],
+  markDirty,
+  { deep: true },
 );
 
+// Centre vertically on the track's notes once, at mount. A track switch remounts
+// this component (keyed by track in App.vue), so this re-runs with the new track's
+// range; in-place note edits deliberately leave the scroll where the user put it.
 onMounted(() => {
   vp.scrollLane = props.initialScrollLane ?? 0;
   markDirty();
@@ -91,7 +346,19 @@ onMounted(() => {
 </script>
 
 <template>
-  <canvas ref="canvas" class="grid-canvas" @wheel="onWheel"></canvas>
+  <canvas
+    ref="canvas"
+    class="grid-canvas"
+    :class="{ editable: !!adapter }"
+    tabindex="0"
+    @wheel="onWheel"
+    @pointerdown="onPointerDown"
+    @pointermove="onPointerMove"
+    @pointerup="onPointerUp"
+    @dblclick="onDoubleClick"
+    @keydown="onKeyDown"
+    @keyup="onKeyUp"
+  ></canvas>
 </template>
 
 <style scoped>
@@ -100,5 +367,11 @@ onMounted(() => {
   height: 100%;
   display: block;
   touch-action: none;
+}
+
+/* Editable views are focusable for keyboard delete/undo; selection feedback is
+   drawn on the canvas, so the default focus ring is redundant. */
+.grid-canvas.editable:focus {
+  outline: none;
 }
 </style>

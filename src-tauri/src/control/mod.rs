@@ -3,13 +3,18 @@
 //!
 //! Communicates with the audio thread only through lock-free ring buffers.
 
+pub mod clip_edit;
 pub mod commands;
 pub mod graph_edit;
+pub mod ids;
+pub mod note_edit;
 pub mod project;
 pub mod render;
 pub mod sequencer;
 pub mod telemetry_pump;
 pub mod undo;
+
+use std::path::{Path, PathBuf};
 
 use crate::engine::graph::{compile, CompiledGraph};
 use crate::engine::node::{NodeIdx, ParamId};
@@ -18,6 +23,16 @@ use crate::modules::registry;
 
 use project::{GraphIndex, Project};
 use sequencer::Schedule;
+
+/// Absolute path of the editable `song.json` (the source of truth the UI writes
+/// back to). Resolved from the crate dir so it is stable regardless of the
+/// process working directory. Held in Tauri state for the edit commands.
+pub struct ProjectFile(pub PathBuf);
+
+/// Canonical location of the demo project on disk.
+pub fn demo_song_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../projects/demo/song.json")
+}
 
 /// The demo project, embedded at build time so the engine always boots with a
 /// playable sequence regardless of the working directory. The same file lives on
@@ -81,8 +96,17 @@ fn demo_project() -> Result<project::Project, project::ProjectError> {
 /// (graph edits / undo). The graph topology is computed here (sample-rate
 /// independent); the closure finishes compilation and builds the schedule once
 /// the device sample rate is known.
-pub fn build_demo() -> Result<(EngineInit, GraphIndex, Project), EngineError> {
-    let project = demo_project()?;
+pub fn build_demo() -> Result<(EngineInit, GraphIndex, Project, PathBuf), EngineError> {
+    let path = demo_song_path();
+    // Load the editable file so UI edits round-trip; fall back to the embedded
+    // copy if it is missing or unreadable, so the app always boots.
+    let mut project = Project::load(&path).or_else(|_| demo_project())?;
+    // Assign ids to any id-less note/clip and rewrite the file (best effort: a
+    // write failure must not stop the app from starting).
+    if ids::normalize(&mut project) && path.exists() {
+        let _ = project.save(&path);
+    }
+
     let (desc, index) = project.to_graph()?;
     let index_for_engine = index.clone();
     let project_for_engine = project.clone();
@@ -91,5 +115,5 @@ pub fn build_demo() -> Result<(EngineInit, GraphIndex, Project), EngineError> {
         let schedule = project.to_schedule(sample_rate as u32, &index)?;
         Ok((graph, schedule))
     });
-    Ok((init, index_for_engine, project_for_engine))
+    Ok((init, index_for_engine, project_for_engine, path))
 }

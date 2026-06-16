@@ -8,9 +8,10 @@ use std::sync::Mutex;
 use rtrb::RingBuffer;
 
 use control::commands::{
-    engine_status, export_wav, graph_insert_effect, graph_move_node, graph_nodes, graph_redo,
-    graph_remove_node, graph_undo, load_project, module_params, note_off, note_on, project_view,
-    set_node_param, transport_play, transport_stop,
+    clip_move, clip_resize, edit_redo, edit_undo, engine_status, export_wav, graph_insert_effect,
+    graph_move_node, graph_nodes, graph_remove_node, load_project, module_params, note_add,
+    note_delete, note_move, note_off, note_on, note_resize, project_view, set_node_param,
+    transport_play, transport_stop,
 };
 use control::undo::EditHistory;
 use telemetry::frame::TelemetryFrame;
@@ -20,7 +21,8 @@ const TELEMETRY_RING_CAPACITY: usize = 64;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let (init, index, project) = control::build_demo().expect("failed to build the demo project");
+    let (init, index, project, project_path) =
+        control::build_demo().expect("failed to build the demo project");
     let (telemetry_prod, telemetry_cons) =
         RingBuffer::<TelemetryFrame>::new(TELEMETRY_RING_CAPACITY);
     let engine = engine::AudioEngine::start(init, index, telemetry_prod)
@@ -31,6 +33,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(engine)
         .manage(history)
+        .manage(control::ProjectFile(project_path))
         .setup(move |app| {
             control::telemetry_pump::spawn(app.handle().clone(), telemetry_cons);
             Ok(())
@@ -48,8 +51,14 @@ pub fn run() {
             graph_insert_effect,
             graph_remove_node,
             graph_move_node,
-            graph_undo,
-            graph_redo,
+            note_add,
+            note_move,
+            note_resize,
+            note_delete,
+            clip_move,
+            clip_resize,
+            edit_undo,
+            edit_redo,
             graph_nodes,
             project_view
         ])

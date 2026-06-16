@@ -93,7 +93,7 @@ pub struct NoteEvent {
     pub kind: NoteKind,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoteKind {
     On { pitch: u8, vel: u8 },
     Off { pitch: u8 },

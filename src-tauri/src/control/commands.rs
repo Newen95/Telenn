@@ -5,8 +5,11 @@ use std::sync::Mutex;
 use tauri::State;
 
 use crate::control::project::{Project, ProjectView};
+use crate::control::sequencer::Schedule;
 use crate::control::undo::EditHistory;
-use crate::control::{graph_edit, render, ControlMsg, TransportCmd};
+use crate::control::{
+    clip_edit, graph_edit, note_edit, render, ControlMsg, ProjectFile, TransportCmd,
+};
 use crate::engine::graph::{compile, GraphDesc};
 use crate::engine::node::ParamId;
 use crate::engine::{AudioEngine, MAX_BLOCK};
@@ -66,12 +69,34 @@ fn swap_to(engine: &AudioEngine, desc: &GraphDesc) -> Result<(), String> {
     Ok(())
 }
 
-/// Apply a validated edit to the project and hot-swap the resulting graph. The
-/// edit runs on a trial clone and must compile before it is committed, so a
-/// rejected edit leaves the project and the audio thread untouched.
+/// Build a project's schedule against the running graph's note routing.
+fn schedule_for(engine: &AudioEngine, project: &Project) -> Result<Schedule, String> {
+    project
+        .to_schedule(engine.sample_rate(), engine.index())
+        .map_err(|e| e.to_string())
+}
+
+/// Replace the playing sequence on the audio thread (no topology change).
+fn set_schedule(engine: &AudioEngine, schedule: Schedule) -> Result<(), String> {
+    if !engine.send(ControlMsg::SetSchedule(Box::new(schedule))) {
+        return Err("engine busy: command dropped".into());
+    }
+    Ok(())
+}
+
+/// Persist the current project back to `song.json` (the source of truth). Best
+/// effort: a write failure does not undo the edit already applied to the engine,
+/// it just leaves the disk mirror to be refreshed by the next edit.
+fn persist(history: &EditHistory, file: &ProjectFile) {
+    let _ = history.project().save(&file.0);
+}
+
+/// Apply a validated **graph** edit (effect chain) to a trial clone and hot-swap
+/// the resulting graph. A rejected edit leaves the project and audio untouched.
 fn edit_and_swap(
     engine: &AudioEngine,
     history: &Mutex<EditHistory>,
+    file: &ProjectFile,
     edit: impl FnOnce(&mut Project) -> Result<(), graph_edit::GraphEditError>,
 ) -> Result<(), String> {
     let mut history = history.lock().map_err(|_| "edit state poisoned")?;
@@ -80,6 +105,44 @@ fn edit_and_swap(
     let (desc, _index) = trial.to_graph().map_err(|e| e.to_string())?;
     swap_to(engine, &desc)?;
     history.commit(trial);
+    persist(&history, file);
+    Ok(())
+}
+
+/// Apply a validated **content** edit (notes/clips) to a trial clone and hot-swap
+/// the rebuilt schedule. The topology is unchanged, so notes resolve against the
+/// running graph and held voices are not cut. Returns the closure's value.
+fn edit_schedule<T, E: std::fmt::Display>(
+    engine: &AudioEngine,
+    history: &Mutex<EditHistory>,
+    file: &ProjectFile,
+    edit: impl FnOnce(&mut Project) -> Result<T, E>,
+) -> Result<T, String> {
+    let mut history = history.lock().map_err(|_| "edit state poisoned")?;
+    let mut trial = history.project().clone();
+    let out = edit(&mut trial).map_err(|e| e.to_string())?;
+    let schedule = schedule_for(engine, &trial)?;
+    set_schedule(engine, schedule)?;
+    history.commit(trial);
+    persist(&history, file);
+    Ok(out)
+}
+
+/// Re-apply a project state restored by undo/redo, sending the **minimal** audio
+/// messages: a graph swap only if the topology changed, a schedule swap only if
+/// the sequence changed. Avoids any spurious declick or note re-trigger when the
+/// step only touched notes (or only the graph).
+fn apply_restored(engine: &AudioEngine, prev: &Project, restored: &Project) -> Result<(), String> {
+    let prev_desc = prev.to_graph().map_err(|e| e.to_string())?.0;
+    let new_desc = restored.to_graph().map_err(|e| e.to_string())?.0;
+    if new_desc != prev_desc {
+        swap_to(engine, &new_desc)?;
+    }
+    let prev_sched = schedule_for(engine, prev)?;
+    let new_sched = schedule_for(engine, restored)?;
+    if new_sched != prev_sched {
+        set_schedule(engine, new_sched)?;
+    }
     Ok(())
 }
 
@@ -87,12 +150,13 @@ fn edit_and_swap(
 pub fn graph_insert_effect(
     engine: State<'_, AudioEngine>,
     history: State<'_, Mutex<EditHistory>>,
+    file: State<'_, ProjectFile>,
     track_id: String,
     module: String,
     id: String,
     params: std::collections::HashMap<String, f32>,
 ) -> Result<(), String> {
-    edit_and_swap(&engine, &history, |p| {
+    edit_and_swap(&engine, &history, &file, |p| {
         graph_edit::insert_effect(p, &track_id, &module, &id, params)
     })
 }
@@ -101,45 +165,149 @@ pub fn graph_insert_effect(
 pub fn graph_remove_node(
     engine: State<'_, AudioEngine>,
     history: State<'_, Mutex<EditHistory>>,
+    file: State<'_, ProjectFile>,
     id: String,
 ) -> Result<(), String> {
-    edit_and_swap(&engine, &history, |p| graph_edit::remove_node(p, &id))
+    edit_and_swap(&engine, &history, &file, |p| {
+        graph_edit::remove_node(p, &id)
+    })
 }
 
 #[tauri::command]
 pub fn graph_move_node(
     engine: State<'_, AudioEngine>,
     history: State<'_, Mutex<EditHistory>>,
+    file: State<'_, ProjectFile>,
     id: String,
     dir: i32,
 ) -> Result<(), String> {
-    edit_and_swap(&engine, &history, |p| graph_edit::move_node(p, &id, dir))
+    edit_and_swap(&engine, &history, &file, |p| {
+        graph_edit::move_node(p, &id, dir)
+    })
 }
 
 #[tauri::command]
-pub fn graph_undo(
+#[allow(clippy::too_many_arguments)] // a Tauri command's args mirror the note fields
+pub fn note_add(
     engine: State<'_, AudioEngine>,
     history: State<'_, Mutex<EditHistory>>,
+    file: State<'_, ProjectFile>,
+    track_id: String,
+    clip_id: String,
+    pitch: u8,
+    start_ticks: u64,
+    length_ticks: u64,
+    vel: u8,
+) -> Result<String, String> {
+    edit_schedule(&engine, &history, &file, |p| {
+        note_edit::add(
+            p,
+            &track_id,
+            &clip_id,
+            pitch,
+            start_ticks,
+            length_ticks,
+            vel,
+        )
+    })
+}
+
+#[tauri::command]
+pub fn note_move(
+    engine: State<'_, AudioEngine>,
+    history: State<'_, Mutex<EditHistory>>,
+    file: State<'_, ProjectFile>,
+    id: String,
+    start_ticks: u64,
+    pitch: u8,
+) -> Result<(), String> {
+    edit_schedule(&engine, &history, &file, |p| {
+        note_edit::move_note(p, &id, start_ticks, pitch)
+    })
+}
+
+#[tauri::command]
+pub fn note_resize(
+    engine: State<'_, AudioEngine>,
+    history: State<'_, Mutex<EditHistory>>,
+    file: State<'_, ProjectFile>,
+    id: String,
+    start_ticks: u64,
+    length_ticks: u64,
+) -> Result<(), String> {
+    edit_schedule(&engine, &history, &file, |p| {
+        note_edit::resize_note(p, &id, start_ticks, length_ticks)
+    })
+}
+
+#[tauri::command]
+pub fn note_delete(
+    engine: State<'_, AudioEngine>,
+    history: State<'_, Mutex<EditHistory>>,
+    file: State<'_, ProjectFile>,
+    id: String,
+) -> Result<(), String> {
+    edit_schedule(&engine, &history, &file, |p| note_edit::delete(p, &id))
+}
+
+#[tauri::command]
+pub fn clip_move(
+    engine: State<'_, AudioEngine>,
+    history: State<'_, Mutex<EditHistory>>,
+    file: State<'_, ProjectFile>,
+    id: String,
+    delta_ticks: i64,
+) -> Result<(), String> {
+    edit_schedule(&engine, &history, &file, |p| {
+        clip_edit::move_clip(p, &id, delta_ticks)
+    })
+}
+
+#[tauri::command]
+pub fn clip_resize(
+    engine: State<'_, AudioEngine>,
+    history: State<'_, Mutex<EditHistory>>,
+    file: State<'_, ProjectFile>,
+    id: String,
+    length_ticks: u64,
+) -> Result<(), String> {
+    edit_schedule(&engine, &history, &file, |p| {
+        clip_edit::resize_clip(p, &id, length_ticks)
+    })
+}
+
+#[tauri::command]
+pub fn edit_undo(
+    engine: State<'_, AudioEngine>,
+    history: State<'_, Mutex<EditHistory>>,
+    file: State<'_, ProjectFile>,
 ) -> Result<(), String> {
     let mut history = history.lock().map_err(|_| "edit state poisoned")?;
-    let desc = match history.undo() {
-        Some(project) => project.to_graph().map_err(|e| e.to_string())?.0,
+    let prev = history.project().clone();
+    let restored = match history.undo() {
+        Some(project) => project.clone(),
         None => return Ok(()), // nothing to undo
     };
-    swap_to(&engine, &desc)
+    apply_restored(&engine, &prev, &restored)?;
+    persist(&history, &file);
+    Ok(())
 }
 
 #[tauri::command]
-pub fn graph_redo(
+pub fn edit_redo(
     engine: State<'_, AudioEngine>,
     history: State<'_, Mutex<EditHistory>>,
+    file: State<'_, ProjectFile>,
 ) -> Result<(), String> {
     let mut history = history.lock().map_err(|_| "edit state poisoned")?;
-    let desc = match history.redo() {
-        Some(project) => project.to_graph().map_err(|e| e.to_string())?.0,
+    let prev = history.project().clone();
+    let restored = match history.redo() {
+        Some(project) => project.clone(),
         None => return Ok(()),
     };
-    swap_to(&engine, &desc)
+    apply_restored(&engine, &prev, &restored)?;
+    persist(&history, &file);
+    Ok(())
 }
 
 /// A node in the current graph, for the UI to list and target edits.

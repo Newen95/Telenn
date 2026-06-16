@@ -53,11 +53,16 @@ impl EditHistory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control::graph_edit;
+    use crate::control::{graph_edit, note_edit};
 
     const DEMO: &str = r#"{ "bpm": 120, "tracks": [
         { "id": "lead", "chain": [ { "id": "lead_synth", "module": "subtractive" } ] }
     ] }"#;
+
+    const DEMO_WITH_CLIP: &str = r#"{ "bpm": 120, "tracks": [
+        { "id": "lead", "chain": [ { "id": "lead_synth", "module": "subtractive" } ],
+          "clips": [ { "id": "c1", "start": "1.1.0", "length": "2.0.0", "notes": [
+            { "id": "n1", "pitch": 60, "start": "1.1.0", "length": "0.1.0" } ] } ] } ] }"#;
 
     #[test]
     fn undo_redo_50_edits_round_trips() {
@@ -94,5 +99,32 @@ mod tests {
             assert!(history.redo().is_some());
         }
         assert_eq!(history.project().tracks[0].chain.len(), 51);
+    }
+
+    #[test]
+    fn mixed_note_and_graph_edits_round_trip() {
+        // One graph edit then one note edit on the same history; undoing both must
+        // restore the original graph AND schedule (the unified undo path).
+        let initial: Project = serde_json::from_str(DEMO_WITH_CLIP).unwrap();
+        let idx = initial.to_graph().unwrap().1;
+        let graph0 = initial.to_graph().unwrap().0;
+        let sched0 = initial.to_schedule(48_000, &idx).unwrap();
+        let mut history = EditHistory::new(initial);
+
+        let mut a = history.project().clone();
+        graph_edit::insert_effect(&mut a, "lead", "gain", "fx", Default::default()).unwrap();
+        history.commit(a);
+
+        let mut b = history.project().clone();
+        note_edit::add(&mut b, "lead", "c1", 72, 1920, 480, 100).unwrap();
+        history.commit(b);
+
+        // After both edits the schedule has grown (extra note → extra on/off).
+        assert_ne!(history.project().to_schedule(48_000, &idx).unwrap(), sched0);
+
+        assert!(history.undo().is_some()); // undo note
+        assert!(history.undo().is_some()); // undo effect
+        assert_eq!(history.project().to_graph().unwrap().0, graph0);
+        assert_eq!(history.project().to_schedule(48_000, &idx).unwrap(), sched0);
     }
 }

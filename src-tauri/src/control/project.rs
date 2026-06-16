@@ -5,7 +5,7 @@
 //! Textual positions are `"bar.beat.tick"`; they are turned into integer sample
 //! positions by [`sequencer::ticks_to_samples`] so playback never drifts.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -40,7 +40,7 @@ pub enum ProjectError {
 
 /// A project, mirroring `song.json`. Unknown fields (and M6/M8 fields such as
 /// `mixer`, `buses`, `modulations`, node `preset`) are ignored by serde for now.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     #[serde(default = "default_version")]
     #[allow(dead_code)]
@@ -51,7 +51,7 @@ pub struct Project {
     pub tracks: Vec<Track>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Track {
     pub id: String,
     #[serde(default)]
@@ -61,17 +61,23 @@ pub struct Track {
     pub clips: Vec<Clip>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeSpec {
     pub id: String,
     pub module: String,
-    /// Initial parameter values, by parameter name, normalized 0..1.
+    /// Initial parameter values, by parameter name, normalized 0..1. A `BTreeMap`
+    /// (not `HashMap`) so a saved project serialises with stable key order — the
+    /// on-disk JSON stays diffable.
     #[serde(default)]
-    pub params: HashMap<String, f32>,
+    pub params: BTreeMap<String, f32>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Clip {
+    /// Stable identifier, addressed by the UI for edits. Empty in a hand-written
+    /// file; [`crate::control::ids::normalize`] assigns one (and rewrites the file).
+    #[serde(default)]
+    pub id: String,
     /// Clip placement and length. In M3 clips are containers only: notes carry
     /// absolute positions and are not windowed by the clip yet.
     pub start: String,
@@ -80,8 +86,12 @@ pub struct Clip {
     pub notes: Vec<Note>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Note {
+    /// Stable identifier, addressed by the UI for edits. Empty in a hand-written
+    /// file; [`crate::control::ids::normalize`] assigns one (and rewrites the file).
+    #[serde(default)]
+    pub id: String,
     pub pitch: u8,
     /// Absolute song position `"bar.beat.tick"` (1-indexed bar/beat).
     pub start: String,
@@ -126,12 +136,17 @@ pub struct ProjectView {
 pub struct TrackView {
     pub id: String,
     pub name: String,
+    /// Flat graph index of the track's instrument node. Instruments occupy the
+    /// leading indices (`to_graph` is instruments-first), so this equals the
+    /// track's position; the UI uses it to play an audio echo while editing.
+    pub instrument_node: NodeIdx,
     pub clips: Vec<ClipView>,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClipView {
+    pub id: String,
     pub start_ticks: u64,
     pub length_ticks: u64,
     pub notes: Vec<NoteView>,
@@ -140,6 +155,7 @@ pub struct ClipView {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NoteView {
+    pub id: String,
     pub pitch: u8,
     /// Absolute start in ticks from the song start.
     pub start_ticks: u64,
@@ -153,6 +169,19 @@ impl Project {
         let text = std::fs::read_to_string(path).map_err(|e| ProjectError::Io(e.to_string()))?;
         let project: Project = serde_json::from_str(&text)?;
         Ok(project)
+    }
+
+    /// Write the project back to disk as pretty JSON (the source of truth stays
+    /// text and diffable; key order is stable). A trailing newline keeps git and
+    /// most editors happy. // off-RT
+    pub fn save(&self, path: impl AsRef<Path>) -> Result<(), ProjectError> {
+        let mut text = serde_json::to_string_pretty(self)?;
+        text.push('\n');
+        std::fs::write(path, text).map_err(|e| ProjectError::Io(e.to_string()))
+    }
+
+    pub fn ticks_per_bar_beat(&self) -> Result<(u64, u64), ProjectError> {
+        Ok((self.ticks_per_bar()?, self.ticks_per_beat()?))
     }
 
     fn ticks_per_beat(&self) -> Result<u64, ProjectError> {
@@ -246,12 +275,13 @@ impl Project {
         let tpbar = self.ticks_per_bar()?;
         let tpbeat = self.ticks_per_beat()?;
         let mut tracks = Vec::with_capacity(self.tracks.len());
-        for track in &self.tracks {
+        for (track_idx, track) in self.tracks.iter().enumerate() {
             let mut clips = Vec::with_capacity(track.clips.len());
             for clip in &track.clips {
                 let mut notes = Vec::with_capacity(clip.notes.len());
                 for note in &clip.notes {
                     notes.push(NoteView {
+                        id: note.id.clone(),
                         pitch: note.pitch,
                         start_ticks: position_to_ticks(&note.start, tpbar, tpbeat)?,
                         length_ticks: duration_to_ticks(&note.length, tpbar, tpbeat)?,
@@ -259,6 +289,7 @@ impl Project {
                     });
                 }
                 clips.push(ClipView {
+                    id: clip.id.clone(),
                     start_ticks: position_to_ticks(&clip.start, tpbar, tpbeat)?,
                     length_ticks: duration_to_ticks(&clip.length, tpbar, tpbeat)?,
                     notes,
@@ -267,6 +298,9 @@ impl Project {
             tracks.push(TrackView {
                 id: track.id.clone(),
                 name: track.name.clone(),
+                // Instruments-first layout: the instrument's flat index is the
+                // track's position (see `to_graph`).
+                instrument_node: track_idx,
                 clips,
             });
         }
@@ -360,7 +394,7 @@ impl Project {
 /// Unknown parameter names are ignored. Validates the module exists.
 fn resolve_params(
     module: &str,
-    params: &HashMap<String, f32>,
+    params: &BTreeMap<String, f32>,
 ) -> Result<Vec<(crate::engine::node::ParamId, f32)>, ProjectError> {
     let node =
         registry::create(module).ok_or_else(|| ProjectError::UnknownModule(module.to_string()))?;
@@ -390,7 +424,7 @@ fn parse_triple(s: &str) -> Result<(u64, u64, u64), ProjectError> {
 }
 
 /// Absolute position `"bar.beat.tick"` → ticks. Bar and beat are 1-indexed.
-fn position_to_ticks(s: &str, tpbar: u64, tpbeat: u64) -> Result<u64, ProjectError> {
+pub fn position_to_ticks(s: &str, tpbar: u64, tpbeat: u64) -> Result<u64, ProjectError> {
     let (bar, beat, tick) = parse_triple(s)?;
     if bar < 1 || beat < 1 {
         return Err(ProjectError::BadPosition(s.to_string()));
@@ -399,9 +433,29 @@ fn position_to_ticks(s: &str, tpbar: u64, tpbeat: u64) -> Result<u64, ProjectErr
 }
 
 /// Duration `"bar.beat.tick"` → ticks. All components are 0-indexed counts.
-fn duration_to_ticks(s: &str, tpbar: u64, tpbeat: u64) -> Result<u64, ProjectError> {
+pub fn duration_to_ticks(s: &str, tpbar: u64, tpbeat: u64) -> Result<u64, ProjectError> {
     let (bar, beat, tick) = parse_triple(s)?;
     Ok(bar * tpbar + beat * tpbeat + tick)
+}
+
+/// Ticks → absolute position `"bar.beat.tick"` (1-indexed bar/beat). Inverse of
+/// [`position_to_ticks`].
+pub fn ticks_to_position(ticks: u64, tpbar: u64, tpbeat: u64) -> String {
+    let bar = ticks / tpbar;
+    let rem = ticks % tpbar;
+    let beat = rem / tpbeat;
+    let tick = rem % tpbeat;
+    format!("{}.{}.{}", bar + 1, beat + 1, tick)
+}
+
+/// Ticks → duration `"bar.beat.tick"` (0-indexed counts). Inverse of
+/// [`duration_to_ticks`].
+pub fn ticks_to_duration(ticks: u64, tpbar: u64, tpbeat: u64) -> String {
+    let bar = ticks / tpbar;
+    let rem = ticks % tpbar;
+    let beat = rem / tpbeat;
+    let tick = rem % tpbeat;
+    format!("{}.{}.{}", bar, beat, tick)
 }
 
 #[cfg(test)]
@@ -525,6 +579,43 @@ mod tests {
         assert_eq!(note.start_ticks, 0);
         assert_eq!(note.length_ticks, 960);
         assert_eq!(note.pitch, 60);
+    }
+
+    #[test]
+    fn position_ticks_round_trip() {
+        // 4/4: 3840 ticks/bar, 960 ticks/beat. Encoders invert the parsers.
+        for &(s, dur) in &[("1.1.0", false), ("2.3.480", false), ("3.0.240", true)] {
+            let ticks = if dur {
+                duration_to_ticks(s, 3840, 960).unwrap()
+            } else {
+                position_to_ticks(s, 3840, 960).unwrap()
+            };
+            let back = if dur {
+                ticks_to_duration(ticks, 3840, 960)
+            } else {
+                ticks_to_position(ticks, 3840, 960)
+            };
+            assert_eq!(back, s, "round trip for {s} (dur={dur})");
+        }
+    }
+
+    #[test]
+    fn serialize_round_trips() {
+        let project: Project = serde_json::from_str(DEMO).unwrap();
+        let text = serde_json::to_string_pretty(&project).unwrap();
+        let back: Project = serde_json::from_str(&text).unwrap();
+        // The graph and schedule derived from the re-parsed project are identical.
+        assert_eq!(
+            project.to_graph().unwrap().0,
+            back.to_graph().unwrap().0,
+            "serialize/deserialize changed the graph"
+        );
+        let idx = project.to_graph().unwrap().1;
+        assert_eq!(
+            project.to_schedule(48_000, &idx).unwrap(),
+            back.to_schedule(48_000, &idx).unwrap(),
+            "serialize/deserialize changed the schedule"
+        );
     }
 
     #[test]

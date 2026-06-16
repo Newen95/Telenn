@@ -191,7 +191,12 @@ impl RtState {
                 self.cursor.reseat(&self.schedule);
                 // Restrike the notes the new sequence already has in progress at
                 // the resume point, so there is no gap until the next downbeat.
-                {
+                // Only while playing: a swap is also how an edit (add/move/resize/
+                // delete) reaches the audio thread, and when stopped the playhead
+                // sits on the sequence's first notes — restriking them would chime
+                // on every edit. Stopped means silent; resume-without-gap only
+                // matters during playback.
+                if self.playing {
                     let cursor = &self.cursor;
                     let schedule = &self.schedule;
                     let graph = &mut self.graph;
@@ -395,7 +400,7 @@ mod tests {
 
     // Compile the demo graph and build a matching schedule for tests, off-RT.
     fn demo_rt() -> (RtState, rtrb::Consumer<Garbage>) {
-        let (init, _index, _project) = crate::control::build_demo().expect("demo builds");
+        let (init, _index, _project, _path) = crate::control::build_demo().expect("demo builds");
         let (graph, schedule) = init(48_000.0, MAX_BLOCK).expect("graph compiles");
         let (prod, cons) = rtrb::RingBuffer::<Garbage>::new(8);
         let (tprod, _t) = rtrb::RingBuffer::<TelemetryFrame>::new(64);
@@ -487,7 +492,7 @@ mod tests {
     fn reload_restrikes_a_note_in_progress() {
         // Regression: reloading mid-sequence must restrike a note the new
         // sequence already has in progress at the playhead, so there is no gap.
-        let (init, _index, _project) = crate::control::build_demo().expect("demo builds");
+        let (init, _index, _project, _path) = crate::control::build_demo().expect("demo builds");
         let (graph, _sched) = init(48_000.0, MAX_BLOCK).expect("graph compiles");
         let (prod, _cons) = rtrb::RingBuffer::<Garbage>::new(8);
         let empty = Schedule {
@@ -530,6 +535,41 @@ mod tests {
             peak > 0.01,
             "in-progress note was not restruck on reload: {peak}"
         );
+    }
+
+    #[test]
+    fn stopped_schedule_swap_stays_silent() {
+        // Regression: when stopped, a schedule swap is how a note edit (add/move/
+        // resize/delete) reaches the audio thread. The playhead sits at the start,
+        // over the sequence's first notes, but an edit must make no sound — only an
+        // explicit preview (the create echo) does. So restriking is gated on play.
+        let (mut rt, _garbage) = demo_rt();
+        let mut out = vec![0.0f32; 4096 * 2];
+
+        // A schedule whose notes are already in progress at the playhead (pos 0).
+        let next = Box::new(Schedule {
+            events: vec![
+                ScheduledEvent {
+                    pos: 0,
+                    node: 0,
+                    kind: NoteKind::On {
+                        pitch: 60,
+                        vel: 110,
+                    },
+                },
+                ScheduledEvent {
+                    pos: 96_000,
+                    node: 0,
+                    kind: NoteKind::Off { pitch: 60 },
+                },
+            ],
+            loop_len: 192_000,
+        });
+        // Never played: still stopped at the start.
+        rt.handle(ControlMsg::SetSchedule(next));
+        rt.process(&mut out, 2);
+        let peak = out.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        assert!(peak < 1e-4, "a stopped edit made sound: {peak}");
     }
 
     fn max_delta(samples: &[f32]) -> f32 {

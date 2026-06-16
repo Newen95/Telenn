@@ -20,7 +20,7 @@ pub fn ticks_to_samples(ticks: u64, bpm: u32, sample_rate: u32) -> u64 {
 }
 
 /// One scheduled note event at an absolute sample position from the loop start.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScheduledEvent {
     pub pos: u64,
     pub node: NodeIdx,
@@ -29,7 +29,7 @@ pub struct ScheduledEvent {
 
 /// A compiled sequence: events sorted by position, plus the loop length in
 /// samples. Built off the audio thread; owned by whoever plays it.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Schedule {
     /// Sorted by `pos`; at equal positions, `NoteOff` comes before `NoteOn`.
     pub events: Vec<ScheduledEvent>,

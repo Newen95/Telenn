@@ -6,6 +6,7 @@ import { invoke } from "@tauri-apps/api/core";
 import TransportBar from "./views/transport/TransportBar.vue";
 import TimelineCanvas from "./views/timeline/TimelineCanvas.vue";
 import PianoRollCanvas from "./views/pianoroll/PianoRollCanvas.vue";
+import { useTimeAxis } from "./views/canvas/timeAxis";
 import { useProjectStore } from "./stores/project";
 import { useTelemetryStore } from "./stores/telemetry";
 
@@ -13,6 +14,9 @@ const { t } = useI18n();
 const project = useProjectStore();
 const telemetry = useTelemetryStore();
 const selectedTrackId = ref("");
+// One horizontal time axis for the timeline and the piano roll, so the same
+// instant — the playhead above all — sits at the same X in both.
+const timeAxis = useTimeAxis();
 
 // --- Dev panel (raw technical labels, not i18n): keyboard, graph edit, sliders.
 
@@ -99,8 +103,8 @@ function insertEffect(trackId: string) {
 
 const removeNode = (id: string) => runEdit("graph_remove_node", { id }, "removed");
 const moveNode = (id: string, dir: number) => runEdit("graph_move_node", { id, dir }, "moved");
-const graphUndo = () => runEdit("graph_undo", {}, "undo");
-const graphRedo = () => runEdit("graph_redo", {}, "redo");
+const graphUndo = () => runEdit("edit_undo", {}, "undo");
+const graphRedo = () => runEdit("edit_redo", {}, "redo");
 
 async function noteOn(pitch: number) {
   if (held.has(pitch)) return;
@@ -131,7 +135,20 @@ async function onParam(id: number, value: number) {
   await invoke("set_node_param", { node: SYNTH_NODE, param: id, value });
 }
 
+async function undoRedo(redo: boolean) {
+  await invoke(redo ? "edit_redo" : "edit_undo");
+  await project.load();
+  await refreshGraph();
+}
+
 function onKeyDown(event: KeyboardEvent) {
+  // Universal undo/redo (semantic key, so it works on AZERTY too). Ctrl+Z /
+  // Ctrl+Shift+Z covers both notes and graph edits via the unified history.
+  if (event.ctrlKey && event.key.toLowerCase() === "z") {
+    event.preventDefault();
+    void undoRedo(event.shiftKey);
+    return;
+  }
   if (event.repeat) return;
   const offset = KEYMAP[event.code];
   if (offset !== undefined) void noteOn(FIRST_PITCH + offset);
@@ -173,7 +190,7 @@ onUnmounted(() => {
 
     <section class="view">
       <h2 class="view-title">{{ t("view.timeline") }}</h2>
-      <div class="timeline-pane"><TimelineCanvas /></div>
+      <div class="timeline-pane"><TimelineCanvas :axis="timeAxis" /></div>
     </section>
 
     <section class="view grow">
@@ -182,9 +199,15 @@ onUnmounted(() => {
         <select v-model="selectedTrackId" class="track-select">
           <option v-for="t in project.tracks" :key="t.id" :value="t.id">{{ t.name || t.id }}</option>
         </select>
+        <span class="hint">{{ t("edit.hints") }}</span>
       </header>
       <div class="pianoroll-pane">
-        <PianoRollCanvas v-if="selectedTrackId" :track-id="selectedTrackId" />
+        <PianoRollCanvas
+          v-if="selectedTrackId"
+          :key="selectedTrackId"
+          :track-id="selectedTrackId"
+          :axis="timeAxis"
+        />
       </div>
     </section>
 
@@ -293,6 +316,13 @@ body {
   text-transform: uppercase;
   letter-spacing: 0.05em;
   color: #8e8e93;
+}
+
+.hint {
+  font-size: 0.7rem;
+  color: #6e6e73;
+  margin-left: auto;
+  padding-right: 0.8rem;
 }
 
 .track-select {

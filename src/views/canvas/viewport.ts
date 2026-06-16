@@ -14,14 +14,20 @@ export interface Viewport {
   scrollLane: number;
   /** Height of one lane in CSS pixels. */
   laneHeight: number;
+  /**
+   * Left inset, in CSS pixels, reserved for a lane gutter (the piano roll's
+   * keyboard). Tick 0 sits at x = originX; the grid lives in [originX, w].
+   * Defaults to 0 (timeline: no gutter).
+   */
+  originX?: number;
 }
 
 export function tickToX(vp: Viewport, tick: number): number {
-  return (tick - vp.scrollTicks) * vp.pxPerTick;
+  return (vp.originX ?? 0) + (tick - vp.scrollTicks) * vp.pxPerTick;
 }
 
 export function xToTick(vp: Viewport, x: number): number {
-  return vp.scrollTicks + x / vp.pxPerTick;
+  return vp.scrollTicks + (x - (vp.originX ?? 0)) / vp.pxPerTick;
 }
 
 export function laneToY(vp: Viewport, lane: number): number {
@@ -29,7 +35,9 @@ export function laneToY(vp: Viewport, lane: number): number {
 }
 
 export function yToLane(vp: Viewport, y: number): number {
-  return vp.scrollLane + Math.floor(y / vp.laneHeight);
+  // Floor the whole sum, not just `y`: `scrollLane` may be fractional after a
+  // pixel-precise vertical pan, and we still want the integer lane under `y`.
+  return Math.floor(vp.scrollLane + y / vp.laneHeight);
 }
 
 /** Convert a sample count to ticks: `samples * bpm * ppq / (sr * 60)`. */

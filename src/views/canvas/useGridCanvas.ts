@@ -17,6 +17,10 @@ export function useGridCanvas(
   isActive: () => boolean,
 ): GridCanvas {
   let dirty = true;
+  // Whether the previous frame was active. When activity stops (a preview voice
+  // expires, the transport halts), we still owe one final frame to paint the
+  // settled state — otherwise the last drawn frame (e.g. a lit key) stays frozen.
+  let wasActive = false;
   let raf = 0;
   let observer: ResizeObserver | null = null;
 
@@ -32,14 +36,20 @@ export function useGridCanvas(
 
   function loop(): void {
     const el = canvas.value;
-    if (el && (dirty || isActive())) {
-      const ctx = el.getContext("2d");
-      if (ctx) {
-        const dpr = window.devicePixelRatio || 1;
-        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-        drawFrame(ctx, el.width / dpr, el.height / dpr);
-        dirty = false;
+    if (el) {
+      const active = isActive();
+      // Draw while active, plus one trailing frame after activity stops so the
+      // settled state (key un-lit, playhead parked) is actually painted.
+      if (dirty || active || wasActive) {
+        const ctx = el.getContext("2d");
+        if (ctx) {
+          const dpr = window.devicePixelRatio || 1;
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+          drawFrame(ctx, el.width / dpr, el.height / dpr);
+          dirty = false;
+        }
       }
+      wasActive = active;
     }
     raf = requestAnimationFrame(loop);
   }

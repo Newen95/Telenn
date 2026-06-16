@@ -45,10 +45,105 @@ d'erreur n'est nécessaire.
 
 ## Gestes (cohérents dans timeline, piano roll ET graphe)
 
+### Navigation (souris, trackpad, clavier)
+
+**Une seule grammaire de navigation partout**, qui sert proprement souris *et*
+trackpad et ne présuppose aucun périphérique précis. Choix structurant : on suit
+la **convention DAW**, pas la convention éditeur-de-nœuds — la molette/le
+défilement **navigue**, un **modificateur zoome**. Raison : le trackpad est le
+périphérique principal (portable) et son geste deux-doigts natif veut dire
+« défiler » ; si la molette seule zoomait, le deux-doigts zoomerait à contretemps.
+La convention DAW couvre les deux périphériques avec une seule logique.
+
+**Souris**
+
+| Geste                       | Effet                                       |
+|-----------------------------|---------------------------------------------|
+| Molette                     | défilement vertical                         |
+| Shift + molette             | défilement horizontal                       |
+| Ctrl + molette              | zoom, centré sur le curseur                 |
+| Glisser au bouton du milieu | pan                                         |
+
+**Trackpad** (à câbler explicitement — rien n'est gratuit dans la webview)
+
+| Geste                       | Effet                                       |
+|-----------------------------|---------------------------------------------|
+| Défilement deux-doigts      | pan sur les deux axes à la fois             |
+| `Ctrl` + défilement deux-doigts | zoom, centré sur le curseur             |
+| Pincement deux-doigts       | zoom *(visé, mais indisponible sous WebView2/Windows — voir limites connues)* |
+| Un doigt                    | curseur / clic (créer, déplacer, brancher)  |
+
+**Alias clavier** (indispensables, pas optionnels)
+
+| Geste                       | Effet                                       |
+|-----------------------------|---------------------------------------------|
+| Espace + glisser            | pan (outil main) — le pan du trackpad, qui n'a pas de bouton du milieu |
+| `+` / `−`                   | zoom                                        |
+| `F` (ou double-clic dans le vide, graphe seul) | tout cadrer / recentrer la vue |
+
+> Détail technique : un `wheel` avec **`ctrlKey` actif** signifie zoom (`Ctrl` +
+> molette/deux-doigts), sinon défilement → pan. Toujours `preventDefault()` pour
+> empêcher le navigateur de zoomer/défiler la page entière (le piège « le zoom
+> agrandit toute l'UI au lieu de la timeline »). En théorie l'OS traduit aussi le
+> **pincement** en `wheel`+`ctrlKey` (vrai dans Chrome) — mais **pas sous WebView2**,
+> qui l'avale avant le DOM (voir limites connues), d'où le repli sur `Ctrl`+deux-doigts.
+
+> Recentrer la vue : le déclencheur universel est **`F`** (aucune collision). Le
+> double-clic dans le vide ne sert de « tout cadrer » **que dans le graphe** ; en
+> timeline et piano roll il est déjà réservé à la **création** (voir gestes
+> d'édition). Une commande de recentrage existe dans le graphe et la timeline pour
+> se retrouver quand on s'est perdu.
+
+Contraintes transverses :
+
+- Aucune action de navigation ne dépend **exclusivement** du bouton du milieu
+  (absent au trackpad) ni du survol : toujours un équivalent clic ou clavier.
+- La machine à états des gestes s'appuie sur les **Pointer Events**
+  (souris/tactile/stylet unifiés), pas sur `mousedown`/`mousemove`. Le tactile
+  n'est pas pour maintenant (post-MVP), mais raisonner en pointeur dès aujourd'hui
+  évite une réécriture — décision gratuite, même esprit que les clés i18n.
+- Le **zoom est toujours centré sur le curseur** (souris) ou le **point pincé**
+  (trackpad), jamais sur le coin de la vue.
+- Le **même renderer et la même machine de gestes** servent timeline et piano roll
+  (déjà acté) ; cette convention de navigation y est mutualisée, seule la couche de
+  mapping diffère. Le graphe (M6) suit la même grammaire.
+
+> Correction d'une note antérieure : la version précédente disait « zoom molette
+> centré sur le curseur ». Le « centré sur le curseur » reste juste, mais le
+> **déclencheur change** — le zoom passe derrière **Ctrl** (souris) / **`Ctrl` +
+> deux-doigts** (trackpad), la molette/le défilement seul **défile**. Le pincement
+> nu était visé pour le trackpad mais n'est pas exploitable sous WebView2 (voir
+> limites connues).
+
+Échéances : la navigation concerne **M5** pour la timeline et le piano roll,
+**M6** pour le graphe.
+
+#### Limites connues & raffinements post-MVP
+
+- **Pincement trackpad sous Windows : indisponible (limite plateforme).** Sous
+  WebView2 (le moteur web de Tauri sur Windows), le pincement nu est consommé par
+  le compositeur natif et **n'atteint jamais le DOM** ; il n'existe pas de chemin
+  d'interception fiable (pas d'event `wheel`, pas de `gesture*` — réservé à Safari).
+  Désactiver le zoom de page natif (`IsPinchZoomEnabled`) ne le fait pas non plus
+  retomber en `ctrl+wheel`. **Solution officielle de zoom au trackpad : `Ctrl` +
+  défilement deux-doigts, ou `+`/`−`.** À **revérifier sous WebKitGTK (Linux)** lors
+  de la validation Linux : moteur différent, comportement possiblement différent ;
+  si le pincement y émet bien un event DOM, on documentera la limite comme
+  spécifique à Windows.
+- **Sens du zoom configurable : post-MVP.** Par défaut, geste vers le haut = zoom
+  avant (convention dominante). Le « natural scrolling » système et le type de
+  périphérique (souris vs trackpad) influent sur le signe du delta ; une option
+  d'inversion viendra plus tard si l'usage le réclame.
+- **Zoom vertical (hauteur des rangées) : post-MVP.** Le piano roll ne zoome que
+  l'axe temps (largeur) ; les rangées de pitch ont une hauteur fixe (une rangée =
+  un demi-ton, reconnaissable d'un coup d'œil). Un zoom vertical, sur un **geste
+  distinct** (ex. `Ctrl+Shift`+molette ou contrôles dédiés), resserrera/agrandira
+  les rangées pour les morceaux à large tessiture ou la visée au trackpad.
+
+### Gestes d'édition
+
 | Geste                  | Effet                                            |
 |------------------------|--------------------------------------------------|
-| Molette                | zoom centré sur le curseur                       |
-| Espace + drag / clic milieu | pan                                         |
 | Drag simple            | déplacer (snap actif)                            |
 | Alt + drag             | déplacer sans snap / dupliquer (sur un nœud)     |
 | Double-clic sur vide   | créer (clip dans timeline, note dans piano roll) |

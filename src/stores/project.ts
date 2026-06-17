@@ -24,11 +24,41 @@ export interface ClipView {
   notes: NoteView[];
 }
 
+export interface ChainNodeView {
+  id: string;
+  module: string;
+  isInstrument: boolean;
+  /** Stored parameter values (normalized 0..1) by name. */
+  params: Record<string, number>;
+}
+
+/** A module parameter as the UI needs it (range/curve stay in the module). */
+export interface ParamInfo {
+  id: number;
+  name: string;
+  unit: string;
+  default: number;
+}
+
 export interface TrackView {
   id: string;
   name: string;
   instrumentNode: number;
+  chain: ChainNodeView[];
   clips: ClipView[];
+}
+
+/** A registered module, as the browser lists it. */
+export interface ModuleDesc {
+  id: string;
+  name: string;
+  category: "instrument" | "effect";
+}
+
+/** A saved effect preset (module + normalized params), without a node id. */
+export interface Preset {
+  module: string;
+  params: Record<string, number>;
 }
 
 export interface ProjectView {
@@ -136,11 +166,86 @@ export const useProjectStore = defineStore("project", () => {
     await load();
   }
 
+  // --- Effect chain edits (M6). Each is one graph hot-swap; reload reconciles. ---
+
+  /** A fresh, collision-resistant node id (the backend also rejects duplicates). */
+  function freshNodeId(): string {
+    return `fx-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`;
+  }
+
+  /** Move an effect to a chain at `index`, keeping its id (its tail follows). */
+  async function moveNode(id: string, toTrack: string, index: number): Promise<void> {
+    await invoke("node_move_to", { id, toTrack, index });
+    await load();
+  }
+
+  /** Copy an effect into a chain at `index` under a fresh id. */
+  async function copyNode(id: string, toTrack: string, index: number): Promise<void> {
+    await invoke("node_copy", { id, newId: freshNodeId(), toTrack, index });
+    await load();
+  }
+
+  /** Insert a dropped module/preset as a new effect at `index`. */
+  async function insertNode(
+    trackId: string,
+    index: number,
+    module: string,
+    params: Record<string, number> = {},
+  ): Promise<void> {
+    await invoke("node_insert", { trackId, index, module, id: freshNodeId(), params });
+    await load();
+  }
+
+  async function removeNode(id: string): Promise<void> {
+    await invoke("graph_remove_node", { id });
+    await load();
+  }
+
+  /** Optimistically write a node's param in the local mirror (keeps knobs live). */
+  function patchNodeParam(nodeId: string, param: string, value: number): void {
+    for (const track of tracks.value) {
+      const node = track.chain.find((n) => n.id === nodeId);
+      if (node) {
+        node.params = { ...node.params, [param]: value };
+        return;
+      }
+    }
+  }
+
+  /** Module param specs (name, unit, default), for the chain panel's knobs. */
+  const moduleParams = (moduleId: string): Promise<ParamInfo[]> =>
+    invoke<ParamInfo[]>("module_params", { moduleId });
+
+  /** Live param change streamed while a knob is dragged (real-time, no persist). */
+  async function setNodeParam(nodeId: string, param: string, value: number): Promise<void> {
+    patchNodeParam(nodeId, param, value);
+    await invoke("node_set_param", { nodeId, param, value });
+  }
+
+  /** Persist a settled param value (one undo step); reload reconciles. */
+  async function commitNodeParam(nodeId: string, param: string, value: number): Promise<void> {
+    patchNodeParam(nodeId, param, value);
+    await invoke("node_commit_param", { nodeId, param, value });
+    await load();
+  }
+
+  // Bumped after a preset is saved, so the browser reloads its list.
+  const presetsVersion = ref(0);
+
+  const listModules = (): Promise<ModuleDesc[]> => invoke<ModuleDesc[]>("list_modules");
+  const listPresets = (): Promise<string[]> => invoke<string[]>("list_presets");
+  const readPreset = (name: string): Promise<Preset> => invoke<Preset>("read_preset", { name });
+  async function savePreset(name: string, nodeId: string): Promise<void> {
+    await invoke("save_preset", { name, nodeId });
+    presetsVersion.value += 1;
+  }
+
   return {
     bpm,
     ppq,
     timeSignature,
     tracks,
+    presetsVersion,
     load,
     addNote,
     moveNote,
@@ -148,5 +253,16 @@ export const useProjectStore = defineStore("project", () => {
     deleteNote,
     moveClip,
     resizeClip,
+    moveNode,
+    copyNode,
+    insertNode,
+    removeNode,
+    moduleParams,
+    setNodeParam,
+    commitNodeParam,
+    listModules,
+    listPresets,
+    readPreset,
+    savePreset,
   };
 });

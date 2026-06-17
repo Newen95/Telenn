@@ -6,7 +6,10 @@ import { invoke } from "@tauri-apps/api/core";
 import TransportBar from "./views/transport/TransportBar.vue";
 import TimelineCanvas from "./views/timeline/TimelineCanvas.vue";
 import PianoRollCanvas from "./views/pianoroll/PianoRollCanvas.vue";
+import ChainPanel from "./views/chain/ChainPanel.vue";
+import PresetBrowser from "./views/browser/PresetBrowser.vue";
 import { useTimeAxis } from "./views/canvas/timeAxis";
+import { useChainDrag, type DropIntent } from "./views/chain/dragdrop";
 import { useProjectStore } from "./stores/project";
 import { useTelemetryStore } from "./stores/telemetry";
 
@@ -17,6 +20,65 @@ const selectedTrackId = ref("");
 // One horizontal time axis for the timeline and the piano roll, so the same
 // instant — the playhead above all — sits at the same X in both.
 const timeAxis = useTimeAxis();
+
+// --- Effect-chain drag & drop controller (M6) ---
+// The pure decision lives in dragdrop.ts; here we own the pointer plumbing: a
+// floating ghost, the gap under the pointer, and running the resolved edit.
+const drag = useChainDrag();
+
+// The drop target under the pointer: the whole chain row is a target, and the
+// insert position is the gap nearest the pointer in X — far more forgiving than
+// requiring a hit on the thin gap element itself.
+function targetUnder(x: number, y: number): { trackId: string; index: number } | null {
+  const row = document.elementFromPoint(x, y)?.closest<HTMLElement>("[data-chain]");
+  if (!row) return null;
+  const gaps = row.querySelectorAll<HTMLElement>("[data-gap]");
+  let best: HTMLElement | null = null;
+  let bestDist = Infinity;
+  for (const gap of gaps) {
+    const rect = gap.getBoundingClientRect();
+    const dist = Math.abs((rect.left + rect.right) / 2 - x);
+    if (dist < bestDist) {
+      bestDist = dist;
+      best = gap;
+    }
+  }
+  if (!best) return null;
+  return { trackId: row.dataset.track ?? "", index: Number(best.dataset.index) };
+}
+
+function executeIntent(intent: DropIntent): void {
+  if (intent.kind === "move") void project.moveNode(intent.nodeId, intent.toTrack, intent.index);
+  else if (intent.kind === "copy") void project.copyNode(intent.nodeId, intent.toTrack, intent.index);
+  else void project.insertNode(intent.trackId, intent.index, intent.module, intent.params);
+}
+
+function onDragMove(e: PointerEvent): void {
+  if (!drag.state.source) return;
+  drag.move(e.clientX, e.clientY);
+  drag.setCopy(e.altKey);
+  drag.hover(targetUnder(e.clientX, e.clientY));
+}
+
+function onDragUp(e: PointerEvent): void {
+  const source = drag.state.source;
+  if (!source) return;
+  drag.setCopy(e.altKey);
+  // Dropping an effect node on the browser saves it as a preset.
+  const overBrowser = document.elementFromPoint(e.clientX, e.clientY)?.closest("[data-save-preset]");
+  if (overBrowser && source.kind === "node") {
+    const name = `${source.module}-${Date.now().toString(36).slice(-4)}`;
+    void project.savePreset(name, source.nodeId);
+    drag.cancel();
+    return;
+  }
+  const intent = drag.drop(); // resolves on the hovered gap, or null outside
+  if (intent) executeIntent(intent);
+}
+
+function onDragKey(e: KeyboardEvent): void {
+  if (drag.state.source && e.key === "Escape") drag.cancel();
+}
 
 // --- Dev panel (raw technical labels, not i18n): keyboard, graph edit, sliders.
 
@@ -172,6 +234,9 @@ onMounted(async () => {
   for (const p of params.value) paramValues[p.id] = p.default;
   window.addEventListener("keydown", onKeyDown);
   window.addEventListener("keyup", onKeyUp);
+  window.addEventListener("pointermove", onDragMove);
+  window.addEventListener("pointerup", onDragUp);
+  window.addEventListener("keydown", onDragKey);
   void refreshGraph();
   void refreshStatus();
   statusTimer = window.setInterval(refreshStatus, 1000);
@@ -180,12 +245,15 @@ onMounted(async () => {
 onUnmounted(() => {
   window.removeEventListener("keydown", onKeyDown);
   window.removeEventListener("keyup", onKeyUp);
+  window.removeEventListener("pointermove", onDragMove);
+  window.removeEventListener("pointerup", onDragUp);
+  window.removeEventListener("keydown", onDragKey);
   if (statusTimer !== undefined) window.clearInterval(statusTimer);
 });
 </script>
 
 <template>
-  <div class="app">
+  <div class="app" :class="{ 'chain-dragging': !!drag.state.source }">
     <TransportBar />
 
     <section class="view">
@@ -208,6 +276,14 @@ onUnmounted(() => {
           :track-id="selectedTrackId"
           :axis="timeAxis"
         />
+      </div>
+    </section>
+
+    <section class="view chain-area">
+      <h2 class="view-title">{{ t("view.chain") }}</h2>
+      <div class="chain-body">
+        <ChainPanel />
+        <PresetBrowser />
       </div>
     </section>
 
@@ -344,6 +420,28 @@ body {
   min-height: 0;
 }
 
+.chain-area {
+  height: 170px;
+  border-top: 1px solid #2c2c2e;
+}
+
+.chain-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
+.chain-body > :first-child {
+  flex: 1;
+  min-width: 0;
+}
+
+/* During a chain drag, the timeline/piano-roll canvases must not fight for the
+   cursor (they set their own on hover). */
+.chain-dragging .grid-canvas {
+  pointer-events: none;
+}
+
 /* --- dev panel --- */
 .dev {
   border-top: 1px solid #2c2c2e;
@@ -421,29 +519,31 @@ body {
   margin-top: 0.3rem;
 }
 
-.params {
+/* Dev-panel param sliders. Namespaced under `.dev` so these unscoped rules do
+   not leak into the chain panel's own `.param` cards. */
+.dev .params {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
   gap: 1rem 2rem;
   width: min(640px, 100%);
 }
 
-.param {
+.dev .param {
   display: flex;
   flex-direction: column;
   gap: 0.3rem;
 }
 
-.param-name {
+.dev .param-name {
   color: #c7c7cc;
 }
 
-.param-name em {
+.dev .param-name em {
   color: #8e8e93;
   font-style: normal;
 }
 
-.param input {
+.dev .param input {
   width: 100%;
 }
 

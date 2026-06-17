@@ -395,6 +395,17 @@ tous les consommateurs visuels — on ne crée pas le pipeline, on le densifie.
 
 **Objectif** : de quoi faire un vrai morceau.
 
+**Prérequis (à traiter AVANT les effets de M8) — débordement de la zone chaîne.**
+En M6 les cartes d'effet sont posées en ligne dans la zone chaîne ; dès deux ou
+trois effets la chaîne dépasse la largeur disponible et les dernières cartes sont
+coupées à droite. M8 ajoute delay/reverb/compresseur (chaînes longues + cartes
+plus hautes à cause des paramètres multiples), donc ce layout doit être cadré
+avant, sinon on teste M8 sur une UI qui cache la moitié de la chaîne. Définir et
+implémenter le comportement de débordement — au choix ou en combinaison :
+scroll horizontal de la zone chaîne ; cartes compactes qui ne déplient le détail
+de leurs paramètres qu'à la sélection/au survol ; repli par piste. Non bloquant
+pour les CA de M6 ; bloquant pour commencer l'intégration visuelle de M8.
+
 **Étapes**
 1. Instruments : `modules/fm.rs` (2 opérateurs, ratio + index modulables,
    c'est suffisant pour cloches/keys/basses) ; `modules/drum_sampler.rs`
@@ -428,6 +439,20 @@ tous les consommateurs visuels — on ne crée pas le pipeline, on le densifie.
    supporte déjà, c'est principalement de l'UI.
 3. **Câbles animés + pré-écoute des presets + scrub.**
 4. **CLAP host** (crate `clack`) comme simple module de plus.
+
+## Polish visuel global (passe unique, au moment de fixer palette + logo)
+
+Cosmétique réversible, à traiter **en une seule passe** quand l'identité visuelle
+sera arrêtée — pas isolément. À ne pas confondre avec un bug fonctionnel.
+
+- **Label de paramètre redondant.** Sur un effet à paramètre unique dont le
+  paramètre porte le même nom que l'effet (ex. `gain`), le label du slider répète
+  le nom du module et n'apporte rien. À masquer **dans ce seul cas** (paramètre
+  unique homonyme) ; pour un effet multi-paramètres (compresseur :
+  attack/release/ratio/threshold) les labels restent indispensables.
+- **Couleur des sliders.** Les `input[type=range]` des cartes d'effet utilisent le
+  style natif (bleu vif) qui détonne avec la palette teal/anthracite. À
+  harmoniser avec la couleur d'accent.
 
 ## Stratégie de test (transverse)
 

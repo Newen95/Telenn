@@ -9,9 +9,10 @@ use rtrb::RingBuffer;
 
 use control::commands::{
     clip_move, clip_resize, edit_redo, edit_undo, engine_status, export_wav, graph_insert_effect,
-    graph_move_node, graph_nodes, graph_remove_node, load_project, module_params, note_add,
-    note_delete, note_move, note_off, note_on, note_resize, project_view, set_node_param,
-    transport_play, transport_stop,
+    graph_move_node, graph_nodes, graph_remove_node, list_modules, list_presets, load_project,
+    module_params, node_commit_param, node_copy, node_insert, node_move_to, node_set_param,
+    note_add, note_delete, note_move, note_off, note_on, note_resize, project_view, read_preset,
+    save_preset, set_node_param, transport_play, transport_stop,
 };
 use control::undo::EditHistory;
 use telemetry::frame::TelemetryFrame;
@@ -51,6 +52,15 @@ pub fn run() {
             graph_insert_effect,
             graph_remove_node,
             graph_move_node,
+            node_move_to,
+            node_copy,
+            node_insert,
+            node_set_param,
+            node_commit_param,
+            list_modules,
+            list_presets,
+            read_preset,
+            save_preset,
             note_add,
             note_move,
             note_resize,

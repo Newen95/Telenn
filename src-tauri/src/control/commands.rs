@@ -1,10 +1,11 @@
 //! Tauri commands: the typed UI → control entry points.
 
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use tauri::State;
 
-use crate::control::project::{Project, ProjectView};
+use crate::control::project::{Preset, Project, ProjectView};
 use crate::control::sequencer::Schedule;
 use crate::control::undo::EditHistory;
 use crate::control::{
@@ -186,6 +187,56 @@ pub fn graph_move_node(
     })
 }
 
+/// Move an effect to another (or the same) chain at `index`, keeping its id (so
+/// the hot-swap adopts the same instance and its tail follows the move).
+#[tauri::command]
+pub fn node_move_to(
+    engine: State<'_, AudioEngine>,
+    history: State<'_, Mutex<EditHistory>>,
+    file: State<'_, ProjectFile>,
+    id: String,
+    to_track: String,
+    index: usize,
+) -> Result<(), String> {
+    edit_and_swap(&engine, &history, &file, |p| {
+        graph_edit::move_node_to(p, &id, &to_track, index)
+    })
+}
+
+/// Copy an effect into a chain at `index` under a fresh id (same params).
+#[tauri::command]
+pub fn node_copy(
+    engine: State<'_, AudioEngine>,
+    history: State<'_, Mutex<EditHistory>>,
+    file: State<'_, ProjectFile>,
+    id: String,
+    new_id: String,
+    to_track: String,
+    index: usize,
+) -> Result<(), String> {
+    edit_and_swap(&engine, &history, &file, |p| {
+        graph_edit::copy_node(p, &id, &new_id, &to_track, index)
+    })
+}
+
+/// Insert a new effect (a dropped module or preset) at `index` in a chain.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)] // a Tauri command mirrors the node fields
+pub fn node_insert(
+    engine: State<'_, AudioEngine>,
+    history: State<'_, Mutex<EditHistory>>,
+    file: State<'_, ProjectFile>,
+    track_id: String,
+    index: usize,
+    module: String,
+    id: String,
+    params: std::collections::HashMap<String, f32>,
+) -> Result<(), String> {
+    edit_and_swap(&engine, &history, &file, |p| {
+        graph_edit::insert_effect_at(p, &track_id, &module, &id, params, index)
+    })
+}
+
 #[tauri::command]
 #[allow(clippy::too_many_arguments)] // a Tauri command's args mirror the note fields
 pub fn note_add(
@@ -362,6 +413,77 @@ pub fn set_node_param(engine: State<'_, AudioEngine>, node: usize, param: ParamI
     engine.send(ControlMsg::SetParam { node, param, value });
 }
 
+/// Resolve an effect's live `(node index, param id)` from a stable node id and a
+/// param name, against the *current* project (whose layout matches the running
+/// graph). Lets the UI address params by id+name and never recompute the
+/// instruments-first flat index itself.
+fn locate_param(project: &Project, node_id: &str, param: &str) -> Result<(usize, ParamId), String> {
+    let (desc, _index) = project.to_graph().map_err(|e| e.to_string())?;
+    let node = desc
+        .nodes
+        .iter()
+        .position(|n| n.id == node_id)
+        .ok_or_else(|| format!("unknown node '{node_id}'"))?;
+    let module = &desc.nodes[node].module_id;
+    let inst = registry::create(module).ok_or_else(|| format!("unknown module '{module}'"))?;
+    let pid = inst
+        .params()
+        .iter()
+        .find(|p| p.name == param)
+        .map(|p| p.id)
+        .ok_or_else(|| format!("unknown param '{param}'"))?;
+    Ok((node, pid))
+}
+
+/// Live parameter change on a chain node, addressed by id and param name. Sends
+/// the normalized value straight to the audio thread (smoothed in the node): no
+/// recompile, no swap, no persist — meant to stream while a knob is dragged so
+/// the sound moves in real time, even mid-playback.
+#[tauri::command]
+pub fn node_set_param(
+    engine: State<'_, AudioEngine>,
+    history: State<'_, Mutex<EditHistory>>,
+    node_id: String,
+    param: String,
+    value: f32,
+) -> Result<(), String> {
+    let history = history.lock().map_err(|_| "edit state poisoned")?;
+    let (node, pid) = locate_param(history.project(), &node_id, &param)?;
+    engine.send(ControlMsg::SetParam {
+        node,
+        param: pid,
+        value,
+    });
+    Ok(())
+}
+
+/// Commit a parameter change: persist it to `song.json` and record one undo step
+/// (a whole knob gesture = one step). No graph swap — a param change keeps the
+/// topology, so the live node already holds the value; the value is resent once
+/// more so the running node ends exactly where the knob settled.
+#[tauri::command]
+pub fn node_commit_param(
+    engine: State<'_, AudioEngine>,
+    history: State<'_, Mutex<EditHistory>>,
+    file: State<'_, ProjectFile>,
+    node_id: String,
+    param: String,
+    value: f32,
+) -> Result<(), String> {
+    let mut history = history.lock().map_err(|_| "edit state poisoned")?;
+    let (node, pid) = locate_param(history.project(), &node_id, &param)?;
+    let mut trial = history.project().clone();
+    graph_edit::set_param(&mut trial, &node_id, &param, value).map_err(|e| e.to_string())?;
+    engine.send(ControlMsg::SetParam {
+        node,
+        param: pid,
+        value,
+    });
+    history.commit(trial);
+    persist(&history, &file);
+    Ok(())
+}
+
 /// Minimal engine health read by the UI. The full telemetry pipeline (peaks,
 /// playhead, event-driven) arrives at M5; M2 still only needs a polled snapshot.
 #[derive(serde::Serialize)]
@@ -406,4 +528,85 @@ pub fn module_params(module_id: String) -> Vec<ParamInfo> {
             .collect(),
         None => Vec::new(),
     }
+}
+
+/// Every registered module (id, display name, category) for the browser.
+#[tauri::command]
+pub fn list_modules() -> Vec<registry::ModuleDesc> {
+    registry::list().to_vec()
+}
+
+/// The project's `presets/` directory (next to its `song.json`).
+fn presets_dir(file: &ProjectFile) -> Option<PathBuf> {
+    file.0.parent().map(|p| p.join("presets"))
+}
+
+/// Reject names that could escape the presets directory or break the filename.
+fn safe_preset_name(name: &str) -> Result<&str, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed.contains(['/', '\\']) || trimmed.contains("..") {
+        return Err("invalid preset name".into());
+    }
+    Ok(trimmed)
+}
+
+/// Names of the presets saved in the project (filenames without the `.json`).
+#[tauri::command]
+pub fn list_presets(file: State<'_, ProjectFile>) -> Vec<String> {
+    let Some(dir) = presets_dir(&file) else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new(); // no presets dir yet
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter_map(|e| {
+            let path = e.path();
+            (path.extension().and_then(|x| x.to_str()) == Some("json"))
+                .then(|| {
+                    path.file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(str::to_string)
+                })
+                .flatten()
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// Read a saved preset (module + params) so the UI can drop it into a chain.
+#[tauri::command]
+pub fn read_preset(file: State<'_, ProjectFile>, name: String) -> Result<Preset, String> {
+    let safe = safe_preset_name(&name)?;
+    let dir = presets_dir(&file).ok_or("no project directory")?;
+    Preset::load(dir.join(format!("{safe}.json"))).map_err(|e| e.to_string())
+}
+
+/// Save an existing node's module + params as a named preset.
+#[tauri::command]
+pub fn save_preset(
+    history: State<'_, Mutex<EditHistory>>,
+    file: State<'_, ProjectFile>,
+    name: String,
+    node_id: String,
+) -> Result<(), String> {
+    let safe = safe_preset_name(&name)?;
+    let history = history.lock().map_err(|_| "edit state poisoned")?;
+    let spec = history
+        .project()
+        .tracks
+        .iter()
+        .flat_map(|t| &t.chain)
+        .find(|n| n.id == node_id)
+        .ok_or_else(|| format!("unknown node '{node_id}'"))?;
+    let preset = Preset {
+        module: spec.module.clone(),
+        params: spec.params.clone(),
+    };
+    let dir = presets_dir(&file).ok_or("no project directory")?;
+    preset
+        .save(dir.join(format!("{safe}.json")))
+        .map_err(|e| e.to_string())
 }

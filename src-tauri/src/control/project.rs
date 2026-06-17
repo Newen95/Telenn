@@ -140,7 +140,23 @@ pub struct TrackView {
     /// leading indices (`to_graph` is instruments-first), so this equals the
     /// track's position; the UI uses it to play an audio echo while editing.
     pub instrument_node: NodeIdx,
+    /// The track's signal chain (instrument first, then effects), for the chain
+    /// panel. Distinct from `graph_nodes`: carried in the same view the UI already
+    /// reloads after every edit, so the panel stays in step without a second fetch.
+    pub chain: Vec<ChainNodeView>,
     pub clips: Vec<ClipView>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChainNodeView {
+    pub id: String,
+    pub module: String,
+    /// The chain head (index 0): fixed, never drag-reordered.
+    pub is_instrument: bool,
+    /// Stored parameter values (normalized 0..1) by name, so the chain panel's
+    /// knobs open on the node's real values rather than the module defaults.
+    pub params: BTreeMap<String, f32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -161,6 +177,35 @@ pub struct NoteView {
     pub start_ticks: u64,
     pub length_ticks: u64,
     pub vel: u8,
+}
+
+/// A reusable effect preset: a module plus its parameter values, **without** a
+/// node id (an id is assigned when the preset is dropped into a chain). Stored as
+/// a small JSON file under the project's `presets/` directory. It mirrors the
+/// effect fields of [`NodeSpec`] so saving a node and reloading it round-trips.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Preset {
+    pub module: String,
+    #[serde(default)]
+    pub params: BTreeMap<String, f32>,
+}
+
+impl Preset {
+    /// Read a preset JSON from disk. // off-RT
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, ProjectError> {
+        let text = std::fs::read_to_string(path).map_err(|e| ProjectError::Io(e.to_string()))?;
+        Ok(serde_json::from_str(&text)?)
+    }
+
+    /// Write a preset to disk as pretty JSON, creating the parent dir if needed. // off-RT
+    pub fn save(&self, path: impl AsRef<Path>) -> Result<(), ProjectError> {
+        if let Some(dir) = path.as_ref().parent() {
+            std::fs::create_dir_all(dir).map_err(|e| ProjectError::Io(e.to_string()))?;
+        }
+        let mut text = serde_json::to_string_pretty(self)?;
+        text.push('\n');
+        std::fs::write(path, text).map_err(|e| ProjectError::Io(e.to_string()))
+    }
 }
 
 impl Project {
@@ -295,12 +340,24 @@ impl Project {
                     notes,
                 });
             }
+            let chain = track
+                .chain
+                .iter()
+                .enumerate()
+                .map(|(i, node)| ChainNodeView {
+                    id: node.id.clone(),
+                    module: node.module.clone(),
+                    is_instrument: i == 0,
+                    params: node.params.clone(),
+                })
+                .collect();
             tracks.push(TrackView {
                 id: track.id.clone(),
                 name: track.name.clone(),
                 // Instruments-first layout: the instrument's flat index is the
                 // track's position (see `to_graph`).
                 instrument_node: track_idx,
+                chain,
                 clips,
             });
         }
@@ -472,6 +529,19 @@ mod tests {
                 "notes": [ { "pitch": 60, "start": "1.1.0", "length": "0.1.0", "vel": 100 } ] } ] }
         ]
     }"#;
+
+    #[test]
+    fn preset_round_trips_through_json() {
+        let mut params = BTreeMap::new();
+        params.insert("gain".to_string(), 0.42);
+        let preset = Preset {
+            module: "gain".to_string(),
+            params,
+        };
+        let text = serde_json::to_string(&preset).unwrap();
+        let back: Preset = serde_json::from_str(&text).unwrap();
+        assert_eq!(preset, back);
+    }
 
     #[test]
     fn parses_positions_and_durations() {

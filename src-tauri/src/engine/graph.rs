@@ -10,6 +10,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::engine::node::{AudioNode, NodeIdx, NoteEvent, ParamId, ProcessCtx, SignalKind};
+use crate::telemetry::frame::Meter;
 
 /// Pre-allocated capacity of each node's per-block note queue. Notes beyond
 /// this in a single block are dropped rather than reallocating. // RT-SAFE
@@ -81,6 +82,9 @@ pub struct CompiledGraph {
     in_scratch: Vec<f32>,
     /// Per-node note queue for the current block, indexed by node index.
     node_notes: Vec<Vec<NoteEvent>>,
+    /// Per-node post-process meter (peak + RMS of port 0), indexed by node
+    /// index. Pre-allocated; filled at the end of each block. // RT-SAFE
+    meters: Vec<Meter>,
     output_node: NodeIdx,
     last_frames: usize,
 }
@@ -123,6 +127,14 @@ impl CompiledGraph {
         }
     }
 
+    /// Notes queued for a node in the current block, before they are consumed by
+    /// `process_block`. Lets a test assert exactly which NoteOn/NoteOff a reload
+    /// pushed (the reconciliation diff). // test-only
+    #[cfg(test)]
+    pub fn pending_notes(&self, node: NodeIdx) -> &[NoteEvent] {
+        &self.node_notes[node]
+    }
+
     /// Drop all queued notes (called once the block has consumed them). // RT-SAFE
     pub fn clear_notes(&mut self) {
         for buf in &mut self.node_notes {
@@ -146,6 +158,13 @@ impl CompiledGraph {
     pub fn output(&self) -> &[f32] {
         let pos = self.node_to_pos[self.output_node];
         &self.outputs[pos][..self.last_frames]
+    }
+
+    /// Per-node post-process meters (peak + RMS of port 0) for the last block,
+    /// indexed by node index — so `meters()[i]` is the node whose stable id is
+    /// `node_ids()[i]`. A node with no audio output reads zero. // RT-SAFE
+    pub fn meters(&self) -> &[Meter] {
+        &self.meters
     }
 
     /// Process one block of `frames` samples (≤ the compiled `max_block`). The
@@ -191,6 +210,28 @@ impl CompiledGraph {
                 frames,
             );
             self.nodes[node].process(&ctx, &mut io);
+        }
+
+        // Meter every node's port-0 output (peak + RMS) post-process. A node
+        // with no audio output keeps a zero meter. // RT-SAFE
+        for node in 0..self.nodes.len() {
+            if self.out_counts[node] == 0 {
+                self.meters[node] = Meter::default();
+                continue;
+            }
+            let buf = &self.outputs[self.node_to_pos[node]][..frames];
+            let mut peak = 0.0f32;
+            let mut sum_sq = 0.0f32;
+            for &s in buf {
+                peak = peak.max(s.abs());
+                sum_sq += s * s;
+            }
+            let rms = if frames > 0 {
+                (sum_sq / frames as f32).sqrt()
+            } else {
+                0.0
+            };
+            self.meters[node] = Meter { peak, rms };
         }
     }
 }
@@ -282,6 +323,7 @@ pub fn compile(
     let in_scratch = vec![0.0f32; max_in * max_block];
     let node_notes = (0..n).map(|_| Vec::with_capacity(NOTE_CAPACITY)).collect();
     let node_ids = desc.nodes.iter().map(|d| d.id.clone()).collect();
+    let meters = vec![Meter::default(); n];
 
     Ok(CompiledGraph {
         nodes,
@@ -294,6 +336,7 @@ pub fn compile(
         outputs,
         in_scratch,
         node_notes,
+        meters,
         output_node: desc.output,
         last_frames: 0,
     })
@@ -413,6 +456,41 @@ mod tests {
         g.process_block(48_000.0, 32);
         // const(1.0) → half(×0.5) = 0.5 on the output buffer.
         assert!(g.output().iter().all(|&s| (s - 0.5).abs() < 1e-6));
+    }
+
+    #[test]
+    fn meters_are_aligned_by_node_index() {
+        // node 0 = const(1.0) source, node 1 = half(×0.5) effect.
+        let desc = GraphDesc {
+            nodes: vec![
+                NodeDesc {
+                    id: "src".into(),
+                    module_id: "const".into(),
+                    params: vec![],
+                },
+                NodeDesc {
+                    id: "fx".into(),
+                    module_id: "half".into(),
+                    params: vec![],
+                },
+            ],
+            connections: vec![Connection {
+                src_node: 0,
+                src_port: 0,
+                dst_node: 1,
+                dst_port: 0,
+            }],
+            output: 1,
+        };
+        let mut g = compile(&desc, create, 48_000.0, 64).expect("compiles");
+        g.process_block(48_000.0, 32);
+        let m = g.meters();
+        assert_eq!(m.len(), 2, "one meter per node");
+        // A constant signal: peak == rms == the level.
+        assert!((m[0].peak - 1.0).abs() < 1e-6, "const node peak");
+        assert!((m[0].rms - 1.0).abs() < 1e-6, "const node rms");
+        assert!((m[1].peak - 0.5).abs() < 1e-6, "halved node peak");
+        assert!((m[1].rms - 0.5).abs() < 1e-6, "halved node rms");
     }
 
     #[test]

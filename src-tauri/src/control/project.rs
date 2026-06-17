@@ -86,7 +86,7 @@ pub struct Clip {
     pub notes: Vec<Note>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Note {
     /// Stable identifier, addressed by the UI for edits. Empty in a hand-written
     /// file; [`crate::control::ids::normalize`] assigns one (and rewrites the file).
@@ -154,6 +154,10 @@ pub struct ChainNodeView {
     pub module: String,
     /// The chain head (index 0): fixed, never drag-reordered.
     pub is_instrument: bool,
+    /// Flat graph index in the `to_graph` instruments-first layout, so the UI
+    /// maps this node to its telemetry meter (`meters[flat_index]`) without
+    /// replicating the graph topology.
+    pub flat_index: NodeIdx,
     /// Stored parameter values (normalized 0..1) by name, so the chain panel's
     /// knobs open on the node's real values rather than the module defaults.
     pub params: BTreeMap<String, f32>,
@@ -177,6 +181,63 @@ pub struct NoteView {
     pub start_ticks: u64,
     pub length_ticks: u64,
     pub vel: u8,
+}
+
+/// A shallow, id-keyed diff between two project states, emitted to the UI after
+/// an external file reload so it can flash the notes that changed. Notes are
+/// matched by stable id across every track and clip.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectDiff {
+    pub added_notes: Vec<String>,
+    pub removed_notes: Vec<String>,
+    pub modified_notes: Vec<String>,
+}
+
+impl ProjectDiff {
+    /// Compare `prev` to `next` by note id: ids only in `next` are added, only in
+    /// `prev` are removed, and ids in both whose note differs are modified. Notes
+    /// without an id are ignored (they are normalised to ids before this runs).
+    pub fn between(prev: &Project, next: &Project) -> Self {
+        let before = note_index(prev);
+        let after = note_index(next);
+        let mut diff = ProjectDiff::default();
+        for (id, note) in &after {
+            match before.get(id) {
+                None => diff.added_notes.push((*id).clone()),
+                Some(old) if old != note => diff.modified_notes.push((*id).clone()),
+                Some(_) => {}
+            }
+        }
+        for id in before.keys() {
+            if !after.contains_key(*id) {
+                diff.removed_notes.push((*id).clone());
+            }
+        }
+        diff
+    }
+
+    /// True when nothing changed (used to suppress an empty UI flash).
+    pub fn is_empty(&self) -> bool {
+        self.added_notes.is_empty()
+            && self.removed_notes.is_empty()
+            && self.modified_notes.is_empty()
+    }
+}
+
+/// Map every id-bearing note of a project to its data, for diffing.
+fn note_index(project: &Project) -> std::collections::HashMap<&String, &Note> {
+    let mut map = std::collections::HashMap::new();
+    for track in &project.tracks {
+        for clip in &track.clips {
+            for note in &clip.notes {
+                if !note.id.is_empty() {
+                    map.insert(&note.id, note);
+                }
+            }
+        }
+    }
+    map
 }
 
 /// A reusable effect preset: a module plus its parameter values, **without** a
@@ -216,13 +277,21 @@ impl Project {
         Ok(project)
     }
 
+    /// Serialize to the on-disk JSON form (pretty, stable key order, trailing
+    /// newline). The single source of the bytes [`save`](Self::save) writes, so
+    /// the file watcher can recognise the app's own writes by comparing content.
+    /// // off-RT
+    pub fn to_json(&self) -> Result<String, ProjectError> {
+        let mut text = serde_json::to_string_pretty(self)?;
+        text.push('\n');
+        Ok(text)
+    }
+
     /// Write the project back to disk as pretty JSON (the source of truth stays
     /// text and diffable; key order is stable). A trailing newline keeps git and
     /// most editors happy. // off-RT
     pub fn save(&self, path: impl AsRef<Path>) -> Result<(), ProjectError> {
-        let mut text = serde_json::to_string_pretty(self)?;
-        text.push('\n');
-        std::fs::write(path, text).map_err(|e| ProjectError::Io(e.to_string()))
+        std::fs::write(path, self.to_json()?).map_err(|e| ProjectError::Io(e.to_string()))
     }
 
     pub fn ticks_per_bar_beat(&self) -> Result<(u64, u64), ProjectError> {
@@ -320,6 +389,9 @@ impl Project {
         let tpbar = self.ticks_per_bar()?;
         let tpbeat = self.ticks_per_beat()?;
         let mut tracks = Vec::with_capacity(self.tracks.len());
+        // Effects occupy the flat indices after the T instruments (`to_graph`
+        // pass 2, in track then chain order). Walked in the same order here.
+        let mut next_effect = self.tracks.len();
         for (track_idx, track) in self.tracks.iter().enumerate() {
             let mut clips = Vec::with_capacity(track.clips.len());
             for clip in &track.clips {
@@ -344,11 +416,23 @@ impl Project {
                 .chain
                 .iter()
                 .enumerate()
-                .map(|(i, node)| ChainNodeView {
-                    id: node.id.clone(),
-                    module: node.module.clone(),
-                    is_instrument: i == 0,
-                    params: node.params.clone(),
+                .map(|(i, node)| {
+                    // Instrument (chain head) keeps the track's leading index;
+                    // each effect takes the next post-instrument slot.
+                    let flat_index = if i == 0 {
+                        track_idx
+                    } else {
+                        let idx = next_effect;
+                        next_effect += 1;
+                        idx
+                    };
+                    ChainNodeView {
+                        id: node.id.clone(),
+                        module: node.module.clone(),
+                        is_instrument: i == 0,
+                        flat_index,
+                        params: node.params.clone(),
+                    }
                 })
                 .collect();
             tracks.push(TrackView {
@@ -530,6 +614,56 @@ mod tests {
         ]
     }"#;
 
+    // Two notes with ids, on one clip of one track, as a reload baseline.
+    const TWO_NOTES: &str = r#"{
+        "bpm": 120,
+        "tracks": [
+            { "id": "lead", "chain": [ { "id": "n1", "module": "subtractive" } ],
+              "clips": [ { "id": "c1", "start": "1.1.0", "length": "1.0.0", "notes": [
+                { "id": "a", "pitch": 60, "start": "1.1.0", "length": "0.1.0", "vel": 100 },
+                { "id": "b", "pitch": 64, "start": "1.2.0", "length": "0.1.0", "vel": 100 }
+              ] } ] }
+        ]
+    }"#;
+
+    #[test]
+    fn diff_classifies_notes_by_id() {
+        let prev: Project = serde_json::from_str(TWO_NOTES).unwrap();
+        let mut next = prev.clone();
+        // Drop "b", change "a"'s pitch, add a fresh "c".
+        let clip = &mut next.tracks[0].clips[0];
+        clip.notes.retain(|n| n.id != "b");
+        clip.notes[0].pitch = 72;
+        clip.notes.push(Note {
+            id: "c".into(),
+            pitch: 67,
+            start: "1.3.0".into(),
+            length: "0.1.0".into(),
+            vel: 100,
+        });
+        let diff = ProjectDiff::between(&prev, &next);
+        assert_eq!(diff.added_notes, vec!["c".to_string()]);
+        assert_eq!(diff.removed_notes, vec!["b".to_string()]);
+        assert_eq!(diff.modified_notes, vec!["a".to_string()]);
+        assert!(!diff.is_empty());
+    }
+
+    #[test]
+    fn diff_of_identical_projects_is_empty() {
+        let p: Project = serde_json::from_str(TWO_NOTES).unwrap();
+        assert!(ProjectDiff::between(&p, &p.clone()).is_empty());
+    }
+
+    #[test]
+    fn to_json_round_trips_so_a_self_write_is_recognised() {
+        // The watcher recognises the app's own write by comparing file content to
+        // `to_json()`. So serialising, reparsing and reserialising must be stable.
+        let p: Project = serde_json::from_str(TWO_NOTES).unwrap();
+        let written = p.to_json().unwrap();
+        let reparsed: Project = serde_json::from_str(&written).unwrap();
+        assert_eq!(written, reparsed.to_json().unwrap());
+    }
+
     #[test]
     fn preset_round_trips_through_json() {
         let mut params = BTreeMap::new();
@@ -600,6 +734,30 @@ mod tests {
         // The layout still compiles to a valid RT graph.
         crate::engine::graph::compile(&graph, crate::modules::registry::create, 48_000.0, 64)
             .unwrap();
+    }
+
+    #[test]
+    fn view_flat_index_matches_graph_layout() {
+        // The view's per-node `flat_index` must address the same node as the
+        // compiled graph's index, so a telemetry meter maps to the right card.
+        let song = r#"{ "bpm": 120, "tracks": [
+            { "id": "lead", "chain": [
+                { "id": "lead_synth", "module": "subtractive" },
+                { "id": "lead_gain", "module": "gain" } ] },
+            { "id": "bass", "chain": [ { "id": "bass_synth", "module": "subtractive" } ] }
+        ] }"#;
+        let project: Project = serde_json::from_str(song).unwrap();
+        let (graph, _index) = project.to_graph().unwrap();
+        let view = project.view().unwrap();
+        for track in &view.tracks {
+            for node in &track.chain {
+                assert_eq!(
+                    graph.nodes[node.flat_index].id, node.id,
+                    "flat_index {} does not address node {}",
+                    node.flat_index, node.id
+                );
+            }
+        }
     }
 
     #[test]

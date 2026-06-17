@@ -116,10 +116,8 @@ const held = reactive(new Set<number>());
 const params = ref<ParamInfo[]>([]);
 const paramValues = reactive<Record<number, number>>({});
 const graphNodes = ref<GraphNode[]>([]);
-const xruns = ref(0);
 const actionMsg = ref("");
 let fxCounter = 0;
-let statusTimer: number | undefined;
 
 async function loadDemo() {
   try {
@@ -221,13 +219,9 @@ function onKeyUp(event: KeyboardEvent) {
   if (offset !== undefined) void noteOff(FIRST_PITCH + offset);
 }
 
-async function refreshStatus() {
-  const status = await invoke<{ xruns: number; sampleRate: number }>("engine_status");
-  xruns.value = status.xruns;
-}
-
 onMounted(async () => {
   await telemetry.init();
+  await project.init(); // file-watcher listeners (external reload + note flash)
   await project.load();
   selectedTrackId.value = project.tracks[0]?.id ?? "";
   params.value = await invoke<ParamInfo[]>("module_params", { moduleId: "plucked" });
@@ -238,8 +232,6 @@ onMounted(async () => {
   window.addEventListener("pointerup", onDragUp);
   window.addEventListener("keydown", onDragKey);
   void refreshGraph();
-  void refreshStatus();
-  statusTimer = window.setInterval(refreshStatus, 1000);
 });
 
 onUnmounted(() => {
@@ -248,7 +240,6 @@ onUnmounted(() => {
   window.removeEventListener("pointermove", onDragMove);
   window.removeEventListener("pointerup", onDragUp);
   window.removeEventListener("keydown", onDragKey);
-  if (statusTimer !== undefined) window.clearInterval(statusTimer);
 });
 </script>
 
@@ -294,7 +285,6 @@ onUnmounted(() => {
           <button type="button" class="gbtn" @click="loadDemo">reload json</button>
           <button type="button" class="gbtn" @click="exportWav">export wav</button>
           <span class="action-msg">{{ actionMsg }}</span>
-          <span class="action-msg">xruns {{ xruns }}</span>
         </div>
 
         <div class="graph">

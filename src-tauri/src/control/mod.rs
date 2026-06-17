@@ -13,6 +13,7 @@ pub mod render;
 pub mod sequencer;
 pub mod telemetry_pump;
 pub mod undo;
+pub mod watcher;
 
 use std::path::{Path, PathBuf};
 

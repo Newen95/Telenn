@@ -5,6 +5,10 @@
 //! sequencer, runs the compiled graph, and writes the mono result to every
 //! output channel.
 
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
+
 use rtrb::Producer;
 
 use crate::control::sequencer::{Schedule, SequencerCursor};
@@ -14,7 +18,7 @@ use crate::engine::node::{NodeIdx, NoteEvent, NoteKind};
 use crate::engine::params::LinearRamp;
 use crate::engine::swap::{Declick, Garbage};
 use crate::engine::MAX_BLOCK;
-use crate::telemetry::frame::TelemetryFrame;
+use crate::telemetry::frame::{Meter, TelemetryFrame, MAX_METERS};
 
 /// Upper bound on simultaneously sounding sequencer notes we track for release.
 const MAX_SCHEDULED_NOTES: usize = 128;
@@ -104,6 +108,9 @@ pub struct RtState {
     garbage: Producer<Garbage>,
     /// Audio→control telemetry ring (one frame per callback; dropped if full).
     telemetry: Producer<TelemetryFrame>,
+    /// Shared cumulative xrun counter (written by the stream's error callback),
+    /// read here to stamp each telemetry frame. Relaxed load is RT-safe.
+    xruns: Arc<AtomicU32>,
 }
 
 impl RtState {
@@ -113,6 +120,7 @@ impl RtState {
         schedule: Schedule,
         garbage: Producer<Garbage>,
         telemetry: Producer<TelemetryFrame>,
+        xruns: Arc<AtomicU32>,
     ) -> Self {
         let mut master = LinearRamp::new(1.0, 10.0, sample_rate);
         master.set_target(1.0);
@@ -130,24 +138,8 @@ impl RtState {
             scheduled_on: ActiveNotes::new(),
             garbage,
             telemetry,
+            xruns,
         }
-    }
-
-    /// Release every note the sequencer is currently holding (their NoteOff
-    /// lived in the active schedule). Live keyboard notes are untracked here, so
-    /// they are left alone. // RT-SAFE
-    fn release_scheduled_notes(&mut self) {
-        for i in 0..self.scheduled_on.len {
-            let (node, pitch) = self.scheduled_on.notes[i];
-            self.graph.push_note(
-                node,
-                NoteEvent {
-                    frame: 0,
-                    kind: NoteKind::Off { pitch },
-                },
-            );
-        }
-        self.scheduled_on.clear();
     }
 
     /// Apply a control message. // RT-SAFE
@@ -179,34 +171,73 @@ impl RtState {
             ),
             ControlMsg::SetParam { node, param, value } => self.graph.set_param(node, param, value),
             ControlMsg::SetSchedule(mut incoming) => {
-                // Release the notes the old sequence was holding: their NoteOff
-                // lived in the schedule we're about to drop, so without this they
-                // would ring forever. The live keyboard is untracked and survives
-                // the reload. The release is a normal envelope tail (click-free).
-                self.release_scheduled_notes();
                 // Swap pointers (no allocation) and keep the playhead so the new
                 // sequence resumes at the current position — only the event list
                 // changes, the graph and its voices are untouched.
                 std::mem::swap(&mut self.schedule, &mut incoming);
                 self.cursor.reseat(&self.schedule);
-                // Restrike the notes the new sequence already has in progress at
-                // the resume point, so there is no gap until the next downbeat.
-                // Only while playing: a swap is also how an edit (add/move/resize/
-                // delete) reaches the audio thread, and when stopped the playhead
-                // sits on the sequence's first notes — restriking them would chime
-                // on every edit. Stopped means silent; resume-without-gap only
-                // matters during playback.
+
+                // Reconcile the sounding sequencer notes with the new sequence by
+                // (node, pitch), so unchanged notes keep ringing across the
+                // reload instead of being released and re-attacked:
+                //   A = notes currently held (`scheduled_on`),
+                //   N = notes the new sequence has in progress at the playhead.
+                //   A∩N → keep (do nothing); A\N → release; N\A → strike.
+                // A note whose only change is velocity stays in A∩N — left
+                // untouched, the new velocity applying at its next trigger.
+                // Re-attacking it just to update the attack loudness would
+                // reintroduce the very glitch this reconciliation removes.
+                //
+                // Only while playing: when stopped a swap is how an edit reaches
+                // the audio thread and must stay silent; the playhead sits at the
+                // start with nothing held, so there is nothing to reconcile.
                 if self.playing {
-                    let cursor = &self.cursor;
-                    let schedule = &self.schedule;
-                    let graph = &mut self.graph;
-                    let active = &mut self.scheduled_on;
-                    cursor.strike_active(schedule, |node, ev| {
-                        graph.push_note(node, ev);
-                        if let NoteKind::On { pitch, .. } = ev.kind {
-                            active.on(node, pitch);
+                    // Stack scratch (no allocation): the new in-progress set.
+                    let mut buf = [(0usize, 0u8, 0u8); MAX_SCHEDULED_NOTES];
+                    let n = self.cursor.active_notes(&self.schedule, &mut buf);
+                    let new_active = &buf[..n];
+
+                    // A\N: held notes no longer in progress → release (the voice
+                    // rings out on its envelope; click-free).
+                    for i in 0..self.scheduled_on.len {
+                        let (node, pitch) = self.scheduled_on.notes[i];
+                        let still_on = new_active
+                            .iter()
+                            .any(|&(nn, np, _)| nn == node && np == pitch);
+                        if !still_on {
+                            self.graph.push_note(
+                                node,
+                                NoteEvent {
+                                    frame: 0,
+                                    kind: NoteKind::Off { pitch },
+                                },
+                            );
                         }
-                    });
+                    }
+                    // N\A: newly in-progress notes not already held → strike.
+                    for &(node, pitch, vel) in new_active {
+                        let already = self.scheduled_on.notes[..self.scheduled_on.len]
+                            .iter()
+                            .any(|&(hn, hp)| hn == node && hp == pitch);
+                        if !already {
+                            self.graph.push_note(
+                                node,
+                                NoteEvent {
+                                    frame: 0,
+                                    kind: NoteKind::On { pitch, vel },
+                                },
+                            );
+                        }
+                    }
+                    // scheduled_on = N.
+                    self.scheduled_on.clear();
+                    for &(node, pitch, _) in new_active {
+                        self.scheduled_on.on(node, pitch);
+                    }
+                } else {
+                    // Stopped: nothing is held and nothing must sound. Keep the
+                    // invariant that `scheduled_on` is empty so a later Play is clean.
+                    self.scheduled_on.clear();
                 }
                 // Return the old schedule for off-RT drop.
                 discard(&mut self.garbage, Garbage::Schedule(incoming));
@@ -243,6 +274,10 @@ impl RtState {
         let total = out.len() / channels;
         let mut off = 0;
         let mut peak = 0.0f32;
+        // Bracket only the graph computation (never the device wait, which lives
+        // outside this call). `Instant::now` is a monotonic clock read — a VDSO
+        // call on Windows/Linux: non-blocking, no allocation, no lock. // RT-SAFE
+        let compute_start = Instant::now();
         while off < total {
             let n = (total - off).min(MAX_BLOCK);
 
@@ -309,12 +344,33 @@ impl RtState {
             self.graph.clear_notes();
         }
 
-        // One telemetry frame per callback (latest playhead, block peak). Dropped
-        // if the ring is full — the pump drains far faster in practice. // RT-SAFE
+        // Compute load = graph time / the block's real-time budget (N/SR), not
+        // the wall-clock gap between callbacks. Above 1.0 means the block did not
+        // fit its budget. // RT-SAFE
+        let audio_load = if total > 0 {
+            let budget = total as f32 / self.sample_rate;
+            compute_start.elapsed().as_secs_f32() / budget
+        } else {
+            0.0
+        };
+
+        // Copy the per-node meters (capped to MAX_METERS) into the frame, keeping
+        // the node-index alignment so the UI maps meter[i] → node id. // RT-SAFE
+        let src = self.graph.meters();
+        let meter_count = src.len().min(MAX_METERS);
+        let mut meters = [Meter::default(); MAX_METERS];
+        meters[..meter_count].copy_from_slice(&src[..meter_count]);
+
+        // One telemetry frame per callback. Dropped if the ring is full — the
+        // pump drains far faster in practice. // RT-SAFE
         let _ = self.telemetry.push(TelemetryFrame {
             playhead_samples: self.cursor.playhead(),
             playing: self.playing,
             master_peak: peak,
+            audio_load,
+            xruns: self.xruns.load(Ordering::Relaxed),
+            meter_count: meter_count as u8,
+            meters,
         });
     }
 }
@@ -341,7 +397,8 @@ pub fn render_offline_via_rtstate(
 
     let (prod, _cons) = rtrb::RingBuffer::<Garbage>::new(8);
     let (tprod, _t) = rtrb::RingBuffer::<TelemetryFrame>::new(64);
-    let mut rt = RtState::new(sample_rate as f32, graph, schedule, prod, tprod);
+    let xruns = Arc::new(AtomicU32::new(0));
+    let mut rt = RtState::new(sample_rate as f32, graph, schedule, prod, tprod, xruns);
     rt.handle(ControlMsg::Transport(TransportCmd::Play));
 
     let mut out = Vec::with_capacity(total);
@@ -404,7 +461,11 @@ mod tests {
         let (graph, schedule) = init(48_000.0, MAX_BLOCK).expect("graph compiles");
         let (prod, cons) = rtrb::RingBuffer::<Garbage>::new(8);
         let (tprod, _t) = rtrb::RingBuffer::<TelemetryFrame>::new(64);
-        (RtState::new(48_000.0, graph, schedule, prod, tprod), cons)
+        let xruns = Arc::new(AtomicU32::new(0));
+        (
+            RtState::new(48_000.0, graph, schedule, prod, tprod, xruns),
+            cons,
+        )
     }
 
     #[test]
@@ -439,6 +500,43 @@ mod tests {
         );
         // The displaced schedule came back for off-RT drop.
         assert!(garbage.pop().is_ok(), "old schedule was not returned");
+    }
+
+    #[test]
+    fn telemetry_frame_carries_meters_load_and_xruns() {
+        // Build an RtState keeping the telemetry consumer, plus a shared xrun
+        // counter we bump to prove it is stamped onto the frame.
+        let (init, _index, _project, _path) = crate::control::build_demo().expect("demo builds");
+        let (graph, schedule) = init(48_000.0, MAX_BLOCK).expect("graph compiles");
+        let (prod, _cons) = rtrb::RingBuffer::<Garbage>::new(8);
+        let (tprod, mut tcons) = rtrb::RingBuffer::<TelemetryFrame>::new(64);
+        let xruns = Arc::new(AtomicU32::new(0));
+        let mut rt = RtState::new(48_000.0, graph, schedule, prod, tprod, Arc::clone(&xruns));
+
+        xruns.store(3, Ordering::Relaxed); // as if the device reported 3 underruns
+        rt.handle(ControlMsg::Transport(TransportCmd::Play));
+        let mut out = vec![0.0f32; 256 * 2];
+        rt.process(&mut out, 2);
+
+        let frame = tcons.pop().expect("a telemetry frame was pushed");
+        assert_eq!(
+            frame.xruns, 3,
+            "xruns must be stamped from the shared counter"
+        );
+        assert!(
+            frame.meter_count as usize >= 1,
+            "the demo graph has metered nodes"
+        );
+        assert!(
+            frame.audio_load >= 0.0 && frame.audio_load.is_finite(),
+            "audio load must be a finite ratio: {}",
+            frame.audio_load
+        );
+        // The sequencer's downbeat is sounding, so some node meter is non-zero.
+        let peak = frame.meters[..frame.meter_count as usize]
+            .iter()
+            .fold(0.0f32, |m, x| m.max(x.peak));
+        assert!(peak > 0.0, "playing graph should register on a node meter");
     }
 
     #[test]
@@ -488,6 +586,155 @@ mod tests {
         assert!(end < 1e-3, "sequenced notes rang on after the swap: {end}");
     }
 
+    // --- Diff-aware reload reconciliation (no re-attack of unchanged notes) ---
+
+    /// One sustained note as two scheduled events, on the instrument (node 0).
+    fn note(pitch: u8, on: u64, off: u64) -> [ScheduledEvent; 2] {
+        [
+            ScheduledEvent {
+                pos: on,
+                node: 0,
+                kind: NoteKind::On { pitch, vel: 100 },
+            },
+            ScheduledEvent {
+                pos: off,
+                node: 0,
+                kind: NoteKind::Off { pitch },
+            },
+        ]
+    }
+
+    /// A playing `RtState` whose held notes are `schedule`'s, with the playhead
+    /// nudged just past the downbeat and the note queue cleared — so a later
+    /// `SetSchedule` reconciles against held notes, not the downbeat.
+    fn playing_with(mut events: Vec<ScheduledEvent>) -> RtState {
+        let (init, _index, _project, _path) = crate::control::build_demo().expect("demo builds");
+        let (graph, _sched) = init(48_000.0, MAX_BLOCK).expect("graph compiles");
+        let (prod, _cons) = rtrb::RingBuffer::<Garbage>::new(8);
+        let (tprod, _t) = rtrb::RingBuffer::<TelemetryFrame>::new(64);
+        let xruns = Arc::new(AtomicU32::new(0));
+        // The schedule must be sorted by position (advance/active_notes stop at
+        // the first event past the playhead).
+        events.sort_by_key(|e| e.pos);
+        let schedule = Schedule {
+            events,
+            loop_len: 1_000_000,
+        };
+        let mut rt = RtState::new(48_000.0, graph, schedule, prod, tprod, xruns);
+        rt.handle(ControlMsg::Transport(TransportCmd::Play));
+        // Process one block: the downbeat notes are struck (via `advance`) and
+        // consumed, `scheduled_on` now holds them, and the queue is clear.
+        let mut out = vec![0.0f32; 64];
+        rt.process(&mut out, 1);
+        rt
+    }
+
+    fn pushed_on(notes: &[NoteEvent], pitch: u8) -> bool {
+        notes
+            .iter()
+            .any(|e| matches!(e.kind, NoteKind::On { pitch: p, .. } if p == pitch))
+    }
+    fn pushed_off(notes: &[NoteEvent], pitch: u8) -> bool {
+        notes
+            .iter()
+            .any(|e| matches!(e.kind, NoteKind::Off { pitch: p } if p == pitch))
+    }
+
+    #[test]
+    fn reload_keeps_an_unchanged_note_while_adding_others() {
+        // The dominant live-coding case: a note is sounding while two notes are
+        // added elsewhere in the sequence. The sounding note is unchanged, so the
+        // reload must push NO note event for it — it keeps ringing, never
+        // re-attacked. This is exactly what every Claude Code save looks like.
+        let mut rt = playing_with(note(60, 0, 500_000).to_vec());
+
+        let mut next = note(60, 0, 500_000).to_vec(); // the unchanged held note
+        next.extend(note(67, 100_000, 110_000)); // added, far in the future
+        next.extend(note(72, 120_000, 130_000)); // added, far in the future
+        rt.handle(ControlMsg::SetSchedule(Box::new(Schedule {
+            events: next,
+            loop_len: 1_000_000,
+        })));
+
+        assert!(
+            rt.graph.pending_notes(0).is_empty(),
+            "an unchanged sounding note must not be released or re-struck on reload"
+        );
+    }
+
+    #[test]
+    fn reload_with_a_pitch_change_releases_old_and_strikes_new() {
+        let mut rt = playing_with(note(60, 0, 500_000).to_vec());
+        rt.handle(ControlMsg::SetSchedule(Box::new(Schedule {
+            events: note(64, 0, 500_000).to_vec(), // same span, pitch 60 → 64
+            loop_len: 1_000_000,
+        })));
+        let pending = rt.graph.pending_notes(0);
+        assert!(pushed_off(pending, 60), "the old pitch must be released");
+        assert!(pushed_on(pending, 64), "the new pitch must be struck");
+        assert_eq!(pending.len(), 2, "nothing else should be touched");
+    }
+
+    #[test]
+    fn reload_releases_only_the_removed_note() {
+        // Two notes sounding; the reload drops one and keeps the other. Only the
+        // removed note is released; the kept note is left untouched.
+        let mut held = note(60, 0, 500_000).to_vec();
+        held.extend(note(62, 0, 500_000));
+        let mut rt = playing_with(held);
+
+        rt.handle(ControlMsg::SetSchedule(Box::new(Schedule {
+            events: note(60, 0, 500_000).to_vec(), // 62 removed
+            loop_len: 1_000_000,
+        })));
+        let pending = rt.graph.pending_notes(0);
+        assert!(pushed_off(pending, 62), "the removed note must be released");
+        assert!(
+            !pushed_off(pending, 60),
+            "the kept note must not be released"
+        );
+        assert!(
+            !pushed_on(pending, 60),
+            "the kept note must not be re-struck"
+        );
+        assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
+    fn reload_strikes_a_note_newly_overlapping_the_playhead() {
+        // Nothing held; the reload adds a note already in progress at the
+        // playhead → it must be struck so it sounds without waiting for a downbeat.
+        let mut rt = playing_with(Vec::new());
+        rt.handle(ControlMsg::SetSchedule(Box::new(Schedule {
+            events: note(60, 0, 500_000).to_vec(),
+            loop_len: 1_000_000,
+        })));
+        let pending = rt.graph.pending_notes(0);
+        assert!(
+            pushed_on(pending, 60),
+            "a newly in-progress note must be struck"
+        );
+        assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
+    fn reload_releases_a_note_shortened_under_the_playhead() {
+        // A sounding note shortened so its new NoteOff now sits before the
+        // playhead is no longer in progress → it must be released, not left
+        // ringing (no stuck voice).
+        let mut rt = playing_with(note(60, 0, 500_000).to_vec());
+        rt.handle(ControlMsg::SetSchedule(Box::new(Schedule {
+            events: note(60, 0, 32).to_vec(), // Off at 32, playhead is at 64
+            loop_len: 1_000_000,
+        })));
+        let pending = rt.graph.pending_notes(0);
+        assert!(
+            pushed_off(pending, 60),
+            "a note shortened under the playhead must be released"
+        );
+        assert_eq!(pending.len(), 1);
+    }
+
     #[test]
     fn reload_restrikes_a_note_in_progress() {
         // Regression: reloading mid-sequence must restrike a note the new
@@ -500,7 +747,8 @@ mod tests {
             loop_len: 192_000,
         };
         let (tprod, _t) = rtrb::RingBuffer::<TelemetryFrame>::new(64);
-        let mut rt = RtState::new(48_000.0, graph, empty, prod, tprod);
+        let xruns = Arc::new(AtomicU32::new(0));
+        let mut rt = RtState::new(48_000.0, graph, empty, prod, tprod, xruns);
 
         rt.handle(ControlMsg::Transport(TransportCmd::Play));
         let mut out = vec![0.0f32; 4096 * 2];
@@ -528,12 +776,12 @@ mod tests {
             loop_len: 192_000,
         });
         rt.handle(ControlMsg::SetSchedule(next));
-        let mut after = vec![0.0f32; 4096 * 2];
-        rt.process(&mut after, 2);
-        let peak = after.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        // The note is in progress at the playhead and was not held before, so the
+        // reload must strike it (asserted on the pushed events, independent of the
+        // demo mix level).
         assert!(
-            peak > 0.01,
-            "in-progress note was not restruck on reload: {peak}"
+            pushed_on(rt.graph.pending_notes(0), 60),
+            "in-progress note was not restruck on reload"
         );
     }
 
@@ -702,7 +950,8 @@ mod tests {
         let graph_a = compile(&tail, test_support::create, 48_000.0, MAX_BLOCK).unwrap();
         let (prod, _cons) = rtrb::RingBuffer::<Garbage>::new(8);
         let (tprod, _t) = rtrb::RingBuffer::<TelemetryFrame>::new(64);
-        let mut rt = RtState::new(48_000.0, graph_a, Schedule::default(), prod, tprod);
+        let xruns = Arc::new(AtomicU32::new(0));
+        let mut rt = RtState::new(48_000.0, graph_a, Schedule::default(), prod, tprod, xruns);
 
         let mut buf = vec![0.0f32; 256];
         rt.process(&mut buf, 1);

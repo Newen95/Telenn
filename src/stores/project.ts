@@ -8,6 +8,16 @@
 import { defineStore } from "pinia";
 import { ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+
+import { flashIntensity, FLASH_MS } from "../views/canvas/flash";
+
+/** Id-keyed diff emitted by the backend after an external `song.json` reload. */
+interface ProjectDiff {
+  addedNotes: string[];
+  removedNotes: string[];
+  modifiedNotes: string[];
+}
 
 export interface NoteView {
   id: string;
@@ -28,6 +38,8 @@ export interface ChainNodeView {
   id: string;
   module: string;
   isInstrument: boolean;
+  /** Flat graph index (instruments-first layout) → its telemetry meter. */
+  flatIndex: number;
   /** Stored parameter values (normalized 0..1) by name. */
   params: Record<string, number>;
 }
@@ -80,6 +92,42 @@ export const useProjectStore = defineStore("project", () => {
     ppq.value = view.ppq;
     timeSignature.value = view.timeSignature;
     tracks.value = view.tracks;
+  }
+
+  // Notes flashing after an external reload: note id → flash start (ms). Plain
+  // (non-reactive) — the canvas polls it each frame via `noteFlash`/`anyFlash`.
+  const flashStart = new Map<string, number>();
+  /** Latest external-edit error, if the changed file failed to parse. */
+  const lastError = ref<string | null>(null);
+
+  /** Register the file-watcher listeners: external reloads refresh the view and
+   *  flash the notes that changed; a parse error is surfaced, no reload. */
+  async function init(): Promise<void> {
+    await listen<ProjectDiff>("project_changed", async (e) => {
+      await load();
+      const now = performance.now();
+      for (const id of e.payload.addedNotes) flashStart.set(id, now);
+      for (const id of e.payload.modifiedNotes) flashStart.set(id, now);
+      lastError.value = null;
+    });
+    await listen<string>("project_error", (e) => {
+      lastError.value = e.payload;
+    });
+  }
+
+  /** Flash intensity (1 → 0) of a note at time `now`; 0 if not flashing. */
+  function noteFlash(id: string, now: number): number {
+    const a = flashIntensity(flashStart.get(id), now);
+    if (a === 0) flashStart.delete(id); // purge once faded
+    return a;
+  }
+
+  /** Whether any note is still within its flash window (drives the redraw). */
+  function anyFlash(now: number): boolean {
+    for (const start of flashStart.values()) {
+      if (now - start < FLASH_MS) return true;
+    }
+    return false;
   }
 
   /** Apply `fn` to the note with `id`, wherever it lives (optimistic mirror). */
@@ -246,6 +294,10 @@ export const useProjectStore = defineStore("project", () => {
     timeSignature,
     tracks,
     presetsVersion,
+    lastError,
+    init,
+    noteFlash,
+    anyFlash,
     load,
     addNote,
     moveNote,

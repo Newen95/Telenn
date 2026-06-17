@@ -90,56 +90,45 @@ impl SequencerCursor {
         self.idx = schedule.events.partition_point(|e| e.pos < self.playhead);
     }
 
-    /// Emit a NoteOn for every note already in progress at the current playhead
-    /// (its NoteOn is at or before the playhead, its NoteOff strictly after). Run
-    /// after a reseat (reload/seek) so resuming mid-sequence restrikes the
-    /// sounding notes instead of leaving a gap until the next downbeat.
+    /// Fill `out` with every note in progress at the current playhead — its
+    /// NoteOn at or before the playhead, its NoteOff strictly after — as
+    /// `(node, pitch, vel)`, and return how many. A note whose NoteOff has
+    /// already passed (e.g. shortened under the playhead) is not in progress and
+    /// is left out. Used after a reseat (reload/seek) to reconcile the sounding
+    /// notes with the new sequence.
     ///
-    /// Bounded by the number of events up to the playhead and only called on a
-    /// (rare) reload; the on/off bookkeeping uses a fixed stack scratch, so it
-    /// allocates nothing. // RT-SAFE
-    pub fn strike_active(&self, schedule: &Schedule, mut emit: impl FnMut(NodeIdx, NoteEvent)) {
-        const SCRATCH: usize = 128;
-        let mut active: [(NodeIdx, u8, u8); SCRATCH] = [(0, 0, 0); SCRATCH];
+    /// Bounded by `out.len()`; the on/off bookkeeping writes only into `out`, so
+    /// it allocates nothing. // RT-SAFE
+    pub fn active_notes(&self, schedule: &Schedule, out: &mut [(NodeIdx, u8, u8)]) -> usize {
         let mut len = 0usize;
-
         for ev in &schedule.events {
             if ev.pos > self.playhead {
                 break; // events are sorted; nothing after the playhead is on yet
             }
             match ev.kind {
                 NoteKind::On { pitch, vel } => {
-                    if let Some(slot) = active[..len]
+                    if let Some(slot) = out[..len]
                         .iter_mut()
                         .find(|n| n.0 == ev.node && n.1 == pitch)
                     {
                         slot.2 = vel;
-                    } else if len < SCRATCH {
-                        active[len] = (ev.node, pitch, vel);
+                    } else if len < out.len() {
+                        out[len] = (ev.node, pitch, vel);
                         len += 1;
                     }
                 }
                 NoteKind::Off { pitch } => {
-                    if let Some(i) = active[..len]
+                    if let Some(i) = out[..len]
                         .iter()
                         .position(|n| n.0 == ev.node && n.1 == pitch)
                     {
                         len -= 1;
-                        active[i] = active[len];
+                        out[i] = out[len];
                     }
                 }
             }
         }
-
-        for &(node, pitch, vel) in &active[..len] {
-            emit(
-                node,
-                NoteEvent {
-                    frame: 0,
-                    kind: NoteKind::On { pitch, vel },
-                },
-            );
-        }
+        len
     }
 
     /// Advance the playhead by `frames` samples, emitting every event that falls
@@ -232,6 +221,83 @@ mod tests {
         got.clear();
         cur.advance(200, &schedule, |_n, e| got.push((e.frame, 0)));
         assert_eq!(got.iter().map(|g| g.0).collect::<Vec<_>>(), vec![100]);
+    }
+
+    #[test]
+    fn active_notes_returns_notes_in_progress_at_the_playhead() {
+        // Note A spans [0, 400) at pitch 60; note B spans [200, 600) at pitch 62.
+        let schedule = Schedule {
+            events: vec![
+                ev(0, 60, true),
+                ev(200, 62, true),
+                ev(400, 60, false),
+                ev(600, 62, false),
+            ],
+            loop_len: 1000,
+        };
+        let mut cur = SequencerCursor::new();
+        let mut out = [(0usize, 0u8, 0u8); 16];
+
+        // At 300: both A and B are in progress.
+        cur.seek(300, &schedule);
+        let n = cur.active_notes(&schedule, &mut out);
+        let mut got: Vec<u8> = out[..n].iter().map(|x| x.1).collect();
+        got.sort_unstable();
+        assert_eq!(got, vec![60, 62]);
+
+        // At 100: only A.
+        cur.seek(100, &schedule);
+        let n = cur.active_notes(&schedule, &mut out);
+        assert_eq!(n, 1);
+        assert_eq!(out[0].1, 60);
+
+        // At 500: A has ended (its Off at 400 has passed), only B remains.
+        cur.seek(500, &schedule);
+        let n = cur.active_notes(&schedule, &mut out);
+        assert_eq!(n, 1);
+        assert_eq!(out[0].1, 62);
+    }
+
+    #[test]
+    fn active_notes_excludes_a_note_whose_off_has_passed() {
+        // A note shortened so its Off (200) sits before the playhead (300) is no
+        // longer in progress — the reconciliation will release it, not keep it.
+        let schedule = Schedule {
+            events: vec![ev(0, 60, true), ev(200, 60, false)],
+            loop_len: 1000,
+        };
+        let mut cur = SequencerCursor::new();
+        cur.seek(300, &schedule);
+        let mut out = [(0usize, 0u8, 0u8); 16];
+        assert_eq!(cur.active_notes(&schedule, &mut out), 0);
+    }
+
+    #[test]
+    fn active_notes_captures_the_latest_velocity() {
+        let schedule = Schedule {
+            events: vec![
+                ScheduledEvent {
+                    pos: 0,
+                    node: 0,
+                    kind: NoteKind::On { pitch: 60, vel: 80 },
+                },
+                ScheduledEvent {
+                    pos: 100,
+                    node: 0,
+                    kind: NoteKind::On {
+                        pitch: 60,
+                        vel: 120,
+                    },
+                },
+            ],
+            loop_len: 1000,
+        };
+        let mut cur = SequencerCursor::new();
+        cur.seek(200, &schedule);
+        let mut out = [(0usize, 0u8, 0u8); 16];
+        let n = cur.active_notes(&schedule, &mut out);
+        assert_eq!(n, 1);
+        assert_eq!(out[0].2, 120, "the later velocity wins");
     }
 
     #[test]

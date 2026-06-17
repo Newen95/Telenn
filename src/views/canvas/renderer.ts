@@ -48,6 +48,7 @@ const BEAT_LINE = "#2a2a2c";
 const BAR_LINE = "#3c3c3f";
 const PLAYHEAD = "#e0b050";
 const SELECTED = "#f6f6f6";
+const FLASH = "#e0b050"; // externally-edited notes pulse in the accent amber
 const GHOST_FILL = "rgba(246, 246, 246, 0.35)";
 const GUTTER_BG = "#161618";
 const GUTTER_WHITE = "#e6e6e9"; // bright white keys, read at a glance
@@ -69,6 +70,8 @@ export function draw(
   playheadTick: number,
   overlay?: Overlay,
   gutter?: GutterStyle,
+  /** Flash intensity (1 → 0) for a block by its `ref`; 0 (or omitted) = none. */
+  flash?: (ref: unknown) => number,
 ): void {
   ctx.fillStyle = BG;
   ctx.fillRect(0, 0, w, h);
@@ -108,7 +111,17 @@ export function draw(
     const y = laneToY(vp, b.lane);
     if (y + vp.laneHeight < 0 || y > h) continue;
     ctx.fillStyle = b.color;
-    ctx.fillRect(x, y + 1, Math.max(bw, 1.5), vp.laneHeight - 2);
+    const rw = Math.max(bw, 1.5);
+    ctx.fillRect(x, y + 1, rw, vp.laneHeight - 2);
+    // A note changed by an external reload pulses, fading over its flash window.
+    const a = flash ? flash(b.ref) : 0;
+    if (a > 0) {
+      ctx.save();
+      ctx.globalAlpha = a;
+      ctx.fillStyle = FLASH;
+      ctx.fillRect(x, y + 1, rw, vp.laneHeight - 2);
+      ctx.restore();
+    }
   }
 
   // Selection outline and the drag ghost, on top of the blocks.

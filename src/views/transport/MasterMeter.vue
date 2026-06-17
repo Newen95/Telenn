@@ -6,8 +6,7 @@ import { onMounted, onUnmounted, ref } from "vue";
 import { useI18n } from "vue-i18n";
 
 import { useTelemetryStore } from "../../stores/telemetry";
-
-const RELEASE_S = 0.3;
+import { ballistic } from "./meterBallistics";
 
 const { t } = useI18n();
 const telemetry = useTelemetryStore();
@@ -19,12 +18,7 @@ function loop(): void {
   const now = performance.now();
   const dt = (now - last) / 1000;
   last = now;
-  const peak = telemetry.masterPeak;
-  if (peak > level.value) {
-    level.value = peak; // instant attack
-  } else {
-    level.value = Math.max(0, level.value - dt / RELEASE_S); // linear release
-  }
+  level.value = ballistic(level.value, telemetry.masterPeak, dt);
   raf = requestAnimationFrame(loop);
 }
 

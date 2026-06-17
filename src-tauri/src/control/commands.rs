@@ -5,11 +5,11 @@ use std::sync::Mutex;
 
 use tauri::State;
 
-use crate::control::project::{Preset, Project, ProjectView};
+use crate::control::project::{Preset, Project, ProjectDiff, ProjectView};
 use crate::control::sequencer::Schedule;
 use crate::control::undo::EditHistory;
 use crate::control::{
-    clip_edit, graph_edit, note_edit, render, ControlMsg, ProjectFile, TransportCmd,
+    clip_edit, graph_edit, ids, note_edit, render, ControlMsg, ProjectFile, TransportCmd,
 };
 use crate::engine::graph::{compile, GraphDesc};
 use crate::engine::node::ParamId;
@@ -145,6 +145,43 @@ fn apply_restored(engine: &AudioEngine, prev: &Project, restored: &Project) -> R
         set_schedule(engine, new_sched)?;
     }
     Ok(())
+}
+
+/// Reload `song.json` after the file watcher saw it change on disk. Returns the
+/// id-keyed diff to flash in the UI, or `None` when the file is byte-identical to
+/// the in-memory project (the app's own write echoing back — never a reload loop).
+///
+/// The file wins: the reloaded state is hot-swapped onto the audio thread
+/// (graph and/or schedule, whichever changed) and committed to the undo history
+/// so the external change can be undone. Id-less notes are normalised and the
+/// file rewritten (that rewrite is itself a deduped echo).
+pub(crate) fn reload_after_external_change(
+    engine: &AudioEngine,
+    history: &Mutex<EditHistory>,
+    file: &ProjectFile,
+) -> Result<Option<ProjectDiff>, String> {
+    let disk = std::fs::read_to_string(&file.0).map_err(|e| e.to_string())?;
+    let mut history = history.lock().map_err(|_| "edit state poisoned")?;
+
+    // Our own write echoing back? Compare against the exact bytes we would write.
+    if let Ok(current) = history.project().to_json() {
+        if current == disk {
+            return Ok(None);
+        }
+    }
+
+    let mut next: Project = serde_json::from_str(&disk).map_err(|e| e.to_string())?;
+    let normalized = ids::normalize(&mut next);
+    let prev = history.project().clone();
+    apply_restored(engine, &prev, &next)?;
+    let diff = ProjectDiff::between(&prev, &next);
+    history.commit(next);
+    // Persist the id assignment so the on-disk file matches memory; without this
+    // the next watcher tick would see a mismatch and reload in a loop.
+    if normalized {
+        persist(&history, file);
+    }
+    Ok(Some(diff))
 }
 
 #[tauri::command]

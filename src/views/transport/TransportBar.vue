@@ -1,12 +1,19 @@
 <script setup lang="ts">
-import { ref } from "vue";
+import { computed, ref } from "vue";
 import { useI18n } from "vue-i18n";
 import { invoke } from "@tauri-apps/api/core";
 
 import MasterMeter from "./MasterMeter.vue";
+import { useTelemetryStore } from "../../stores/telemetry";
 
 const { t } = useI18n();
+const telemetry = useTelemetryStore();
 const playing = ref(false);
+
+// CPU load and xrun count, streamed from the audio thread via telemetry. The
+// readout turns red past 80 % of the real-time budget (close to underrunning).
+const cpuPercent = computed(() => Math.round(telemetry.audioLoad * 100));
+const cpuHot = computed(() => telemetry.audioLoad > 0.8);
 
 async function play(): Promise<void> {
   await invoke("transport_play");
@@ -26,6 +33,9 @@ async function stop(): Promise<void> {
     </button>
     <button type="button" class="tbtn" @click="stop">⏹ {{ t("transport.stop") }}</button>
     <MasterMeter />
+    <span class="engine-load" :class="{ hot: cpuHot }">
+      {{ t("meter.cpu") }} {{ cpuPercent }}% · {{ t("meter.xruns") }} {{ telemetry.xruns }}
+    </span>
   </header>
 </template>
 
@@ -53,5 +63,15 @@ async function stop(): Promise<void> {
 .tbtn.active {
   background: #2f7d5b;
   border-color: #2f7d5b;
+}
+
+.engine-load {
+  font-size: 0.75rem;
+  color: #8e8e93;
+  font-variant-numeric: tabular-nums;
+}
+
+.engine-load.hot {
+  color: #e0564f;
 }
 </style>

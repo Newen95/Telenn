@@ -29,6 +29,7 @@ pub fn run() {
     let engine = engine::AudioEngine::start(init, index, telemetry_prod)
         .expect("failed to start the audio engine");
     let history = Mutex::new(EditHistory::new(project));
+    let watch_path = project_path.clone();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -37,6 +38,7 @@ pub fn run() {
         .manage(control::ProjectFile(project_path))
         .setup(move |app| {
             control::telemetry_pump::spawn(app.handle().clone(), telemetry_cons);
+            control::watcher::spawn(app.handle().clone(), watch_path);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

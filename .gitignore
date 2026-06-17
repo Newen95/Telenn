@@ -25,3 +25,6 @@ dist-ssr
 
 # Generated audio exports (binary, not diffable — regenerate with export_wav)
 projects/**/*.wav
+
+# Saved effect presets are runtime user data (recreated on demand by save_preset)
+projects/*/presets/

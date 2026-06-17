@@ -10,6 +10,7 @@ import { useI18n } from "vue-i18n";
 import { useProjectStore, type ChainNodeView, type ParamInfo } from "../../stores/project";
 import { useChainDrag, type DropTarget } from "./dragdrop";
 import { ChainSelection } from "./selection";
+import NodeMeter from "./NodeMeter.vue";
 
 const { t } = useI18n();
 const project = useProjectStore();
@@ -177,6 +178,8 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
               @input="project.setNodeParam(node.id, p.name, sliderValue($event))"
               @change="project.commitNodeParam(node.id, p.name, sliderValue($event))"
             />
+            <!-- Live VU from the audio thread (peak + RMS), mapped by flat index. -->
+            <NodeMeter :index="node.flatIndex" />
           </div>
         </div>
         <!-- Trailing gap = append to the end of the chain. -->

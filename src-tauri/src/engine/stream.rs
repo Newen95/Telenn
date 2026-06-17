@@ -176,7 +176,14 @@ fn build_stream(
     let channels = config.channels as usize;
 
     let (graph, schedule) = init(sample_rate as f32, MAX_BLOCK)?;
-    let mut rt = RtState::new(sample_rate as f32, graph, schedule, garbage, telemetry);
+    let mut rt = RtState::new(
+        sample_rate as f32,
+        graph,
+        schedule,
+        garbage,
+        telemetry,
+        Arc::clone(&xruns),
+    );
     let err_xruns = Arc::clone(&xruns);
 
     let stream = device

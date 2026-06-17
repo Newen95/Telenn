@@ -115,7 +115,10 @@ function frame(ctx: CanvasRenderingContext2D, w: number, h: number): void {
   const samples = telemetry.currentSamples(performance.now());
   const tick = samplesToTicks(samples, project.bpm, telemetry.sampleRate, project.ppq);
   const overlay = fsm ? { ghost: fsm.ghost(), selected: fsm.selected } : undefined;
-  draw(ctx, w, h, vp, props.grid, props.blocks, props.laneCount, tick, overlay, props.gutter);
+  const now = performance.now();
+  const flash = (ref: unknown): number =>
+    typeof ref === "string" ? project.noteFlash(ref, now) : 0;
+  draw(ctx, w, h, vp, props.grid, props.blocks, props.laneCount, tick, overlay, props.gutter, flash);
 }
 
 /** True if `x` falls in the keyboard gutter column. */
@@ -128,7 +131,10 @@ function inGutter(x: number): boolean {
 const { markDirty } = useGridCanvas(
   canvas,
   frame,
-  () => telemetry.playing || (props.gutter?.sounding?.() ?? false),
+  () =>
+    telemetry.playing ||
+    (props.gutter?.sounding?.() ?? false) ||
+    project.anyFlash(performance.now()),
 );
 
 function onPointerDown(e: PointerEvent): void {

@@ -54,7 +54,9 @@ function executeIntent(intent: DropIntent): void {
 }
 
 function onDragMove(e: PointerEvent): void {
-  if (!drag.state.source) return;
+  // Pump moves while a press is merely armed too, so it can cross the threshold
+  // and promote itself to a real drag (see useChainDrag.move).
+  if (!drag.state.source && !drag.state.pressing) return;
   drag.move(e.clientX, e.clientY);
   drag.setCopy(e.altKey);
   drag.hover(targetUnder(e.clientX, e.clientY));
@@ -62,7 +64,10 @@ function onDragMove(e: PointerEvent): void {
 
 function onDragUp(e: PointerEvent): void {
   const source = drag.state.source;
-  if (!source) return;
+  if (!source) {
+    drag.clearPress(); // released before crossing the threshold: it was a click
+    return;
+  }
   drag.setCopy(e.altKey);
   // Dropping an effect node on the browser saves it as a preset.
   const overBrowser = document.elementFromPoint(e.clientX, e.clientY)?.closest("[data-save-preset]");
@@ -244,7 +249,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="app" :class="{ 'chain-dragging': !!drag.state.source }">
+  <div class="app" :class="{ 'chain-dragging': !!drag.state.source, 'chain-pressing': drag.state.pressing }">
     <TransportBar />
 
     <section class="view">
@@ -430,6 +435,18 @@ body {
    cursor (they set their own on hover). */
 .chain-dragging .grid-canvas {
   pointer-events: none;
+}
+
+/* Holding a card (an armed press) or actually dragging it shows the closed-hand
+   grab cursor everywhere, overriding each element's own rest cursor (the arrow on
+   cards, the hand on sliders). `pressing` covers the moment the press is held but
+   has not yet crossed the threshold, so the grab feel is immediate, not only once
+   the pointer starts moving; a release before the threshold is still a plain click. */
+.chain-dragging,
+.chain-dragging *,
+.chain-pressing,
+.chain-pressing * {
+  cursor: grabbing !important;
 }
 
 /* --- dev panel --- */

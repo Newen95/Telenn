@@ -57,6 +57,8 @@ export function resolveDrop(
 
 interface DragState {
   source: DragSource | null;
+  /** A press is held on a draggable but no drag has started yet (pre-threshold). */
+  pressing: boolean;
   hovered: DropTarget | null;
   copy: boolean;
   /** Pointer position, for the floating ghost. */
@@ -64,19 +66,64 @@ interface DragState {
   y: number;
 }
 
+/** Pixels the pointer must travel after a press before it becomes a real drag. A
+ *  shorter move is a plain click — for a chain node, just a selection. */
+const DRAG_THRESHOLD = 4;
+
+/** Milliseconds a press must be held still before it shows the grab cursor. A
+ *  quick click releases before this, so it never flashes the grab affordance. */
+const HOLD_DELAY = 160;
+
 // One shared drag across the chain panel and the browser (singleton).
-const state = reactive<DragState>({ source: null, hovered: null, copy: false, x: 0, y: 0 });
+const state = reactive<DragState>({
+  source: null,
+  pressing: false,
+  hovered: null,
+  copy: false,
+  x: 0,
+  y: 0,
+});
+
+// The origin of an armed press, kept to measure the threshold. The fact that a
+// press is armed lives in the reactive `state.pressing` (it drives the cursor).
+let pressOrigin: { source: DragSource; x: number; y: number } | null = null;
+// Timer that flips on the grab cursor after HOLD_DELAY; cancelled by an early
+// release (a click), by a real drag starting, or by any drag teardown.
+let pressTimer: ReturnType<typeof setTimeout> | null = null;
+
+function clearPressTimer(): void {
+  if (pressTimer !== null) {
+    clearTimeout(pressTimer);
+    pressTimer = null;
+  }
+}
 
 export function useChainDrag() {
   return {
     state,
-    begin(source: DragSource, x: number, y: number): void {
-      state.source = source;
+    /** Arm a press: a drag candidate that starts only past the move threshold. */
+    arm(source: DragSource, x: number, y: number): void {
+      pressOrigin = { source, x, y };
       state.hovered = null;
       state.x = x;
       state.y = y;
+      // Show the grab cursor only after a brief hold, so a quick click stays an
+      // arrow (it releases before the timer fires).
+      clearPressTimer();
+      pressTimer = setTimeout(() => {
+        if (pressOrigin) state.pressing = true;
+        pressTimer = null;
+      }, HOLD_DELAY);
     },
     move(x: number, y: number): void {
+      // Promote an armed press to a real drag once it travels past the threshold.
+      if (pressOrigin && !state.source) {
+        if (Math.hypot(x - pressOrigin.x, y - pressOrigin.y) < DRAG_THRESHOLD) return;
+        clearPressTimer();
+        state.source = pressOrigin.source;
+        state.pressing = false; // the real drag's `chain-dragging` carries the cursor now
+        pressOrigin = null;
+      }
       state.x = x;
       state.y = y;
     },
@@ -86,13 +133,25 @@ export function useChainDrag() {
     setCopy(copy: boolean): void {
       state.copy = copy;
     },
+    /** A release that never became a drag: drop the armed press (it was a click). */
+    clearPress(): void {
+      clearPressTimer();
+      pressOrigin = null;
+      state.pressing = false;
+    },
     cancel(): void {
+      clearPressTimer();
+      pressOrigin = null;
+      state.pressing = false;
       state.source = null;
       state.hovered = null;
     },
     /** Resolve the drop on the hovered target and clear the drag. */
     drop(): DropIntent | null {
       const { source, hovered, copy } = state;
+      clearPressTimer();
+      pressOrigin = null;
+      state.pressing = false;
       state.source = null;
       state.hovered = null;
       if (!source || !hovered) return null;

@@ -85,14 +85,15 @@ function isOver(target: DropTarget): boolean {
   return !!h && h.trackId === target.trackId && h.index === target.index;
 }
 
-// Selecting a node also focuses it, so the keydown handler below (and thus the
-// Delete/Ctrl+D guard) only fires while this chain owns the focus.
+// Pressing a node selects and focuses it right away (so Delete/Ctrl+D apply and the
+// params unfold). The drag only arms here: it starts once the pointer travels past
+// the threshold, so a plain click selects without moving the node.
 function onNodePointerDown(e: PointerEvent, trackId: string, node: ChainNodeView, index: number): void {
   if (node.isInstrument) return;
   e.preventDefault();
   sel.select(node.id);
   (e.currentTarget as HTMLElement).focus({ preventScroll: true });
-  drag.begin(
+  drag.arm(
     { kind: "node", nodeId: node.id, module: node.module, fromTrack: trackId, fromIndex: index },
     e.clientX,
     e.clientY,
@@ -194,8 +195,9 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
       </TransitionGroup>
     </div>
 
-    <!-- Drag ghost: a ~50% copy of the real card (same shape, size and knobs), so
-         its footprint shows how much room the node will take where it lands. -->
+    <!-- Drag ghost: a ~50% copy of the real card. Cards are compact (params show
+         only once selected), so the ghost is compact too — its footprint matches
+         the card as it will land: unselected, header only. -->
     <div
       v-if="ghost"
       class="drag-ghost"
@@ -204,17 +206,6 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
       <div class="node ghost">
         <span class="node-name">{{ ghost.module }}</span>
         <span class="node-role">{{ t("chain.effect") }}</span>
-        <input
-          v-for="p in paramSpecs[ghost.module] ?? []"
-          :key="p.id"
-          type="range"
-          class="param-slider"
-          min="0"
-          max="1"
-          step="0.001"
-          :value="specValue(ghost.params, p)"
-          disabled
-        />
         <span v-if="drag.state.copy" class="ghost-copy">+</span>
       </div>
     </div>
@@ -284,7 +275,9 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
   border: 1px solid #3a3a3c;
   border-radius: 6px;
   background: #2c2c2e;
-  cursor: grab;
+  /* Plain arrow on hover/click: a press selects (the drag only arms past the
+     threshold), so the card should not advertise a grab affordance at rest. */
+  cursor: default;
   user-select: none;
   white-space: nowrap;
 }
@@ -307,7 +300,6 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
 .node.instrument {
   background: #20303a;
   border-color: #2f5a6e;
-  cursor: default;
 }
 
 .node-name {
@@ -324,8 +316,18 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
 /* The cursor only changes over the slider itself (the grab cursor stays on the
    rest of the card), and it is the pointing hand — not a resize cursor. */
 .param-slider {
+  /* Hidden until the node is selected (the existing click selection); never on
+     hover. A dropped or unselected node stays compact (name, role, VU only). */
+  display: none;
   width: 70px;
   cursor: pointer;
+}
+
+/* Selecting a node reveals its params; focus-within keeps them shown while a
+   slider inside is being dragged or focused. */
+.node.selected .param-slider,
+.node:focus-within .param-slider {
+  display: inline-block;
 }
 
 /* Gaps are thin by default; they widen while a drag is active and the one under

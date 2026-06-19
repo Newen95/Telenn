@@ -43,12 +43,12 @@ watch(() => project.presetsVersion, reloadPresets);
 
 function dragModule(e: PointerEvent, m: ModuleDesc): void {
   e.preventDefault();
-  drag.begin({ kind: "module", module: m.id, label: m.name }, e.clientX, e.clientY);
+  drag.arm({ kind: "module", module: m.id, label: m.name }, e.clientX, e.clientY);
 }
 
 function dragPreset(e: PointerEvent, p: NamedPreset): void {
   e.preventDefault();
-  drag.begin({ kind: "preset", name: p.name, module: p.module, params: p.params }, e.clientX, e.clientY);
+  drag.arm({ kind: "preset", name: p.name, module: p.module, params: p.params }, e.clientX, e.clientY);
 }
 </script>
 

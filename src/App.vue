@@ -8,6 +8,7 @@ import TimelineCanvas from "./views/timeline/TimelineCanvas.vue";
 import PianoRollCanvas from "./views/pianoroll/PianoRollCanvas.vue";
 import ChainPanel from "./views/chain/ChainPanel.vue";
 import PresetBrowser from "./views/browser/PresetBrowser.vue";
+import MixerPanel from "./views/mixer/MixerPanel.vue";
 import { useTimeAxis } from "./views/canvas/timeAxis";
 import { useChainDrag, type DropIntent } from "./views/chain/dragdrop";
 import { useProjectStore } from "./stores/project";
@@ -281,6 +282,11 @@ onUnmounted(() => {
         <ChainPanel />
         <PresetBrowser />
       </div>
+    </section>
+
+    <section class="view">
+      <h2 class="view-title">{{ t("view.mixer") }}</h2>
+      <MixerPanel />
     </section>
 
     <details class="dev">

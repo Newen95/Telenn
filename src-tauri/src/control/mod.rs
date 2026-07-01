@@ -18,6 +18,7 @@ pub mod watcher;
 use std::path::{Path, PathBuf};
 
 use crate::engine::graph::{compile, CompiledGraph};
+use crate::engine::mix::TrackMix;
 use crate::engine::node::{NodeIdx, ParamId};
 use crate::engine::EngineError;
 use crate::modules::registry;
@@ -71,6 +72,16 @@ pub enum ControlMsg {
     /// out the old one (removed effects' tails), and returns it through the
     /// garbage ring.
     SwapGraph(Box<CompiledGraph>),
+    /// Live mixer change for one track (fader/pan drag): retargets the strip's
+    /// smoothers, no recompile, no swap.
+    SetTrackMix {
+        track: usize,
+        mix: TrackMix,
+    },
+    /// Live master gain change (dB).
+    SetMasterGain {
+        gain_db: f32,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -112,7 +123,7 @@ pub fn build_demo() -> Result<(EngineInit, GraphIndex, Project, PathBuf), Engine
     let index_for_engine = index.clone();
     let project_for_engine = project.clone();
     let init: EngineInit = Box::new(move |sample_rate, max_block| {
-        let graph = compile(&desc, registry::create, sample_rate, max_block)?;
+        let graph = compile(&desc, registry::create, sample_rate, max_block, 1)?;
         let schedule = project.to_schedule(sample_rate as u32, &index)?;
         Ok((graph, schedule))
     });

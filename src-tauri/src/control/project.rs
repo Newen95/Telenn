@@ -12,13 +12,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::control::sequencer::{ticks_to_samples, Schedule, ScheduledEvent, PPQ};
 use crate::engine::graph::{Connection, GraphDesc, NodeDesc};
+use crate::engine::mix::TrackMix;
 use crate::engine::node::{NodeIdx, NoteKind};
 use crate::modules::registry;
-
-/// Module id of the implicit master node every project's tracks sum into. The
-/// per-track mixer (gain/pan/sends) and buses arrive at M8; here a unity gain
-/// just merges the tracks.
-const MASTER_MODULE: &str = "gain";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProjectError {
@@ -38,8 +34,8 @@ pub enum ProjectError {
     UnknownTrack(String),
 }
 
-/// A project, mirroring `song.json`. Unknown fields (and M6/M8 fields such as
-/// `mixer`, `buses`, `modulations`, node `preset`) are ignored by serde for now.
+/// A project, mirroring `song.json`. Unknown fields (post-MVP fields such as
+/// `buses`, `modulations`, node `preset`) are ignored by serde for now.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     #[serde(default = "default_version")]
@@ -48,6 +44,9 @@ pub struct Project {
     pub bpm: u32,
     #[serde(default = "default_time_signature")]
     pub time_signature: [u32; 2],
+    /// Master gain (dB) applied by the mixer stage after the track sum.
+    #[serde(default)]
+    pub master_gain_db: f32,
     pub tracks: Vec<Track>,
 }
 
@@ -56,6 +55,10 @@ pub struct Track {
     pub id: String,
     #[serde(default)]
     pub name: String,
+    /// Mixer settings (gain dB + pan), applied to the chain tail by the mixer
+    /// stage — not a chain node. Defaults keep old files loading unchanged.
+    #[serde(default)]
+    pub mixer: TrackMix,
     pub chain: Vec<NodeSpec>,
     #[serde(default)]
     pub clips: Vec<Clip>,
@@ -128,7 +131,18 @@ pub struct ProjectView {
     pub bpm: u32,
     pub ppq: u64,
     pub time_signature: [u32; 2],
+    /// Master gain (dB) applied by the mixer stage.
+    pub master_gain_db: f32,
     pub tracks: Vec<TrackView>,
+}
+
+/// A track's mixer settings as the UI reads them (camelCase mirror of
+/// [`TrackMix`], whose snake_case form belongs to `song.json`).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrackMixView {
+    pub gain_db: f32,
+    pub pan: f32,
 }
 
 #[derive(Debug, Serialize)]
@@ -144,6 +158,8 @@ pub struct TrackView {
     /// panel. Distinct from `graph_nodes`: carried in the same view the UI already
     /// reloads after every edit, so the panel stays in step without a second fetch.
     pub chain: Vec<ChainNodeView>,
+    /// Mixer strip settings (gain dB + pan), for the mixer panel.
+    pub mixer: TrackMixView,
     pub clips: Vec<ClipView>,
 }
 
@@ -315,13 +331,15 @@ impl Project {
         Ok(self.time_signature[0] as u64 * self.ticks_per_beat()?)
     }
 
-    /// Build a graph description from the track chains, summing every chain into
-    /// a unity master node. Returns the graph and the note-routing index.
+    /// Build a graph description from the track chains. Returns the graph and
+    /// the note-routing index. There is no master node: each chain tail stays
+    /// mono and the mixer stage reads the tails with the per-track settings
+    /// carried on the description.
     ///
     /// Layout is **instruments first** (indices `0..T-1`), then every track's
-    /// effects, then the master. Keeping instrument indices independent of the
-    /// effect chains means a live effect edit never shifts an instrument index,
-    /// so the playing schedule and held notes stay valid across a hot-swap.
+    /// effects. Keeping instrument indices independent of the effect chains
+    /// means a live effect edit never shifts an instrument index, so the
+    /// playing schedule and held notes stay valid across a hot-swap.
     pub fn to_graph(&self) -> Result<(GraphDesc, GraphIndex), ProjectError> {
         for track in &self.tracks {
             if track.chain.is_empty() {
@@ -358,27 +376,13 @@ impl Project {
             }
         }
 
-        // The master node: every track's chain tail sums into its single input.
-        let master = nodes.len();
-        nodes.push(NodeDesc {
-            id: "_master".into(),
-            module_id: MASTER_MODULE.into(),
-            params: Vec::new(),
-        });
-        for &tail in &tails {
-            connections.push(Connection {
-                src_node: tail,
-                src_port: 0,
-                dst_node: master,
-                dst_port: 0,
-            });
-        }
-
         Ok((
             GraphDesc {
                 nodes,
                 connections,
-                output: master,
+                tails,
+                track_mix: self.tracks.iter().map(|t| t.mixer).collect(),
+                master_gain_db: self.master_gain_db,
             },
             index,
         ))
@@ -442,6 +446,10 @@ impl Project {
                 // track's position (see `to_graph`).
                 instrument_node: track_idx,
                 chain,
+                mixer: TrackMixView {
+                    gain_db: track.mixer.gain_db,
+                    pan: track.mixer.pan,
+                },
                 clips,
             });
         }
@@ -449,6 +457,7 @@ impl Project {
             bpm: self.bpm,
             ppq: PPQ,
             time_signature: self.time_signature,
+            master_gain_db: self.master_gain_db,
             tracks,
         })
     }
@@ -698,16 +707,15 @@ mod tests {
     }
 
     #[test]
-    fn builds_graph_with_master_and_index() {
+    fn builds_graph_with_tails_and_index() {
         let project: Project = serde_json::from_str(DEMO).unwrap();
         let (graph, index) = project.to_graph().unwrap();
-        // One instrument + the master node.
-        assert_eq!(graph.nodes.len(), 2);
-        assert_eq!(graph.output, 1);
+        // One instrument, no master node — the mixer reads the tail.
+        assert_eq!(graph.nodes.len(), 1);
+        assert_eq!(graph.tails, vec![0]);
+        assert_eq!(graph.track_mix.len(), 1);
         assert_eq!(index.instrument["lead"], 0);
-        // The instrument feeds the master.
-        assert_eq!(graph.connections.len(), 1);
-        assert_eq!(graph.connections[0].dst_node, 1);
+        assert!(graph.connections.is_empty());
     }
 
     #[test]
@@ -727,12 +735,11 @@ mod tests {
         assert_eq!(index.instrument["bass"], 1);
         assert_eq!(graph.nodes[0].id, "lead_synth");
         assert_eq!(graph.nodes[1].id, "bass_synth");
-        // Effect after the instruments, master last.
+        // Effects after the instruments; the tails are each chain's last node.
         assert_eq!(graph.nodes[2].id, "lead_gain");
-        assert_eq!(graph.nodes[3].id, "_master");
-        assert_eq!(graph.output, 3);
+        assert_eq!(graph.tails, vec![2, 1]);
         // The layout still compiles to a valid RT graph.
-        crate::engine::graph::compile(&graph, crate::modules::registry::create, 48_000.0, 64)
+        crate::engine::graph::compile(&graph, crate::modules::registry::create, 48_000.0, 64, 1)
             .unwrap();
     }
 

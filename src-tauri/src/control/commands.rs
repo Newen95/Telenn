@@ -12,6 +12,7 @@ use crate::control::{
     clip_edit, graph_edit, ids, note_edit, render, ControlMsg, ProjectFile, TransportCmd,
 };
 use crate::engine::graph::{compile, GraphDesc};
+use crate::engine::mix::TrackMix;
 use crate::engine::node::{ParamCurve, ParamId};
 use crate::engine::{AudioEngine, MAX_BLOCK};
 use crate::modules::registry;
@@ -47,7 +48,7 @@ pub fn load_project(engine: State<'_, AudioEngine>, path: String) -> Result<(), 
     Ok(())
 }
 
-/// Render a project to a 16-bit mono WAV offline (deterministic, device-free).
+/// Render a project to a 16-bit stereo WAV offline (deterministic, device-free).
 #[tauri::command]
 pub fn export_wav(project_path: String, out_path: String) -> Result<(), String> {
     let project = Project::load(&project_path).map_err(|e| e.to_string())?;
@@ -62,6 +63,7 @@ fn swap_to(engine: &AudioEngine, desc: &GraphDesc) -> Result<(), String> {
         registry::create,
         engine.sample_rate() as f32,
         MAX_BLOCK,
+        1,
     )
     .map_err(|e| e.to_string())?;
     if !engine.send(ControlMsg::SwapGraph(Box::new(graph))) {
@@ -516,6 +518,82 @@ pub fn node_commit_param(
         param: pid,
         value,
     });
+    history.commit(trial);
+    persist(&history, &file);
+    Ok(())
+}
+
+/// Track index of a track id in the project (the mixer strip order).
+fn locate_track(project: &Project, track_id: &str) -> Result<usize, String> {
+    project
+        .tracks
+        .iter()
+        .position(|t| t.id == track_id)
+        .ok_or_else(|| format!("unknown track '{track_id}'"))
+}
+
+/// Live mixer change for one track, streamed while a fader/pan is dragged: the
+/// strip's smoothers retarget in real time — no recompile, no swap, no persist.
+#[tauri::command]
+pub fn mixer_set_track(
+    engine: State<'_, AudioEngine>,
+    history: State<'_, Mutex<EditHistory>>,
+    track_id: String,
+    gain_db: f32,
+    pan: f32,
+) -> Result<(), String> {
+    let history = history.lock().map_err(|_| "edit state poisoned")?;
+    let track = locate_track(history.project(), &track_id)?;
+    engine.send(ControlMsg::SetTrackMix {
+        track,
+        mix: TrackMix { gain_db, pan },
+    });
+    Ok(())
+}
+
+/// Commit a track's mixer settings: persist to `song.json` and record one undo
+/// step (a whole fader gesture = one step). The value is resent live so the
+/// strip ends exactly where the fader settled.
+#[tauri::command]
+pub fn mixer_commit_track(
+    engine: State<'_, AudioEngine>,
+    history: State<'_, Mutex<EditHistory>>,
+    file: State<'_, ProjectFile>,
+    track_id: String,
+    gain_db: f32,
+    pan: f32,
+) -> Result<(), String> {
+    let mut history = history.lock().map_err(|_| "edit state poisoned")?;
+    let track = locate_track(history.project(), &track_id)?;
+    let mut trial = history.project().clone();
+    trial.tracks[track].mixer = TrackMix { gain_db, pan };
+    engine.send(ControlMsg::SetTrackMix {
+        track,
+        mix: TrackMix { gain_db, pan },
+    });
+    history.commit(trial);
+    persist(&history, &file);
+    Ok(())
+}
+
+/// Live master gain change (dB), streamed while the master fader is dragged.
+#[tauri::command]
+pub fn mixer_set_master(engine: State<'_, AudioEngine>, gain_db: f32) {
+    engine.send(ControlMsg::SetMasterGain { gain_db });
+}
+
+/// Commit the master gain: persist and record one undo step.
+#[tauri::command]
+pub fn mixer_commit_master(
+    engine: State<'_, AudioEngine>,
+    history: State<'_, Mutex<EditHistory>>,
+    file: State<'_, ProjectFile>,
+    gain_db: f32,
+) -> Result<(), String> {
+    let mut history = history.lock().map_err(|_| "edit state poisoned")?;
+    let mut trial = history.project().clone();
+    trial.master_gain_db = gain_db;
+    engine.send(ControlMsg::SetMasterGain { gain_db });
     history.commit(trial);
     persist(&history, &file);
     Ok(())

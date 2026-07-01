@@ -223,6 +223,7 @@ mod tests {
         let ctx = ProcessCtx {
             sample_rate: SR,
             frames,
+            channels: 1,
         };
         let mut io = NodeIo::new(&[], input, out, frames);
         r.process(&ctx, &mut io);

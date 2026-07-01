@@ -57,11 +57,18 @@ export interface ParamInfo {
   curve: "linear" | "log" | "db";
 }
 
+/** A track's mixer strip settings (gain in dB, constant-power pan -1..1). */
+export interface TrackMixView {
+  gainDb: number;
+  pan: number;
+}
+
 export interface TrackView {
   id: string;
   name: string;
   instrumentNode: number;
   chain: ChainNodeView[];
+  mixer: TrackMixView;
   clips: ClipView[];
 }
 
@@ -82,6 +89,7 @@ export interface ProjectView {
   bpm: number;
   ppq: number;
   timeSignature: [number, number];
+  masterGainDb: number;
   tracks: TrackView[];
 }
 
@@ -89,6 +97,7 @@ export const useProjectStore = defineStore("project", () => {
   const bpm = ref(120);
   const ppq = ref(960);
   const timeSignature = ref<[number, number]>([4, 4]);
+  const masterGainDb = ref(0);
   const tracks = ref<TrackView[]>([]);
 
   async function load(): Promise<void> {
@@ -96,6 +105,7 @@ export const useProjectStore = defineStore("project", () => {
     bpm.value = view.bpm;
     ppq.value = view.ppq;
     timeSignature.value = view.timeSignature;
+    masterGainDb.value = view.masterGainDb ?? 0;
     tracks.value = view.tracks;
   }
 
@@ -282,6 +292,34 @@ export const useProjectStore = defineStore("project", () => {
     await load();
   }
 
+  /** Live mixer change streamed while a fader/pan is dragged (no persist). */
+  async function setTrackMix(trackId: string, gainDb: number, pan: number): Promise<void> {
+    const track = tracks.value.find((t) => t.id === trackId);
+    if (track) track.mixer = { gainDb, pan };
+    await invoke("mixer_set_track", { trackId, gainDb, pan });
+  }
+
+  /** Persist a settled mixer gesture (one undo step); reload reconciles. */
+  async function commitTrackMix(trackId: string, gainDb: number, pan: number): Promise<void> {
+    const track = tracks.value.find((t) => t.id === trackId);
+    if (track) track.mixer = { gainDb, pan };
+    await invoke("mixer_commit_track", { trackId, gainDb, pan });
+    await load();
+  }
+
+  /** Live master gain change (dB) streamed while the master fader is dragged. */
+  async function setMasterGain(gainDb: number): Promise<void> {
+    masterGainDb.value = gainDb;
+    await invoke("mixer_set_master", { gainDb });
+  }
+
+  /** Persist the settled master gain (one undo step). */
+  async function commitMasterGain(gainDb: number): Promise<void> {
+    masterGainDb.value = gainDb;
+    await invoke("mixer_commit_master", { gainDb });
+    await load();
+  }
+
   // Bumped after a preset is saved, so the browser reloads its list.
   const presetsVersion = ref(0);
 
@@ -297,6 +335,7 @@ export const useProjectStore = defineStore("project", () => {
     bpm,
     ppq,
     timeSignature,
+    masterGainDb,
     tracks,
     presetsVersion,
     lastError,
@@ -317,6 +356,10 @@ export const useProjectStore = defineStore("project", () => {
     moduleParams,
     setNodeParam,
     commitNodeParam,
+    setTrackMix,
+    commitTrackMix,
+    setMasterGain,
+    commitMasterGain,
     listModules,
     listPresets,
     readPreset,

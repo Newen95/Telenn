@@ -105,11 +105,17 @@ pub enum NoteKind {
 pub struct ProcessCtx {
     pub sample_rate: f32,
     pub frames: usize,
+    /// Channels per port. Fixed to 1 today (the graph is mono upstream of the
+    /// mixer stage); a future stereo module reads this. Buffer layout within a
+    /// port is channel-major: `[p0c0.., p0c1.., p1c0..]`.
+    pub channels: usize,
 }
 
 /// The buffers and note events a node reads/writes for one block. Audio buffers
 /// are flat, port-major (`port * frames`), so the node never sees a slice of
-/// slices. // RT-SAFE
+/// slices. The accessors below are mono (= channel 0 with the channel-major
+/// layout documented on [`ProcessCtx::channels`]); per-channel indexing arrives
+/// with the first stereo module (post-MVP). // RT-SAFE
 pub struct NodeIo<'a> {
     notes: &'a [NoteEvent],
     inputs: &'a [f32],

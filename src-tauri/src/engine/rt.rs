@@ -2,8 +2,8 @@
 //!
 //! Everything here runs on the real-time thread and must stay RT-SAFE: no
 //! allocation, no locks, no I/O. `RtState` drains control messages, advances the
-//! sequencer, runs the compiled graph, and writes the mono result to every
-//! output channel.
+//! sequencer, runs the compiled graph, mixes the mono track tails into stereo
+//! (the `Mixer` stage), and fans the stereo pair out to the device channels.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -14,6 +14,7 @@ use rtrb::Producer;
 use crate::control::sequencer::{Schedule, SequencerCursor};
 use crate::control::{ControlMsg, TransportCmd};
 use crate::engine::graph::CompiledGraph;
+use crate::engine::mix::Mixer;
 use crate::engine::node::{NodeIdx, NoteEvent, NoteKind};
 use crate::engine::params::LinearRamp;
 use crate::engine::swap::{Declick, Garbage};
@@ -89,13 +90,13 @@ pub struct RtState {
     /// tails — faded to silence then returned to `garbage`. At most one.
     fading: Option<Box<CompiledGraph>>,
     fade: LinearRamp,
-    declick: Declick,
-    /// Mono mix scratch (graph + fading graph) before fan-out. Pre-allocated.
+    /// The mono→stereo boundary: per-track gain/pan and the master gain.
+    mixer: Mixer,
+    /// One declick per stereo channel, absorbing the swap-boundary step.
+    declick: [Declick; 2],
+    /// Interleaved stereo mix scratch (graph + fading graph) before the device
+    /// fan-out. Pre-allocated.
     mix: Vec<f32>,
-    /// Master gain. Held at unity in the MVP: the instrument is always live and
-    /// the sequencer gates playback, so the master never gates audio. The ADSR
-    /// keeps note transitions clickless.
-    master: LinearRamp,
     /// The playing sequence. A `Box` so a hot reload swaps pointers (no
     /// allocation on the audio thread); the displaced box is returned through
     /// `garbage` to be dropped off the real-time thread.
@@ -122,16 +123,15 @@ impl RtState {
         telemetry: Producer<TelemetryFrame>,
         xruns: Arc<AtomicU32>,
     ) -> Self {
-        let mut master = LinearRamp::new(1.0, 10.0, sample_rate);
-        master.set_target(1.0);
+        let mixer = Mixer::new(sample_rate, graph.track_mix(), graph.master_gain_db());
         Self {
             sample_rate,
             graph: Box::new(graph),
             fading: None,
             fade: LinearRamp::new(0.0, FADE_MS, sample_rate),
-            declick: Declick::new(sample_rate),
-            mix: vec![0.0; MAX_BLOCK],
-            master,
+            mixer,
+            declick: [Declick::new(sample_rate), Declick::new(sample_rate)],
+            mix: vec![0.0; MAX_BLOCK * 2],
             schedule: Box::new(schedule),
             cursor: SequencerCursor::new(),
             playing: false,
@@ -257,16 +257,24 @@ impl RtState {
                 self.fade = LinearRamp::new(1.0, FADE_MS, self.sample_rate);
                 self.fade.set_target(0.0);
                 self.fading = Some(old);
+                // The new graph carries the project's mixer settings; glide the
+                // strips to them (a mixer-only change swaps too, e.g. undo).
+                self.mixer
+                    .retarget(self.graph.track_mix(), self.graph.master_gain_db());
                 // Smooth the residual routing/level step at the boundary.
-                self.declick.arm();
+                self.declick[0].arm();
+                self.declick[1].arm();
             }
+            ControlMsg::SetTrackMix { track, mix } => self.mixer.set_track(track, mix),
+            ControlMsg::SetMasterGain { gain_db } => self.mixer.set_master_db(gain_db),
         }
     }
 
-    /// Render the graph into `out` (interleaved, `channels` per frame), fanning
-    /// the mono result out to every channel. Processed in `MAX_BLOCK` chunks so
-    /// an unusually large callback never overruns the pre-allocated buffers.
-    /// // RT-SAFE
+    /// Render the graph into `out` (interleaved, `channels` per frame): the
+    /// mixer turns the mono track tails into a stereo pair, which fans out to
+    /// the device — even channels get L, odd channels get R; a mono device gets
+    /// the (L+R)/2 fold. Processed in `MAX_BLOCK` chunks so an unusually large
+    /// callback never overruns the pre-allocated buffers. // RT-SAFE
     pub fn process(&mut self, out: &mut [f32], channels: usize) {
         if channels == 0 {
             return;
@@ -299,23 +307,20 @@ impl RtState {
             }
 
             self.graph.process_block(self.sample_rate, n);
-            let src = self.graph.output();
-            self.mix[..n].copy_from_slice(src);
+            // The mixer stage: mono track tails → interleaved stereo, with
+            // per-track gain/pan and the master gain applied inside.
+            self.mixer.mix(&self.graph, n, &mut self.mix);
 
-            // Mix the fading graph's tail (removed effects), faded out. Collect
-            // it once silent or once its fade window elapses.
+            // Add the fading graph's tails (removed effects), panned with the
+            // current strip gains and faded out. Collect it once silent or once
+            // its fade window elapses.
             let mut collect = false;
             if let Some(fading) = self.fading.as_mut() {
                 fading.process_block(self.sample_rate, n);
                 fading.clear_notes();
-                let fsrc = fading.output();
-                let mut energy = 0.0f32;
-                for (m, &f) in self.mix[..n].iter_mut().zip(fsrc) {
-                    let g = self.fade.tick();
-                    let s = f * g;
-                    *m += s;
-                    energy += s * s;
-                }
+                let energy = self
+                    .mixer
+                    .add_faded(fading, n, &mut self.fade, &mut self.mix);
                 if self.fade.value() <= 1.0e-4 || energy < FADE_EPS {
                     collect = true;
                 }
@@ -326,13 +331,19 @@ impl RtState {
                 }
             }
 
-            // Declick the master boundary step, apply master gain, fan out.
+            // Declick the swap-boundary step per channel, then fan the stereo
+            // pair out to the device layout.
             let slice = &mut out[off * channels..(off + n) * channels];
-            for (frame, &m) in slice.chunks_mut(channels).zip(&self.mix[..n]) {
-                let value = self.declick.apply(m) * self.master.tick();
-                peak = peak.max(value.abs());
-                for c in frame.iter_mut() {
-                    *c = value;
+            for (f, frame) in slice.chunks_mut(channels).enumerate() {
+                let l = self.declick[0].apply(self.mix[2 * f]);
+                let r = self.declick[1].apply(self.mix[2 * f + 1]);
+                peak = peak.max(l.abs()).max(r.abs());
+                if channels == 1 {
+                    frame[0] = 0.5 * (l + r);
+                } else {
+                    for (c, ch) in frame.iter_mut().enumerate() {
+                        *ch = if c % 2 == 0 { l } else { r };
+                    }
                 }
             }
             off += n;
@@ -375,9 +386,10 @@ impl RtState {
     }
 }
 
-/// Render a project through the real `RtState` path (mono, channel 0), driven in
-/// fixed `block`-sized callbacks. Shared by the equivalence test that pins the
-/// offline render against the audio thread. // test-only
+/// Render a project through the real `RtState` path (interleaved stereo, as a
+/// 2-channel device would receive it), driven in fixed `block`-sized callbacks.
+/// Shared by the equivalence test that pins the offline render against the
+/// audio thread. // test-only
 #[cfg(test)]
 pub fn render_offline_via_rtstate(
     project: &crate::control::project::Project,
@@ -390,6 +402,7 @@ pub fn render_offline_via_rtstate(
         crate::modules::registry::create,
         sample_rate as f32,
         MAX_BLOCK,
+        1,
     )
     .expect("compile");
     let schedule = project.to_schedule(sample_rate, &index).expect("schedule");
@@ -401,14 +414,14 @@ pub fn render_offline_via_rtstate(
     let mut rt = RtState::new(sample_rate as f32, graph, schedule, prod, tprod, xruns);
     rt.handle(ControlMsg::Transport(TransportCmd::Play));
 
-    let mut out = Vec::with_capacity(total);
-    let mut buf = vec![0.0f32; block];
+    let mut out = Vec::with_capacity(total * 2);
+    let mut buf = vec![0.0f32; block * 2];
     let mut produced = 0usize;
     while produced < total {
         let n = (total - produced).min(block);
-        let slice = &mut buf[..n];
+        let slice = &mut buf[..n * 2];
         slice.fill(0.0);
-        rt.process(slice, 1);
+        rt.process(slice, 2);
         out.extend_from_slice(slice);
         produced += n;
     }
@@ -844,6 +857,7 @@ mod tests {
             crate::modules::registry::create,
             48_000.0,
             MAX_BLOCK,
+            1,
         )
         .unwrap();
         Box::new(graph)
@@ -945,9 +959,11 @@ mod tests {
                 params: vec![],
             }],
             connections: vec![],
-            output: 0,
+            tails: vec![0],
+            track_mix: vec![],
+            master_gain_db: 0.0,
         };
-        let graph_a = compile(&tail, test_support::create, 48_000.0, MAX_BLOCK).unwrap();
+        let graph_a = compile(&tail, test_support::create, 48_000.0, MAX_BLOCK, 1).unwrap();
         let (prod, _cons) = rtrb::RingBuffer::<Garbage>::new(8);
         let (tprod, _t) = rtrb::RingBuffer::<TelemetryFrame>::new(64);
         let xruns = Arc::new(AtomicU32::new(0));
@@ -968,9 +984,11 @@ mod tests {
                 params: vec![],
             }],
             connections: vec![],
-            output: 0,
+            tails: vec![0],
+            track_mix: vec![],
+            master_gain_db: 0.0,
         };
-        let graph_b = compile(&silence, test_support::create, 48_000.0, MAX_BLOCK).unwrap();
+        let graph_b = compile(&silence, test_support::create, 48_000.0, MAX_BLOCK, 1).unwrap();
         rt.handle(ControlMsg::SwapGraph(Box::new(graph_b)));
 
         let mut cap = Vec::new();

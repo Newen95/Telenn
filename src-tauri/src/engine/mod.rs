@@ -5,6 +5,7 @@
 
 pub mod dsp;
 pub mod graph;
+pub mod mix;
 pub mod node;
 pub mod params;
 pub mod rt;

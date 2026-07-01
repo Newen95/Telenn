@@ -9,6 +9,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::engine::mix::TrackMix;
 use crate::engine::node::{AudioNode, NodeIdx, NoteEvent, ParamId, ProcessCtx, SignalKind};
 use crate::telemetry::frame::Meter;
 
@@ -38,12 +39,24 @@ pub struct Connection {
 }
 
 /// Serializable graph description (the future shape of `song.json` chains).
+///
+/// The graph has no master/output node: each track's chain tail stays mono and
+/// the mixer stage (`engine::mix`) reads those buffers to produce the stereo
+/// device signal, applying the per-track and master settings carried here.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GraphDesc {
     pub nodes: Vec<NodeDesc>,
     pub connections: Vec<Connection>,
-    /// Node whose first output port feeds the device.
-    pub output: NodeIdx,
+    /// The last node of each track's chain, in track order — the mono signals
+    /// the mixer stage consumes.
+    #[serde(default)]
+    pub tails: Vec<NodeIdx>,
+    /// Per-track mixer settings, aligned with `tails`.
+    #[serde(default)]
+    pub track_mix: Vec<TrackMix>,
+    /// Master gain (dB) the mixer applies after the track sum.
+    #[serde(default)]
+    pub master_gain_db: f32,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -58,8 +71,8 @@ pub enum GraphError {
     TypeMismatch,
     #[error("the graph contains a cycle")]
     Cycle,
-    #[error("output node out of range")]
-    OutputOutOfRange,
+    #[error("track tail node out of range")]
+    TailOutOfRange,
 }
 
 /// Compiled graph, owned by the audio thread.
@@ -85,7 +98,11 @@ pub struct CompiledGraph {
     /// Per-node post-process meter (peak + RMS of port 0), indexed by node
     /// index. Pre-allocated; filled at the end of each block. // RT-SAFE
     meters: Vec<Meter>,
-    output_node: NodeIdx,
+    tails: Vec<NodeIdx>,
+    track_mix: Vec<TrackMix>,
+    master_gain_db: f32,
+    /// Channels per port (the channel-agnostic seam; fixed to 1 today).
+    channels: usize,
     last_frames: usize,
 }
 
@@ -154,9 +171,26 @@ impl CompiledGraph {
         &self.node_ids
     }
 
-    /// The output node's mono buffer for the last processed block. // RT-SAFE
-    pub fn output(&self) -> &[f32] {
-        let pos = self.node_to_pos[self.output_node];
+    /// The last node of each track's chain, in track order — the mono signals
+    /// the mixer stage reads through [`Self::node_output`].
+    pub fn track_tails(&self) -> &[NodeIdx] {
+        &self.tails
+    }
+
+    /// Per-track mixer settings, aligned with [`Self::track_tails`].
+    pub fn track_mix(&self) -> &[TrackMix] {
+        &self.track_mix
+    }
+
+    /// Master gain (dB) the mixer applies after the track sum.
+    pub fn master_gain_db(&self) -> f32 {
+        self.master_gain_db
+    }
+
+    /// A node's mono (channel 0) output buffer for the last processed block.
+    /// // RT-SAFE
+    pub fn node_output(&self, node: NodeIdx) -> &[f32] {
+        let pos = self.node_to_pos[node];
         &self.outputs[pos][..self.last_frames]
     }
 
@@ -202,6 +236,7 @@ impl CompiledGraph {
             let ctx = ProcessCtx {
                 sample_rate,
                 frames,
+                channels: self.channels,
             };
             let mut io = crate::engine::node::NodeIo::new(
                 &self.node_notes[node],
@@ -237,16 +272,20 @@ impl CompiledGraph {
 }
 
 /// Compile a description into an RT-ready graph. `create` maps a module id to a
-/// fresh node (the registry). Runs entirely off the audio thread.
+/// fresh node (the registry). `channels` is the channel-agnostic seam: buffers
+/// are sized for it, but the engine passes 1 everywhere today (the graph is mono
+/// upstream of the mixer stage). Runs entirely off the audio thread.
 pub fn compile(
     desc: &GraphDesc,
     create: impl Fn(&str) -> Option<Box<dyn AudioNode>>,
     sample_rate: f32,
     max_block: usize,
+    channels: usize,
 ) -> Result<CompiledGraph, GraphError> {
     let n = desc.nodes.len();
-    if desc.output >= n {
-        return Err(GraphError::OutputOutOfRange);
+    let channels = channels.max(1);
+    if desc.tails.iter().any(|&t| t >= n) {
+        return Err(GraphError::TailOutOfRange);
     }
 
     // Instantiate, prepare and inspect every node.
@@ -314,13 +353,15 @@ pub fn compile(
         node_to_pos[node] = pos;
     }
 
-    // Allocate buffers (off the audio thread).
+    // Allocate buffers (off the audio thread). Sized `× channels` per the
+    // channel-major layout documented on `ProcessCtx::channels` — identical to
+    // the historical mono layout while `channels == 1`.
     let outputs: Vec<Vec<f32>> = order
         .iter()
-        .map(|&node| vec![0.0f32; out_counts[node].max(1) * max_block])
+        .map(|&node| vec![0.0f32; out_counts[node].max(1) * max_block * channels])
         .collect();
     let max_in = in_counts.iter().copied().max().unwrap_or(0);
-    let in_scratch = vec![0.0f32; max_in * max_block];
+    let in_scratch = vec![0.0f32; max_in * max_block * channels];
     let node_notes = (0..n).map(|_| Vec::with_capacity(NOTE_CAPACITY)).collect();
     let node_ids = desc.nodes.iter().map(|d| d.id.clone()).collect();
     let meters = vec![Meter::default(); n];
@@ -337,7 +378,10 @@ pub fn compile(
         in_scratch,
         node_notes,
         meters,
-        output_node: desc.output,
+        tails: desc.tails.clone(),
+        track_mix: desc.track_mix.clone(),
+        master_gain_db: desc.master_gain_db,
+        channels,
         last_frames: 0,
     })
 }
@@ -450,12 +494,14 @@ mod tests {
                 dst_node: 1,
                 dst_port: 0,
             }],
-            output: 1,
+            tails: vec![1],
+            track_mix: vec![],
+            master_gain_db: 0.0,
         };
-        let mut g = compile(&desc, create, 48_000.0, 64).expect("compiles");
+        let mut g = compile(&desc, create, 48_000.0, 64, 1).expect("compiles");
         g.process_block(48_000.0, 32);
-        // const(1.0) → half(×0.5) = 0.5 on the output buffer.
-        assert!(g.output().iter().all(|&s| (s - 0.5).abs() < 1e-6));
+        // const(1.0) → half(×0.5) = 0.5 on the tail buffer.
+        assert!(g.node_output(1).iter().all(|&s| (s - 0.5).abs() < 1e-6));
     }
 
     #[test]
@@ -480,9 +526,11 @@ mod tests {
                 dst_node: 1,
                 dst_port: 0,
             }],
-            output: 1,
+            tails: vec![1],
+            track_mix: vec![],
+            master_gain_db: 0.0,
         };
-        let mut g = compile(&desc, create, 48_000.0, 64).expect("compiles");
+        let mut g = compile(&desc, create, 48_000.0, 64, 1).expect("compiles");
         g.process_block(48_000.0, 32);
         let m = g.meters();
         assert_eq!(m.len(), 2, "one meter per node");
@@ -515,9 +563,11 @@ mod tests {
                 dst_node: 0,
                 dst_port: 0,
             }],
-            output: 0,
+            tails: vec![0],
+            track_mix: vec![],
+            master_gain_db: 0.0,
         };
-        let g = compile(&desc, create, 48_000.0, 64).expect("compiles");
+        let g = compile(&desc, create, 48_000.0, 64, 1).expect("compiles");
         // node 1 (const) must come before node 0 (half) in the order.
         let pos_const = g.node_to_pos[1];
         let pos_half = g.node_to_pos[0];
@@ -534,25 +584,27 @@ mod tests {
                 params: vec![],
             }],
             connections: vec![],
-            output: 0,
+            tails: vec![0],
+            track_mix: vec![],
+            master_gain_db: 0.0,
         };
         // Ring the tail (struck to 1.0 by prepare) well down.
-        let mut a = compile(&desc, test_support::create, 48_000.0, 64).expect("compiles");
+        let mut a = compile(&desc, test_support::create, 48_000.0, 64, 1).expect("compiles");
         for _ in 0..16 {
             a.process_block(48_000.0, 64);
         }
-        let decayed = a.output()[0];
+        let decayed = a.node_output(0)[0];
         assert!(decayed < 0.7, "tail should have decayed: {decayed}");
 
         // A fresh graph's tail is struck back to 1.0 by prepare; adopting the
         // live node must carry the decayed state instead of restarting at 1.0.
-        let mut b = compile(&desc, test_support::create, 48_000.0, 64).expect("compiles");
+        let mut b = compile(&desc, test_support::create, 48_000.0, 64, 1).expect("compiles");
         b.adopt_nodes_from(&mut a);
         b.process_block(48_000.0, 64);
         assert!(
-            b.output()[0] <= decayed,
+            b.node_output(0)[0] <= decayed,
             "live state was not moved into the new graph: {}",
-            b.output()[0]
+            b.node_output(0)[0]
         );
     }
 
@@ -577,10 +629,12 @@ mod tests {
                 dst_node: 1,
                 dst_port: 0,
             }],
-            output: 0,
+            tails: vec![0],
+            track_mix: vec![],
+            master_gain_db: 0.0,
         };
         assert!(matches!(
-            compile(&desc, create, 48_000.0, 64),
+            compile(&desc, create, 48_000.0, 64, 1),
             Err(GraphError::TypeMismatch)
         ));
     }

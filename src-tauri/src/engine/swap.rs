@@ -117,7 +117,7 @@ pub mod test_support {
         }
     }
 
-    /// A source that outputs silence (a valid output node with no tail).
+    /// A source that outputs silence (a valid tail node with nothing to say).
     #[derive(Default)]
     pub struct Silence;
 
@@ -141,11 +141,36 @@ pub mod test_support {
         fn prepare(&mut self, _sr: f32, _mb: usize) {}
     }
 
+    /// A unit DC source (constant 1.0) — a known level for mixer/pan tests.
+    #[derive(Default)]
+    pub struct Dc;
+
+    impl AudioNode for Dc {
+        fn process(&mut self, _ctx: &ProcessCtx, io: &mut NodeIo) {
+            io.output(0).fill(1.0);
+        }
+        fn ports(&self) -> PortSpec {
+            PortSpec {
+                inputs: vec![],
+                outputs: vec![Port {
+                    name: "out",
+                    kind: SignalKind::Audio,
+                }],
+            }
+        }
+        fn params(&self) -> &[ParamSpec] {
+            &[]
+        }
+        fn set_param(&mut self, _id: ParamId, _value: f32) {}
+        fn prepare(&mut self, _sr: f32, _mb: usize) {}
+    }
+
     /// Registry for the test nodes (plus the real modules), for `compile`.
     pub fn create(module_id: &str) -> Option<Box<dyn AudioNode>> {
         match module_id {
             "tail" => Some(Box::<TailSource>::default()),
             "silence" => Some(Box::<Silence>::default()),
+            "dc" => Some(Box::<Dc>::default()),
             other => crate::modules::registry::create(other),
         }
     }

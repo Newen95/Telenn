@@ -1,16 +1,17 @@
 //! Offline WAV render: deroulement of a project entirely off the real-time
-//! thread, into a deterministic mono buffer and a `hound` WAV file.
+//! thread, into a deterministic stereo buffer and a `hound` WAV file.
 //!
 //! The render shares the exact sequencing logic of the audio thread (the
-//! [`SequencerCursor`]) so an export can never drift from live playback. Being
-//! device-free and fixed-rate, two renders of the same project are bit-for-bit
-//! identical.
+//! [`SequencerCursor`]) *and* the same [`Mixer`] stage, so an export honours
+//! gain/pan/master and can never drift from live playback. Being device-free
+//! and fixed-rate, two renders of the same project are bit-for-bit identical.
 
 use std::path::Path;
 
 use crate::control::project::{Project, ProjectError};
 use crate::control::sequencer::SequencerCursor;
 use crate::engine::graph::{compile, GraphError};
+use crate::engine::mix::Mixer;
 use crate::engine::MAX_BLOCK;
 use crate::modules::registry;
 
@@ -27,19 +28,26 @@ pub enum RenderError {
     Wav(String),
 }
 
-/// Render `loops` iterations of the project's loop into a mono sample buffer.
-/// Deterministic for a given `(project, sample_rate, loops)`.
+/// Render `loops` iterations of the project's loop into an interleaved stereo
+/// sample buffer (L,R per frame), through the same `Mixer` stage as the audio
+/// thread. Deterministic for a given `(project, sample_rate, loops)`.
 pub fn render_samples(
     project: &Project,
     sample_rate: u32,
     loops: u32,
 ) -> Result<Vec<f32>, RenderError> {
     let (desc, index) = project.to_graph()?;
-    let mut graph = compile(&desc, registry::create, sample_rate as f32, MAX_BLOCK)?;
+    let mut graph = compile(&desc, registry::create, sample_rate as f32, MAX_BLOCK, 1)?;
+    let mut mixer = Mixer::new(
+        sample_rate as f32,
+        graph.track_mix(),
+        graph.master_gain_db(),
+    );
     let schedule = project.to_schedule(sample_rate, &index)?;
 
     let total = schedule.loop_len.saturating_mul(loops as u64) as usize;
-    let mut out = Vec::with_capacity(total);
+    let mut out = Vec::with_capacity(total * 2);
+    let mut stereo = vec![0.0f32; RENDER_BLOCK * 2];
     let mut cursor = SequencerCursor::new();
     let mut produced = 0usize;
     while produced < total {
@@ -49,14 +57,15 @@ pub fn render_samples(
             cursor.advance(n, &schedule, |node, ev| g.push_note(node, ev));
         }
         graph.process_block(sample_rate as f32, n);
-        out.extend_from_slice(graph.output());
+        mixer.mix(&graph, n, &mut stereo);
+        out.extend_from_slice(&stereo[..n * 2]);
         graph.clear_notes();
         produced += n;
     }
     Ok(out)
 }
 
-/// Render the project and write it as a 16-bit mono PCM WAV.
+/// Render the project and write it as a 16-bit stereo PCM WAV.
 pub fn render_to_wav(
     project: &Project,
     sample_rate: u32,
@@ -65,7 +74,7 @@ pub fn render_to_wav(
 ) -> Result<(), RenderError> {
     let samples = render_samples(project, sample_rate, loops)?;
     let spec = hound::WavSpec {
-        channels: 1,
+        channels: 2,
         sample_rate,
         bits_per_sample: 16,
         sample_format: hound::SampleFormat::Int,
@@ -103,14 +112,62 @@ mod tests {
 
     #[test]
     fn render_matches_realtime_path() {
-        // The offline render and the audio thread share the SequencerCursor, so
-        // at the same sample rate and block size their mono output is identical.
-        // This pins "no logic duplicated with real time" (MVP_PLAN M3).
+        // The offline render and the audio thread share the SequencerCursor AND
+        // the Mixer stage, so at the same sample rate and block size their
+        // interleaved stereo output is identical. This pins "no logic duplicated
+        // with real time" (MVP_PLAN M3), now including gain/pan/master.
         let project = demo();
         let offline = render_samples(&project, 48_000, 1).unwrap();
 
         let rt = crate::engine::rt::render_offline_via_rtstate(&project, 48_000, RENDER_BLOCK);
         assert_eq!(offline.len(), rt.len());
         assert_eq!(offline, rt, "offline and real-time paths diverged");
+    }
+
+    #[test]
+    fn stereo_render_has_no_clip_and_no_dc() {
+        let samples = render_samples(&demo(), 48_000, 1).unwrap();
+        assert_eq!(samples.len() % 2, 0, "stereo output must be interleaved");
+        assert!(!samples.is_empty());
+
+        let peak = samples.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        assert!(peak <= 1.0, "render clips: peak {peak}");
+
+        // Per-channel DC offset stays negligible relative to the signal.
+        let frames = (samples.len() / 2) as f32;
+        let dc_l: f32 = samples.iter().step_by(2).sum::<f32>() / frames;
+        let dc_r: f32 = samples.iter().skip(1).step_by(2).sum::<f32>() / frames;
+        assert!(dc_l.abs() < 1e-3, "left channel DC offset {dc_l}");
+        assert!(dc_r.abs() < 1e-3, "right channel DC offset {dc_r}");
+    }
+
+    #[test]
+    fn pan_routes_a_track_between_channels() {
+        // Pan the demo's single-track... the demo has two tracks; pan the first
+        // hard left and the second hard right: each channel must then carry
+        // energy, and muting is audible per side when compared to centre.
+        let mut project = demo();
+        project.tracks[0].mixer.pan = -1.0;
+        if project.tracks.len() > 1 {
+            project.tracks[1].mixer.pan = 1.0;
+        }
+        let samples = render_samples(&project, 48_000, 1).unwrap();
+        let energy_l: f32 = samples.iter().step_by(2).map(|s| s * s).sum();
+        let energy_r: f32 = samples.iter().skip(1).step_by(2).map(|s| s * s).sum();
+        assert!(energy_l > 0.0, "hard-left track vanished");
+        assert!(energy_r > 0.0, "hard-right track vanished");
+
+        // Centre reference: both channels identical. Hard-panned: they differ.
+        let centre = render_samples(&demo(), 48_000, 1).unwrap();
+        let (cl, cr): (Vec<f32>, Vec<f32>) = (
+            centre.iter().step_by(2).copied().collect(),
+            centre.iter().skip(1).step_by(2).copied().collect(),
+        );
+        assert_eq!(cl, cr, "centre pan must be identical on both channels");
+        let (l, r): (Vec<f32>, Vec<f32>) = (
+            samples.iter().step_by(2).copied().collect(),
+            samples.iter().skip(1).step_by(2).copied().collect(),
+        );
+        assert_ne!(l, r, "hard pans must separate the channels");
     }
 }

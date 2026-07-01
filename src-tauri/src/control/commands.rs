@@ -12,7 +12,7 @@ use crate::control::{
     clip_edit, graph_edit, ids, note_edit, render, ControlMsg, ProjectFile, TransportCmd,
 };
 use crate::engine::graph::{compile, GraphDesc};
-use crate::engine::node::ParamId;
+use crate::engine::node::{ParamCurve, ParamId};
 use crate::engine::{AudioEngine, MAX_BLOCK};
 use crate::modules::registry;
 
@@ -538,9 +538,10 @@ pub fn engine_status(engine: State<'_, AudioEngine>) -> EngineStatus {
     }
 }
 
-/// A module parameter, as the UI needs it: identity plus the slider's starting
-/// position (normalized 0..1). Ranges and curves stay declared in the module,
-/// not hard-coded in the frontend.
+/// A module parameter, as the UI needs it: identity, the slider's starting
+/// position (normalized 0..1), and the declared range/curve so the UI can
+/// display the real value next to the normalized slider. Ranges and curves stay
+/// declared in the module, never hard-coded in the frontend.
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ParamInfo {
@@ -548,6 +549,9 @@ pub struct ParamInfo {
     pub name: String,
     pub unit: String,
     pub default: f32,
+    pub min: f32,
+    pub max: f32,
+    pub curve: ParamCurve,
 }
 
 #[tauri::command]
@@ -561,6 +565,9 @@ pub fn module_params(module_id: String) -> Vec<ParamInfo> {
                 name: p.name.to_string(),
                 unit: p.unit.to_string(),
                 default: p.normalize(p.default),
+                min: p.min,
+                max: p.max,
+                curve: p.curve,
             })
             .collect(),
         None => Vec::new(),

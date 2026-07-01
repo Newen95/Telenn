@@ -44,12 +44,17 @@ export interface ChainNodeView {
   params: Record<string, number>;
 }
 
-/** A module parameter as the UI needs it (range/curve stay in the module). */
+/** A module parameter as the UI needs it. `default` is normalized 0..1;
+ * `min`/`max`/`curve` are the module-declared range so the UI can display the
+ * real value (Hz, dB, ms…) behind a normalized slider. */
 export interface ParamInfo {
   id: number;
   name: string;
   unit: string;
   default: number;
+  min: number;
+  max: number;
+  curve: "linear" | "log" | "db";
 }
 
 export interface TrackView {

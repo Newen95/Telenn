@@ -33,7 +33,9 @@ pub struct PortSpec {
 }
 
 /// How a normalized 0..1 control value maps to the parameter's real range.
-#[derive(Debug, Clone, Copy)]
+/// Serialized (lowercase) so the UI can display real values next to sliders.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ParamCurve {
     /// Linear between `min` and `max`.
     Linear,

@@ -5,14 +5,12 @@
 // another track. Instruments are never drag-reordered (M6 = effects only).
 
 import { computed, reactive, watchEffect } from "vue";
-import { useI18n } from "vue-i18n";
 
 import { useProjectStore, type ChainNodeView, type ParamInfo } from "../../stores/project";
 import { useChainDrag, type DropTarget } from "./dragdrop";
 import { ChainSelection } from "./selection";
 import NodeMeter from "./NodeMeter.vue";
 
-const { t } = useI18n();
 const project = useProjectStore();
 const drag = useChainDrag();
 
@@ -53,6 +51,22 @@ function specValue(params: Record<string, number>, spec: ParamInfo): number {
 const paramValue = (node: ChainNodeView, spec: ParamInfo): number => specValue(node.params, spec);
 
 const sliderValue = (e: Event): number => Number((e.target as HTMLInputElement).value);
+
+/** Real value behind a normalized 0..1 position, mirroring `ParamSpec::denormalize`.
+ * For the `db` curve the *displayed* value is the dB position itself (the linear
+ * gain conversion only matters to the engine). */
+function realValue(p: ParamInfo, v: number): number {
+  if (p.curve === "log") return p.min * Math.pow(p.max / p.min, v);
+  return p.min + (p.max - p.min) * v;
+}
+
+/** "350 ms", "-6.0 dB", "0.35" — adaptive precision so short and huge ranges both read. */
+function formatParam(node: ChainNodeView, p: ParamInfo): string {
+  const r = realValue(p, paramValue(node, p));
+  const digits = Math.abs(r) >= 100 ? 0 : Math.abs(r) >= 10 ? 1 : 2;
+  const text = r.toFixed(digits);
+  return p.unit ? `${text} ${p.unit}` : text;
+}
 
 /** The dragged item as a card preview: its module and the params to show. */
 const ghost = computed<{ module: string; params: Record<string, number> } | null>(() => {
@@ -159,28 +173,36 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
             @keydown="onNodeKey($event, track.id, node, i)"
             @focusout="onNodeBlur($event, node.id)"
           >
-            <span class="node-name">{{ node.module }}</span>
-            <span class="node-role">{{ node.isInstrument ? t("chain.instrument") : t("chain.effect") }}</span>
-            <!-- Bare slider (no wrapping label): the interactive zone is exactly
-                 the slider, so its hover/cursor and a click never bleed onto the
-                 card. Drag streams the value live; release persists it. The param
-                 name lives in the tooltip rather than a redundant on-card label. -->
-            <input
-              v-for="p in (node.isInstrument ? [] : paramSpecs[node.module] ?? [])"
-              :key="p.id"
-              type="range"
-              class="param-slider"
-              min="0"
-              max="1"
-              step="0.001"
-              :title="p.name"
-              :value="paramValue(node, p)"
+            <div class="node-head">
+              <span class="node-name">{{ node.module }}</span>
+              <!-- Live VU from the audio thread (peak + RMS), mapped by flat index. -->
+              <NodeMeter :index="node.flatIndex" />
+            </div>
+            <!-- Params unfold *below* the header on selection, one labelled row
+                 each (name — slider — real value), so the card grows down and its
+                 neighbours never move. `pointerdown.stop` on the whole block: a
+                 press anywhere in the params area tweaks values, never arms a card
+                 drag. Drag streams the value live; release persists it. -->
+            <div
+              v-if="!node.isInstrument && sel.selected === node.id"
+              class="node-params"
               @pointerdown.stop
-              @input="project.setNodeParam(node.id, p.name, sliderValue($event))"
-              @change="project.commitNodeParam(node.id, p.name, sliderValue($event))"
-            />
-            <!-- Live VU from the audio thread (peak + RMS), mapped by flat index. -->
-            <NodeMeter :index="node.flatIndex" />
+            >
+              <label v-for="p in paramSpecs[node.module] ?? []" :key="p.id" class="param-row">
+                <span class="param-name">{{ p.name }}</span>
+                <input
+                  type="range"
+                  class="param-slider"
+                  min="0"
+                  max="1"
+                  step="0.001"
+                  :value="paramValue(node, p)"
+                  @input="project.setNodeParam(node.id, p.name, sliderValue($event))"
+                  @change="project.commitNodeParam(node.id, p.name, sliderValue($event))"
+                />
+                <span class="param-value">{{ formatParam(node, p) }}</span>
+              </label>
+            </div>
           </div>
         </div>
         <!-- Trailing gap = append to the end of the chain. -->
@@ -204,9 +226,10 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
       :style="{ left: drag.state.x + 'px', top: drag.state.y + 'px' }"
     >
       <div class="node ghost">
-        <span class="node-name">{{ ghost.module }}</span>
-        <span class="node-role">{{ t("chain.effect") }}</span>
-        <span v-if="drag.state.copy" class="ghost-copy">+</span>
+        <div class="node-head">
+          <span class="node-name">{{ ghost.module }}</span>
+          <span v-if="drag.state.copy" class="ghost-copy">+</span>
+        </div>
       </div>
     </div>
   </div>
@@ -215,7 +238,10 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
 <style scoped>
 .chain-panel {
   height: 100%;
-  overflow: auto;
+  /* Only the panel scrolls vertically (when there are many tracks); each track
+     row scrolls its own effects horizontally, so the track name never leaves. */
+  overflow-y: auto;
+  overflow-x: hidden;
   padding: 0.4rem 0.6rem;
   display: flex;
   flex-direction: column;
@@ -224,12 +250,16 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
 
 .chain-row {
   display: flex;
-  align-items: center;
+  /* Top-aligned: a card unfolding its params grows downward without moving its
+     neighbours or the track name. */
+  align-items: flex-start;
   gap: 0.6rem;
 }
 
 .track-name {
   min-width: 4rem;
+  /* Optically aligned with the card headers of the top-aligned row. */
+  padding-top: 0.55rem;
   font-size: 0.75rem;
   color: #8e8e93;
   text-transform: uppercase;
@@ -238,8 +268,14 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
 
 .chain {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   flex: 1;
+  /* A long chain scrolls within its row instead of being clipped or pushing the
+     panel wider. `min-width: 0` lets this flex child shrink below its content so
+     the overflow actually engages. */
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: thin;
   /* Offset parent for a leaving card pinned by `onBeforeLeave` (position: absolute). */
   position: relative;
 }
@@ -269,8 +305,9 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
 
 .node {
   display: flex;
-  align-items: center;
-  gap: 0.4rem;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0.3rem;
   padding: 0.3rem 0.5rem;
   border: 1px solid #3a3a3c;
   border-radius: 6px;
@@ -302,32 +339,74 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
   border-color: #2f5a6e;
 }
 
+.node-head {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
 .node-name {
   font-size: 0.85rem;
   color: #f6f6f6;
+  margin-right: auto;
 }
 
-.node-role {
-  font-size: 0.65rem;
+/* Params of the selected node, one labelled row each, stacked under the header. */
+.node-params {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  padding-top: 0.3rem;
+  border-top: 1px solid #3a3a3c;
+  cursor: default;
+}
+
+.param-row {
+  display: grid;
+  grid-template-columns: 4.6rem 6.5rem 4.2rem;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.param-name {
+  font-size: 0.7rem;
   color: #8e8e93;
-  text-transform: uppercase;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
-/* The cursor only changes over the slider itself (the grab cursor stays on the
-   rest of the card), and it is the pointing hand — not a resize cursor. */
+.param-value {
+  font-size: 0.7rem;
+  color: #c7c7cc;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Palette-matched slider (WebView2 = Chromium, webkit pseudo-elements only):
+   thin anthracite track, round accent thumb, tall transparent hit zone. */
 .param-slider {
-  /* Hidden until the node is selected (the existing click selection); never on
-     hover. A dropped or unselected node stays compact (name, role, VU only). */
-  display: none;
-  width: 70px;
+  appearance: none;
+  -webkit-appearance: none;
+  width: 100%;
+  height: 14px;
+  background: transparent;
   cursor: pointer;
 }
 
-/* Selecting a node reveals its params; focus-within keeps them shown while a
-   slider inside is being dragged or focused. */
-.node.selected .param-slider,
-.node:focus-within .param-slider {
-  display: inline-block;
+.param-slider::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 2px;
+  background: #3a3a3c;
+}
+
+.param-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 12px;
+  height: 12px;
+  /* Centre the thumb on the 4px track. */
+  margin-top: -4px;
+  border-radius: 50%;
+  background: #5fae7f;
 }
 
 /* Gaps are thin by default; they widen while a drag is active and the one under

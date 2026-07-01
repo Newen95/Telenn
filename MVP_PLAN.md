@@ -13,7 +13,7 @@ Le MVP est atteint quand ce scénario fonctionne de bout en bout, sur Windows ET
 
 **Dans le MVP** : moteur graphe + hot-swap, séquenceur, 3 instruments
 (soustractif, FM, drums-sampler), 4 effets (filtre, delay, reverb, compresseur),
-mixeur (gain/pan/sends), timeline + piano roll canvas, panneau chaîne avec
+mixeur (gain/pan + master), timeline + piano roll canvas, panneau chaîne avec
 drag & drop, VU-mètres + playhead fluide, export WAV, file watcher.
 
 **Hors MVP (post-MVP, dans cet ordre)** : entrée MIDI live, éditeur de graphe
@@ -413,9 +413,13 @@ pour les CA de M6 ; bloquant pour commencer l'intégration visuelle de M8.
    libre de droits dans `assets/`).
 2. Effets : `modules/delay.rs` (synchronisé au tempo, feedback filtré),
    `modules/reverb.rs` (Freeverb/FDN simple — qualité honnête, pas un Lexicon),
-   `modules/compressor.rs` (attack/release/ratio/makeup, détection RMS).
-3. Mixeur : gain/pan par piste (pan loi -3 dB), 2 bus d'envoi (A/B) + master.
-   `views/mixer/MixerPanel.vue` : faders verticaux + VU.
+   `modules/compressor.rs` (attack/release/ratio/makeup, détection RMS). La reverb
+   est un **effet d'insert** dans la chaîne d'une piste (comme le delay) : pas de
+   bus de reverb partagé au MVP.
+3. Mixeur : gain/pan par piste (pan loi -3 dB) + master. Pas de bus d'envoi : les
+   **sends/bus = post-MVP #1**, déclenchés par le besoin concret d'une reverb
+   partagée (cf. vision modulaire de CONTRIBUTING.md). `views/mixer/MixerPanel.vue` :
+   faders verticaux + VU.
 4. Métronome (clic généré, pas un sample), volume dédié.
 5. Projet de démo complet 16 mesures qui sonne bien — c'est aussi le test
    d'intégration vivant et la démo pour Claude Code.

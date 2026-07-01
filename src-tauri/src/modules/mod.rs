@@ -4,6 +4,11 @@
 //! module registry. Adding or removing a module never touches the engine core.
 
 pub mod _template;
+pub mod compressor;
+pub mod delay;
+pub mod drum_sampler;
+pub mod fm;
 pub mod plucked;
 pub mod registry;
+pub mod reverb;
 pub mod subtractive;

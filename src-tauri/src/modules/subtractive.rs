@@ -4,8 +4,7 @@
 //! All DSP is hand-written. `process` is RT-SAFE: a fixed voice array, no
 //! allocation, no locks. Voice stealing takes the oldest voice.
 
-use std::f32::consts::TAU;
-
+use crate::engine::dsp::{AdsrSettings, Biquad, Env, MIN_RELEASE_S};
 use crate::engine::node::{
     AudioNode, NodeIo, NoteKind, ParamCurve, ParamId, ParamSpec, Port, PortSpec, ProcessCtx,
     SignalKind,
@@ -15,8 +14,6 @@ use crate::engine::params::{LinearRamp, OnePole};
 const VOICES: usize = 8;
 /// Cutoff/resonance glide time constant (seconds) for the one-pole smoother.
 const SMOOTH_S: f32 = 0.015;
-/// Minimum release to guarantee a click-free tail (seconds).
-const MIN_RELEASE_S: f32 = 0.005;
 
 const P_CUTOFF: ParamId = 0;
 const P_RESONANCE: ParamId = 1;
@@ -91,136 +88,6 @@ const PARAMS: [ParamSpec; 7] = [
         curve: ParamCurve::Db,
     },
 ];
-
-/// ADSR settings shared by all voices (the synth's current envelope shape).
-#[derive(Clone, Copy)]
-struct AdsrSettings {
-    attack_s: f32,
-    decay_s: f32,
-    sustain: f32,
-    release_s: f32,
-}
-
-impl Default for AdsrSettings {
-    fn default() -> Self {
-        Self {
-            attack_s: 0.005,
-            decay_s: 0.2,
-            sustain: 0.7,
-            release_s: 0.15,
-        }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Stage {
-    Idle,
-    Attack,
-    Decay,
-    Sustain,
-    Release,
-}
-
-/// Per-voice amplitude envelope. Linear segments; the release floor keeps the
-/// tail click-free even at the shortest setting.
-#[derive(Clone, Copy)]
-struct Env {
-    stage: Stage,
-    level: f32,
-}
-
-impl Default for Env {
-    fn default() -> Self {
-        Self {
-            stage: Stage::Idle,
-            level: 0.0,
-        }
-    }
-}
-
-impl Env {
-    fn note_on(&mut self) {
-        self.stage = Stage::Attack;
-    }
-
-    fn note_off(&mut self) {
-        if self.stage != Stage::Idle {
-            self.stage = Stage::Release;
-        }
-    }
-
-    fn is_active(&self) -> bool {
-        self.stage != Stage::Idle
-    }
-
-    // RT-SAFE
-    fn tick(&mut self, s: &AdsrSettings, sr: f32) -> f32 {
-        match self.stage {
-            Stage::Idle => self.level = 0.0,
-            Stage::Attack => {
-                self.level += 1.0 / (s.attack_s.max(0.001) * sr);
-                if self.level >= 1.0 {
-                    self.level = 1.0;
-                    self.stage = Stage::Decay;
-                }
-            }
-            Stage::Decay => {
-                self.level -= (1.0 - s.sustain) / (s.decay_s.max(0.001) * sr);
-                if self.level <= s.sustain {
-                    self.level = s.sustain;
-                    self.stage = Stage::Sustain;
-                }
-            }
-            Stage::Sustain => self.level = s.sustain,
-            Stage::Release => {
-                self.level -= 1.0 / (s.release_s.max(MIN_RELEASE_S) * sr);
-                if self.level <= 0.0 {
-                    self.level = 0.0;
-                    self.stage = Stage::Idle;
-                }
-            }
-        }
-        self.level
-    }
-}
-
-/// RBJ cookbook low-pass biquad, transposed direct form II. // RT-SAFE
-#[derive(Clone, Copy, Default)]
-struct Biquad {
-    b0: f32,
-    b1: f32,
-    b2: f32,
-    a1: f32,
-    a2: f32,
-    z1: f32,
-    z2: f32,
-}
-
-impl Biquad {
-    fn set_lowpass(&mut self, fc: f32, q: f32, sr: f32) {
-        let w0 = TAU * (fc / sr).clamp(1.0e-4, 0.49);
-        let cos_w0 = w0.cos();
-        let alpha = w0.sin() / (2.0 * q.max(0.1));
-        let a0 = 1.0 + alpha;
-        self.b1 = (1.0 - cos_w0) / a0;
-        self.b0 = self.b1 / 2.0;
-        self.b2 = self.b0;
-        self.a1 = (-2.0 * cos_w0) / a0;
-        self.a2 = (1.0 - alpha) / a0;
-    }
-
-    // RT-SAFE
-    fn process(&mut self, x: f32) -> f32 {
-        let y = self.b0 * x + self.z1;
-        self.z1 = self.b1 * x - self.a1 * y + self.z2;
-        self.z2 = self.b2 * x - self.a2 * y;
-        // Flush denormals: filter tails decay toward subnormal values, which
-        // are catastrophically slow on x86 unless flushed.
-        self.z1 = flush(self.z1);
-        self.z2 = flush(self.z2);
-        y
-    }
-}
 
 #[derive(Clone, Copy, Default)]
 struct Voice {
@@ -445,16 +312,6 @@ fn poly_blep(t: f32, dt: f32) -> f32 {
         x * x + x + x + 1.0
     } else {
         0.0
-    }
-}
-
-/// Zero subnormal values to avoid denormal CPU stalls. // RT-SAFE
-#[inline]
-fn flush(x: f32) -> f32 {
-    if x.abs() < 1.0e-15 {
-        0.0
-    } else {
-        x
     }
 }
 

@@ -3,6 +3,7 @@
 //! Everything reachable from the audio callback must be RT-SAFE: no allocation,
 //! no locks, no I/O, no blocking syscalls.
 
+pub mod dsp;
 pub mod graph;
 pub mod node;
 pub mod params;

@@ -23,8 +23,7 @@ dist-ssr
 *.sln
 *.sw?
 
-# Generated audio exports (binary, not diffable — regenerate with export_wav)
-projects/**/*.wav
-
-# Saved effect presets are runtime user data (recreated on demand by save_preset)
-projects/*/presets/
+# User projects (songs, presets, exports) are local working data, not repo
+# content: live testing edits them constantly. The app ships its demo embedded
+# and recreates projects/demo on first launch.
+projects/

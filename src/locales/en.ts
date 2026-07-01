@@ -6,10 +6,6 @@ export default {
   edit: {
     hints: "Double-click: create · drag: move · edges: resize · keyboard: audition · Del: delete · Ctrl+Z: undo",
   },
-  chain: {
-    instrument: "Instrument",
-    effect: "Effect",
-  },
   browser: {
     modules: "Modules",
     presets: "Presets",

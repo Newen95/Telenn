@@ -5,6 +5,7 @@
 
 pub mod dsp;
 pub mod graph;
+pub mod metronome;
 pub mod mix;
 pub mod node;
 pub mod params;

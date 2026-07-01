@@ -143,27 +143,36 @@ mod tests {
 
     #[test]
     fn pan_routes_a_track_between_channels() {
-        // Pan the demo's single-track... the demo has two tracks; pan the first
-        // hard left and the second hard right: each channel must then carry
-        // energy, and muting is audible per side when compared to centre.
+        // The demo's stored mixer values are whatever the user last saved, so
+        // every setting under test is forced explicitly here. Hard-pan the two
+        // tracks apart: each channel must carry energy and the channels differ;
+        // recentred, both channels are identical (within f32 rounding).
         let mut project = demo();
-        project.tracks[0].mixer.pan = -1.0;
-        if project.tracks.len() > 1 {
-            project.tracks[1].mixer.pan = 1.0;
+        project.master_gain_db = 0.0;
+        for track in &mut project.tracks {
+            track.mixer = crate::engine::mix::TrackMix::default();
         }
-        let samples = render_samples(&project, 48_000, 1).unwrap();
+        let mut panned = project.clone();
+        panned.tracks[0].mixer.pan = -1.0;
+        if panned.tracks.len() > 1 {
+            panned.tracks[1].mixer.pan = 1.0;
+        }
+
+        let samples = render_samples(&panned, 48_000, 1).unwrap();
         let energy_l: f32 = samples.iter().step_by(2).map(|s| s * s).sum();
         let energy_r: f32 = samples.iter().skip(1).step_by(2).map(|s| s * s).sum();
         assert!(energy_l > 0.0, "hard-left track vanished");
         assert!(energy_r > 0.0, "hard-right track vanished");
 
-        // Centre reference: both channels identical. Hard-panned: they differ.
-        let centre = render_samples(&demo(), 48_000, 1).unwrap();
-        let (cl, cr): (Vec<f32>, Vec<f32>) = (
-            centre.iter().step_by(2).copied().collect(),
-            centre.iter().skip(1).step_by(2).copied().collect(),
-        );
-        assert_eq!(cl, cr, "centre pan must be identical on both channels");
+        let centre = render_samples(&project, 48_000, 1).unwrap();
+        for frame in centre.chunks_exact(2) {
+            assert!(
+                (frame[0] - frame[1]).abs() < 1.0e-6,
+                "centre pan differs between channels: {} vs {}",
+                frame[0],
+                frame[1]
+            );
+        }
         let (l, r): (Vec<f32>, Vec<f32>) = (
             samples.iter().step_by(2).copied().collect(),
             samples.iter().skip(1).step_by(2).copied().collect(),

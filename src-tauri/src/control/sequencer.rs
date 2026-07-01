@@ -36,6 +36,11 @@ pub struct Schedule {
     /// Loop length in samples. The playhead wraps modulo this. Zero means an
     /// empty schedule with nothing to play.
     pub loop_len: u64,
+    /// Samples per beat (from bpm + time signature), the metronome's grid.
+    /// Zero means unknown — the metronome stays silent.
+    pub samples_per_beat: u64,
+    /// Beats per bar (time-signature numerator); the bar start is accented.
+    pub beats_per_bar: u32,
 }
 
 /// Walks a [`Schedule`] forward in sample time, emitting the events that fall in
@@ -210,6 +215,7 @@ mod tests {
         let schedule = Schedule {
             events: vec![ev(0, 60, true), ev(100, 60, false), ev(300, 62, true)],
             loop_len: 1000,
+            ..Default::default()
         };
         let mut cur = SequencerCursor::new();
         let mut got: Vec<(usize, u64)> = Vec::new();
@@ -234,6 +240,7 @@ mod tests {
                 ev(600, 62, false),
             ],
             loop_len: 1000,
+            ..Default::default()
         };
         let mut cur = SequencerCursor::new();
         let mut out = [(0usize, 0u8, 0u8); 16];
@@ -265,6 +272,7 @@ mod tests {
         let schedule = Schedule {
             events: vec![ev(0, 60, true), ev(200, 60, false)],
             loop_len: 1000,
+            ..Default::default()
         };
         let mut cur = SequencerCursor::new();
         cur.seek(300, &schedule);
@@ -291,6 +299,7 @@ mod tests {
                 },
             ],
             loop_len: 1000,
+            ..Default::default()
         };
         let mut cur = SequencerCursor::new();
         cur.seek(200, &schedule);
@@ -306,6 +315,7 @@ mod tests {
         let schedule = Schedule {
             events: vec![ev(0, 60, true)],
             loop_len,
+            ..Default::default()
         };
         let mut cur = SequencerCursor::new();
         // Advance with an awkward, non-divisor block size for many loops.

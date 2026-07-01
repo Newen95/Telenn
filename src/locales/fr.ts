@@ -1,6 +1,6 @@
 export default {
   app: { title: "Telenn" },
-  transport: { play: "Lecture", stop: "Stop" },
+  transport: { play: "Lecture", stop: "Stop", metronome: "Métronome" },
   view: { timeline: "Timeline", pianoRoll: "Piano roll", chain: "Chaîne", mixer: "Mixeur" },
   meter: { master: "Master", cpu: "CPU", xruns: "xruns" },
   edit: {

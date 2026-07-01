@@ -82,6 +82,11 @@ pub enum ControlMsg {
     SetMasterGain {
         gain_db: f32,
     },
+    /// Metronome toggle + volume (session state, never persisted to the song).
+    SetMetronome {
+        enabled: bool,
+        volume: f32,
+    },
 }
 
 #[derive(Clone, Copy)]

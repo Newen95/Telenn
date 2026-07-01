@@ -24,6 +24,21 @@ async function stop(): Promise<void> {
   await invoke("transport_stop");
   playing.value = false;
 }
+
+// Metronome: session monitoring state (never saved to the song, never
+// exported). The volume slider only shows while the click is on.
+const metronomeOn = ref(false);
+const metronomeVolume = ref(0.7);
+
+async function toggleMetronome(): Promise<void> {
+  metronomeOn.value = !metronomeOn.value;
+  await invoke("metronome_set", { enabled: metronomeOn.value, volume: metronomeVolume.value });
+}
+
+async function onMetronomeVolume(e: Event): Promise<void> {
+  metronomeVolume.value = Number((e.target as HTMLInputElement).value);
+  await invoke("metronome_set", { enabled: metronomeOn.value, volume: metronomeVolume.value });
+}
 </script>
 
 <template>
@@ -32,6 +47,25 @@ async function stop(): Promise<void> {
       ▶ {{ t("transport.play") }}
     </button>
     <button type="button" class="tbtn" @click="stop">⏹ {{ t("transport.stop") }}</button>
+    <button
+      type="button"
+      class="tbtn"
+      :class="{ active: metronomeOn }"
+      :title="t('transport.metronome')"
+      @click="toggleMetronome"
+    >
+      ⏱ {{ t("transport.metronome") }}
+    </button>
+    <input
+      v-if="metronomeOn"
+      class="metronome-volume"
+      type="range"
+      min="0"
+      max="1"
+      step="0.01"
+      :value="metronomeVolume"
+      @input="onMetronomeVolume($event)"
+    />
     <MasterMeter />
     <span class="engine-load" :class="{ hot: cpuHot }">
       {{ t("meter.cpu") }} {{ cpuPercent }}% · {{ t("meter.xruns") }} {{ telemetry.xruns }}
@@ -63,6 +97,12 @@ async function stop(): Promise<void> {
 .tbtn.active {
   background: #2f7d5b;
   border-color: #2f7d5b;
+}
+
+.metronome-volume {
+  width: 70px;
+  accent-color: #5fae7f;
+  cursor: pointer;
 }
 
 .engine-load {

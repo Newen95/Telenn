@@ -535,7 +535,12 @@ impl Project {
         // re-triggered pitch releases the old voice before the new one starts.
         events.sort_by_key(|e| (e.pos, matches!(e.kind, NoteKind::On { .. }) as u8));
 
-        Ok(Schedule { events, loop_len })
+        Ok(Schedule {
+            events,
+            loop_len,
+            samples_per_beat: ticks_to_samples(tpbeat, self.bpm, sample_rate),
+            beats_per_bar: self.time_signature[0],
+        })
     }
 }
 

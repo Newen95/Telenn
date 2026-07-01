@@ -582,6 +582,13 @@ pub fn mixer_set_master(engine: State<'_, AudioEngine>, gain_db: f32) {
     engine.send(ControlMsg::SetMasterGain { gain_db });
 }
 
+/// Metronome toggle + volume. Session monitoring state: never persisted to the
+/// song, never part of an export.
+#[tauri::command]
+pub fn metronome_set(engine: State<'_, AudioEngine>, enabled: bool, volume: f32) {
+    engine.send(ControlMsg::SetMetronome { enabled, volume });
+}
+
 /// Commit the master gain: persist and record one undo step.
 #[tauri::command]
 pub fn mixer_commit_master(

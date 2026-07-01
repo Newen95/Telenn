@@ -14,6 +14,7 @@ use rtrb::Producer;
 use crate::control::sequencer::{Schedule, SequencerCursor};
 use crate::control::{ControlMsg, TransportCmd};
 use crate::engine::graph::CompiledGraph;
+use crate::engine::metronome::Metronome;
 use crate::engine::mix::Mixer;
 use crate::engine::node::{NodeIdx, NoteEvent, NoteKind};
 use crate::engine::params::LinearRamp;
@@ -94,6 +95,8 @@ pub struct RtState {
     mixer: Mixer,
     /// One declick per stereo channel, absorbing the swap-boundary step.
     declick: [Declick; 2],
+    /// Generated click on the beat grid — monitoring only, never exported.
+    metronome: Metronome,
     /// Interleaved stereo mix scratch (graph + fading graph) before the device
     /// fan-out. Pre-allocated.
     mix: Vec<f32>,
@@ -131,6 +134,7 @@ impl RtState {
             fade: LinearRamp::new(0.0, FADE_MS, sample_rate),
             mixer,
             declick: [Declick::new(sample_rate), Declick::new(sample_rate)],
+            metronome: Metronome::new(sample_rate),
             mix: vec![0.0; MAX_BLOCK * 2],
             schedule: Box::new(schedule),
             cursor: SequencerCursor::new(),
@@ -267,6 +271,7 @@ impl RtState {
             }
             ControlMsg::SetTrackMix { track, mix } => self.mixer.set_track(track, mix),
             ControlMsg::SetMasterGain { gain_db } => self.mixer.set_master_db(gain_db),
+            ControlMsg::SetMetronome { enabled, volume } => self.metronome.set(enabled, volume),
         }
     }
 
@@ -288,6 +293,9 @@ impl RtState {
         let compute_start = Instant::now();
         while off < total {
             let n = (total - off).min(MAX_BLOCK);
+            // Chunk-start playhead, captured before the sequencer advances: the
+            // metronome grid below is positioned against it.
+            let chunk_start = self.cursor.playhead();
 
             // Emit this chunk's scheduled events before rendering. Live keyboard
             // notes were already queued by `handle`; both coexist (always-live
@@ -329,6 +337,19 @@ impl RtState {
                 if let Some(done) = self.fading.take() {
                     discard(&mut self.garbage, Garbage::Graph(done));
                 }
+            }
+
+            // Metronome, monitoring only: added to the real-time mix while the
+            // transport plays. The offline render never runs this path, so an
+            // export can never carry the click.
+            if self.playing {
+                self.metronome.add_block(
+                    chunk_start,
+                    self.schedule.loop_len,
+                    self.schedule.samples_per_beat,
+                    self.schedule.beats_per_bar,
+                    &mut self.mix[..n * 2],
+                );
             }
 
             // Declick the swap-boundary step per channel, then fan the stereo
@@ -496,6 +517,7 @@ mod tests {
                 },
             }],
             loop_len: 96_000,
+            ..Default::default()
         });
 
         VIOLATIONS.store(0, Ordering::SeqCst);
@@ -632,6 +654,7 @@ mod tests {
         let schedule = Schedule {
             events,
             loop_len: 1_000_000,
+            ..Default::default()
         };
         let mut rt = RtState::new(48_000.0, graph, schedule, prod, tprod, xruns);
         rt.handle(ControlMsg::Transport(TransportCmd::Play));
@@ -667,6 +690,7 @@ mod tests {
         rt.handle(ControlMsg::SetSchedule(Box::new(Schedule {
             events: next,
             loop_len: 1_000_000,
+            ..Default::default()
         })));
 
         assert!(
@@ -681,6 +705,7 @@ mod tests {
         rt.handle(ControlMsg::SetSchedule(Box::new(Schedule {
             events: note(64, 0, 500_000).to_vec(), // same span, pitch 60 → 64
             loop_len: 1_000_000,
+            ..Default::default()
         })));
         let pending = rt.graph.pending_notes(0);
         assert!(pushed_off(pending, 60), "the old pitch must be released");
@@ -699,6 +724,7 @@ mod tests {
         rt.handle(ControlMsg::SetSchedule(Box::new(Schedule {
             events: note(60, 0, 500_000).to_vec(), // 62 removed
             loop_len: 1_000_000,
+            ..Default::default()
         })));
         let pending = rt.graph.pending_notes(0);
         assert!(pushed_off(pending, 62), "the removed note must be released");
@@ -721,6 +747,7 @@ mod tests {
         rt.handle(ControlMsg::SetSchedule(Box::new(Schedule {
             events: note(60, 0, 500_000).to_vec(),
             loop_len: 1_000_000,
+            ..Default::default()
         })));
         let pending = rt.graph.pending_notes(0);
         assert!(
@@ -739,6 +766,7 @@ mod tests {
         rt.handle(ControlMsg::SetSchedule(Box::new(Schedule {
             events: note(60, 0, 32).to_vec(), // Off at 32, playhead is at 64
             loop_len: 1_000_000,
+            ..Default::default()
         })));
         let pending = rt.graph.pending_notes(0);
         assert!(
@@ -758,6 +786,7 @@ mod tests {
         let empty = Schedule {
             events: vec![],
             loop_len: 192_000,
+            ..Default::default()
         };
         let (tprod, _t) = rtrb::RingBuffer::<TelemetryFrame>::new(64);
         let xruns = Arc::new(AtomicU32::new(0));
@@ -787,6 +816,7 @@ mod tests {
                 },
             ],
             loop_len: 192_000,
+            ..Default::default()
         });
         rt.handle(ControlMsg::SetSchedule(next));
         // The note is in progress at the playhead and was not held before, so the
@@ -796,6 +826,67 @@ mod tests {
             pushed_on(rt.graph.pending_notes(0), 60),
             "in-progress note was not restruck on reload"
         );
+    }
+
+    #[test]
+    fn metronome_clicks_on_the_beat_grid_only_while_playing() {
+        // A silent graph + an empty schedule with a beat grid: whatever sounds
+        // is the metronome alone.
+        use crate::engine::graph::{compile, GraphDesc, NodeDesc};
+        use crate::engine::swap::test_support;
+
+        let silence = GraphDesc {
+            nodes: vec![NodeDesc {
+                id: "s".into(),
+                module_id: "silence".into(),
+                params: vec![],
+            }],
+            connections: vec![],
+            tails: vec![0],
+            track_mix: vec![],
+            master_gain_db: 0.0,
+        };
+        let graph = compile(&silence, test_support::create, 48_000.0, MAX_BLOCK, 1).unwrap();
+        let schedule = Schedule {
+            events: vec![],
+            loop_len: 96_000,
+            samples_per_beat: 24_000, // 120 bpm at 48 kHz
+            beats_per_bar: 4,
+        };
+        let (prod, _cons) = rtrb::RingBuffer::<Garbage>::new(8);
+        let (tprod, _t) = rtrb::RingBuffer::<TelemetryFrame>::new(64);
+        let xruns = Arc::new(AtomicU32::new(0));
+        let mut rt = RtState::new(48_000.0, graph, schedule, prod, tprod, xruns);
+        rt.handle(ControlMsg::SetMetronome {
+            enabled: true,
+            volume: 1.0,
+        });
+
+        // Stopped: the metronome stays silent even when enabled.
+        let mut out = vec![0.0f32; 4096 * 2];
+        rt.process(&mut out, 2);
+        let stopped = out.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        assert!(stopped == 0.0, "metronome clicked while stopped: {stopped}");
+
+        // Playing: one bar rendered in device-sized callbacks; clicks land on
+        // the beat grid and have decayed just before the next beat.
+        rt.handle(ControlMsg::Transport(TransportCmd::Play));
+        let mut left = Vec::with_capacity(96_000);
+        let mut buf = vec![0.0f32; 256 * 2];
+        while left.len() < 96_000 {
+            rt.process(&mut buf, 2);
+            left.extend(buf.iter().step_by(2).copied());
+        }
+        let peak = |w: &[f32]| w.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        for beat in 0..4usize {
+            let at = beat * 24_000;
+            let strike = peak(&left[at..at + 128]);
+            assert!(strike > 0.05, "no click at beat {beat}: {strike}");
+            if beat > 0 {
+                let quiet = peak(&left[at - 1_000..at - 10]);
+                assert!(quiet < 1.0e-3, "click bleeds into beat {beat}: {quiet}");
+            }
+        }
     }
 
     #[test]
@@ -825,6 +916,7 @@ mod tests {
                 },
             ],
             loop_len: 192_000,
+            ..Default::default()
         });
         // Never played: still stopped at the start.
         rt.handle(ControlMsg::SetSchedule(next));

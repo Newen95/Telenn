@@ -1,7 +1,25 @@
 export default {
   app: { title: "Telenn" },
   transport: { play: "Lecture", stop: "Stop", metronome: "Métronome" },
-  view: { timeline: "Timeline", pianoRoll: "Piano roll", chain: "Chaîne", mixer: "Mixeur" },
+  view: {
+    timeline: "Timeline",
+    pianoRoll: "Piano roll",
+    chain: "Chaîne",
+    mixer: "Mixeur",
+    browser: "Bibliothèque",
+  },
+  ui: { collapse: "Replier", expand: "Déplier" },
+  menu: {
+    file: "Fichier",
+    edit: "Édition",
+    view: "Affichage",
+    exportWav: "Exporter en WAV",
+    exported: "Export terminé",
+    reloadProject: "Recharger le projet",
+    undo: "Annuler",
+    redo: "Rétablir",
+    devOverlay: "Console dev",
+  },
   meter: { master: "Master", cpu: "CPU", xruns: "xruns" },
   edit: {
     hints: "Double-clic : créer · glisser : déplacer · bords : redimensionner · clavier : préécouter · Suppr : supprimer · Ctrl+Z : annuler",
@@ -10,6 +28,7 @@ export default {
     instruments: "Instruments",
     modules: "Effets",
     presets: "Presets",
+    search: "Rechercher…",
     dropToSave: "Glissez un effet ici pour l'enregistrer",
   },
   chain: {

@@ -1,14 +1,17 @@
 <script setup lang="ts">
-// Browser of effect modules and saved presets. Items are dragged from here into a
-// track's chain (insert). The presets section is also a drop target: dragging an
-// effect node onto it saves that node as a preset (handled by the App controller,
-// which owns the pointer plumbing; here we only mark the zone and the sources).
+// Library browser: collapsible sections (instruments / effects / presets) with
+// a search field that filters all of them. Items are dragged from here into a
+// track's chain (insert), onto a chain head (replace instrument) or the
+// new-track zone. The presets section is also a drop target: dragging an
+// effect node onto it saves that node as a preset (handled by the App
+// controller, which owns the pointer plumbing; here we only mark the zone).
 
-import { onMounted, ref, watch } from "vue";
+import { computed, onMounted, reactive, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
 
 import { useProjectStore, type ModuleDesc } from "../../stores/project";
 import { useChainDrag } from "../chain/dragdrop";
+import Icon from "../../ui/Icon.vue";
 
 interface NamedPreset {
   name: string;
@@ -24,6 +27,16 @@ const instruments = ref<ModuleDesc[]>([]);
 const effects = ref<ModuleDesc[]>([]);
 const presets = ref<NamedPreset[]>([]);
 
+const search = ref("");
+const open = reactive({ instruments: true, effects: true, presets: true });
+
+const match = (name: string): boolean =>
+  name.toLowerCase().includes(search.value.trim().toLowerCase());
+
+const shownInstruments = computed(() => instruments.value.filter((m) => match(m.name)));
+const shownEffects = computed(() => effects.value.filter((m) => match(m.name)));
+const shownPresets = computed(() => presets.value.filter((p) => match(p.name)));
+
 async function reloadPresets(): Promise<void> {
   const names = await project.listPresets();
   presets.value = await Promise.all(
@@ -35,8 +48,6 @@ async function reloadPresets(): Promise<void> {
 }
 
 onMounted(async () => {
-  // Effects insert into a chain; instruments drop on a chain head (replace) or
-  // on the new-track zone (create a track).
   const modules = await project.listModules();
   instruments.value = modules.filter((m) => m.category === "instrument");
   effects.value = modules.filter((m) => m.category === "effect");
@@ -62,11 +73,23 @@ function dragPreset(e: PointerEvent, p: NamedPreset): void {
 
 <template>
   <div class="browser">
+    <input
+      v-model="search"
+      class="search"
+      type="search"
+      :placeholder="t('browser.search')"
+      spellcheck="false"
+    />
+
     <section class="group">
-      <h3 class="group-title">{{ t("browser.instruments") }}</h3>
-      <div class="items">
+      <button type="button" class="group-head" @click="open.instruments = !open.instruments">
+        <Icon name="chevron-down" :size="12" :class="{ closed: !open.instruments }" />
+        <span class="group-title">{{ t("browser.instruments") }}</span>
+        <span class="count num">{{ shownInstruments.length }}</span>
+      </button>
+      <div v-if="open.instruments" class="items">
         <div
-          v-for="m in instruments"
+          v-for="m in shownInstruments"
           :key="m.id"
           class="item instrument"
           @pointerdown="dragModule($event, m)"
@@ -77,10 +100,14 @@ function dragPreset(e: PointerEvent, p: NamedPreset): void {
     </section>
 
     <section class="group">
-      <h3 class="group-title">{{ t("browser.modules") }}</h3>
-      <div class="items">
+      <button type="button" class="group-head" @click="open.effects = !open.effects">
+        <Icon name="chevron-down" :size="12" :class="{ closed: !open.effects }" />
+        <span class="group-title">{{ t("browser.modules") }}</span>
+        <span class="count num">{{ shownEffects.length }}</span>
+      </button>
+      <div v-if="open.effects" class="items">
         <div
-          v-for="m in effects"
+          v-for="m in shownEffects"
           :key="m.id"
           class="item"
           @pointerdown="dragModule($event, m)"
@@ -96,10 +123,14 @@ function dragPreset(e: PointerEvent, p: NamedPreset): void {
       :class="{ savable: drag.state.source?.kind === 'node' }"
       data-save-preset
     >
-      <h3 class="group-title">{{ t("browser.presets") }}</h3>
-      <div class="items">
+      <button type="button" class="group-head" @click="open.presets = !open.presets">
+        <Icon name="chevron-down" :size="12" :class="{ closed: !open.presets }" />
+        <span class="group-title">{{ t("browser.presets") }}</span>
+        <span class="count num">{{ shownPresets.length }}</span>
+      </button>
+      <div v-if="open.presets" class="items">
         <div
-          v-for="p in presets"
+          v-for="p in shownPresets"
           :key="p.name"
           class="item preset"
           @pointerdown="dragPreset($event, p)"
@@ -114,43 +145,99 @@ function dragPreset(e: PointerEvent, p: NamedPreset): void {
 
 <style scoped>
 .browser {
-  width: 200px;
-  border-left: 1px solid #2c2c2e;
+  width: 100%;
+  height: 100%;
   padding: 0.4rem 0.6rem;
   overflow: auto;
   display: flex;
   flex-direction: column;
-  gap: 0.8rem;
+  gap: 0.6rem;
+}
+
+.search {
+  width: 100%;
+  padding: 0.3rem 0.5rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font-size: 0.8rem;
+  transition: border-color var(--t-fast);
+}
+
+.search:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.search::placeholder {
+  color: var(--text-3);
+}
+
+.group-head {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  width: 100%;
+  border: none;
+  background: none;
+  padding: 0.2rem 0;
+  color: var(--text-2);
+  cursor: pointer;
+}
+
+.group-head:hover {
+  color: var(--text);
+}
+
+.group-head .closed {
+  transform: rotate(-90deg);
+}
+
+.group-head svg {
+  transition: transform var(--t-med);
 }
 
 .group-title {
-  margin: 0 0 0.3rem;
+  font-family: var(--font-display);
   font-size: 0.65rem;
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.05em;
-  color: #8e8e93;
+}
+
+.count {
+  margin-left: auto;
+  font-size: 0.65rem;
+  color: var(--text-3);
 }
 
 .items {
   display: flex;
   flex-direction: column;
   gap: 0.3rem;
+  padding-top: 0.25rem;
 }
 
 .item {
   padding: 0.3rem 0.5rem;
-  border: 1px solid #3a3a3c;
-  border-radius: 6px;
-  background: #2c2c2e;
-  color: #f6f6f6;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  color: var(--text);
   font-size: 0.85rem;
   cursor: grab;
   user-select: none;
+  transition: background-color var(--t-fast), border-color var(--t-fast);
+}
+
+.item:hover {
+  background: var(--surface-2);
+  border-color: var(--accent);
 }
 
 .item.instrument {
-  border-left: 2px solid #5fae7f;
+  border-left: 2px solid var(--sig-notes);
 }
 
 .item.preset {
@@ -159,18 +246,18 @@ function dragPreset(e: PointerEvent, p: NamedPreset): void {
 
 .presets {
   border: 1px dashed transparent;
-  border-radius: 6px;
-  transition: border-color 120ms ease, background-color 120ms ease;
+  border-radius: var(--radius-md);
+  transition: border-color var(--t-fast), background-color var(--t-fast);
 }
 
 /* Highlighted while a node is being dragged: drop it here to save a preset. */
 .presets.savable {
-  border-color: #e0b050;
-  background: rgba(224, 176, 80, 0.08);
+  border-color: var(--sig-mod);
+  background: rgba(217, 164, 65, 0.08);
 }
 
 .empty {
   font-size: 0.75rem;
-  color: #6e6e73;
+  color: var(--text-3);
 }
 </style>

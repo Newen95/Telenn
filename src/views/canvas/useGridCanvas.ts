@@ -24,31 +24,39 @@ export function useGridCanvas(
   let raf = 0;
   let observer: ResizeObserver | null = null;
 
+  function draw(): void {
+    const el = canvas.value;
+    if (!el) return;
+    const ctx = el.getContext("2d");
+    if (!ctx) return;
+    const dpr = window.devicePixelRatio || 1;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    drawFrame(ctx, el.width / dpr, el.height / dpr);
+    dirty = false;
+  }
+
   function resize(): void {
     const el = canvas.value;
     if (!el) return;
     const dpr = window.devicePixelRatio || 1;
     const rect = el.getBoundingClientRect();
-    el.width = Math.max(1, Math.round(rect.width * dpr));
-    el.height = Math.max(1, Math.round(rect.height * dpr));
-    dirty = true;
+    const w = Math.max(1, Math.round(rect.width * dpr));
+    const h = Math.max(1, Math.round(rect.height * dpr));
+    if (el.width === w && el.height === h) return;
+    // Reallocating the backing store blanks the canvas, so repaint right here:
+    // the ResizeObserver fires before the browser paints, which keeps a
+    // splitter drag from ever presenting an empty frame (no flicker).
+    el.width = w;
+    el.height = h;
+    draw();
   }
 
   function loop(): void {
-    const el = canvas.value;
-    if (el) {
+    if (canvas.value) {
       const active = isActive();
       // Draw while active, plus one trailing frame after activity stops so the
       // settled state (key un-lit, playhead parked) is actually painted.
-      if (dirty || active || wasActive) {
-        const ctx = el.getContext("2d");
-        if (ctx) {
-          const dpr = window.devicePixelRatio || 1;
-          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-          drawFrame(ctx, el.width / dpr, el.height / dpr);
-          dirty = false;
-        }
-      }
+      if (dirty || active || wasActive) draw();
       wasActive = active;
     }
     raf = requestAnimationFrame(loop);

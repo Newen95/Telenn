@@ -1,0 +1,67 @@
+/* Global base: reset + app-wide defaults. Every color/font here comes from the
+   theme tokens (posed on :root by applyTheme in main.ts) — no hex literals. */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+:root {
+  font-family: var(--font-body);
+  font-size: 15px;
+  line-height: 1.4;
+  color: var(--text);
+  background-color: var(--bg);
+
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -webkit-text-size-adjust: 100%;
+}
+
+/* Numeric readouts never jiggle: every value uses the mono face, tabular. */
+.num {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+button {
+  font-family: inherit;
+}
+
+input,
+select {
+  font-family: inherit;
+}
+
+::selection {
+  background: var(--accent-dim);
+}
+
+/* App-wide drag behavior (crosses component boundaries, so it lives here).
+   During a chain drag the canvases must not fight for the cursor, and holding
+   or dragging a card shows the closed-hand cursor everywhere. */
+.chain-dragging .grid-canvas {
+  pointer-events: none;
+}
+
+.chain-dragging,
+.chain-dragging *,
+.chain-pressing,
+.chain-pressing * {
+  cursor: grabbing !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+  }
+}

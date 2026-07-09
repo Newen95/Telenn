@@ -422,7 +422,11 @@ pour les CA de M6 ; bloquant pour commencer l'intégration visuelle de M8.
    faders verticaux + VU.
 4. Métronome (clic généré, pas un sample), volume dédié.
 5. Projet de démo complet 16 mesures qui sonne bien — c'est aussi le test
-   d'intégration vivant et la démo pour Claude Code.
+   d'intégration vivant et la démo pour Claude Code. Source canonique
+   **embarquée** (`src-tauri/assets/demo_song.json`, versionnée — `projects/`
+   est gitignoré), matérialisée dans `projects/demo/song.json` au premier
+   lancement ; les tests moteur lisent la copie embarquée, jamais le fichier
+   vivant.
 
 **CA — recette finale du MVP**
 - [ ] Le scénario du contrat (en tête de ce document) déroulé en entier sur

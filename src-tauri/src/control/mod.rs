@@ -37,10 +37,12 @@ pub fn demo_song_path() -> PathBuf {
 }
 
 /// The demo project, embedded at build time so the engine always boots with a
-/// playable sequence regardless of the working directory. The same file lives on
-/// disk (`projects/demo/song.json`) for the user to edit and reload via
-/// `load_project`.
-const DEMO_SONG: &str = include_str!("../../../projects/demo/song.json");
+/// playable sequence regardless of the working directory. The source of truth
+/// is a tracked asset (`projects/` is gitignored user land): on first launch it
+/// is materialized as `projects/demo/song.json` for the user to edit and
+/// reload, and tests parse the embedded copy so a live edit session can never
+/// break them.
+const DEMO_SONG: &str = include_str!("../../assets/demo_song.json");
 
 /// Compact, allocation-free messages sent from the control side to the audio
 /// thread through an `rtrb` ring buffer. The callback drains all pending
@@ -103,20 +105,42 @@ pub enum TransportCmd {
 pub type EngineInit =
     Box<dyn FnOnce(f32, usize) -> Result<(CompiledGraph, Schedule), EngineError> + Send>;
 
-/// Parse the embedded demo project.
-fn demo_project() -> Result<project::Project, project::ProjectError> {
+/// Parse the embedded demo project. Deterministic (independent of any file on
+/// disk), so tests can rely on it as a stable fixture.
+pub fn demo_project() -> Result<project::Project, project::ProjectError> {
     Ok(serde_json::from_str(DEMO_SONG)?)
+}
+
+/// Build the engine initialiser for a project: the graph topology is computed
+/// here (sample-rate independent); the closure finishes compilation and builds
+/// the schedule once the device sample rate is known.
+pub fn build_engine_init(project: Project) -> Result<(EngineInit, GraphIndex), EngineError> {
+    let (desc, index) = project.to_graph()?;
+    let index_for_engine = index.clone();
+    let init: EngineInit = Box::new(move |sample_rate, max_block| {
+        let graph = compile(&desc, registry::create, sample_rate, max_block, 1)?;
+        let schedule = project.to_schedule(sample_rate as u32, &index)?;
+        Ok((graph, schedule))
+    });
+    Ok((init, index_for_engine))
 }
 
 /// Build the engine initialiser plus the control-side state kept for later
 /// commands: the note-routing index (`load_project`) and the editable project
-/// (graph edits / undo). The graph topology is computed here (sample-rate
-/// independent); the closure finishes compilation and builds the schedule once
-/// the device sample rate is known.
+/// (graph edits / undo).
 pub fn build_demo() -> Result<(EngineInit, GraphIndex, Project, PathBuf), EngineError> {
     let path = demo_song_path();
+    // Materialize the embedded demo on first launch (or fresh clone) so the
+    // user has an editable file. Best effort: booting from the embedded copy
+    // still works if the write fails.
+    if !path.exists() {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(&path, DEMO_SONG);
+    }
     // Load the editable file so UI edits round-trip; fall back to the embedded
-    // copy if it is missing or unreadable, so the app always boots.
+    // copy if it is unreadable, so the app always boots.
     let mut project = Project::load(&path).or_else(|_| demo_project())?;
     // Assign ids to any id-less note/clip and rewrite the file (best effort: a
     // write failure must not stop the app from starting).
@@ -124,13 +148,7 @@ pub fn build_demo() -> Result<(EngineInit, GraphIndex, Project, PathBuf), Engine
         let _ = project.save(&path);
     }
 
-    let (desc, index) = project.to_graph()?;
-    let index_for_engine = index.clone();
     let project_for_engine = project.clone();
-    let init: EngineInit = Box::new(move |sample_rate, max_block| {
-        let graph = compile(&desc, registry::create, sample_rate, max_block, 1)?;
-        let schedule = project.to_schedule(sample_rate as u32, &index)?;
-        Ok((graph, schedule))
-    });
-    Ok((init, index_for_engine, project_for_engine, path))
+    let (init, index) = build_engine_init(project)?;
+    Ok((init, index, project_for_engine, path))
 }

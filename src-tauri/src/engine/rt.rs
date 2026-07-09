@@ -489,9 +489,18 @@ mod tests {
     #[global_allocator]
     static GUARD: GuardAlloc = GuardAlloc;
 
+    /// The embedded demo as an engine initialiser. Always the tracked asset,
+    /// never the user's editable `projects/` file, so a live edit session can
+    /// not break these tests.
+    fn demo_init() -> crate::control::EngineInit {
+        let project = crate::control::demo_project().expect("demo parses");
+        let (init, _index) = crate::control::build_engine_init(project).expect("demo builds");
+        init
+    }
+
     // Compile the demo graph and build a matching schedule for tests, off-RT.
     fn demo_rt() -> (RtState, rtrb::Consumer<Garbage>) {
-        let (init, _index, _project, _path) = crate::control::build_demo().expect("demo builds");
+        let init = demo_init();
         let (graph, schedule) = init(48_000.0, MAX_BLOCK).expect("graph compiles");
         let (prod, cons) = rtrb::RingBuffer::<Garbage>::new(8);
         let (tprod, _t) = rtrb::RingBuffer::<TelemetryFrame>::new(64);
@@ -541,7 +550,7 @@ mod tests {
     fn telemetry_frame_carries_meters_load_and_xruns() {
         // Build an RtState keeping the telemetry consumer, plus a shared xrun
         // counter we bump to prove it is stamped onto the frame.
-        let (init, _index, _project, _path) = crate::control::build_demo().expect("demo builds");
+        let init = demo_init();
         let (graph, schedule) = init(48_000.0, MAX_BLOCK).expect("graph compiles");
         let (prod, _cons) = rtrb::RingBuffer::<Garbage>::new(8);
         let (tprod, mut tcons) = rtrb::RingBuffer::<TelemetryFrame>::new(64);
@@ -580,8 +589,10 @@ mod tests {
         // only replaces the event list, never the graph or its voices.
         let (mut rt, _garbage) = demo_rt();
         let mut out = vec![0.0f32; 256 * 2];
+        // Node 2 = the demo's `lead_synth` (plucked): speaks instantly, unlike
+        // the drum sampler at node 0 which is silent on unmapped pitches.
         rt.handle(ControlMsg::NoteOn {
-            node: 0,
+            node: 2,
             pitch: 60,
             vel: 110,
         });
@@ -643,7 +654,7 @@ mod tests {
     /// nudged just past the downbeat and the note queue cleared — so a later
     /// `SetSchedule` reconciles against held notes, not the downbeat.
     fn playing_with(mut events: Vec<ScheduledEvent>) -> RtState {
-        let (init, _index, _project, _path) = crate::control::build_demo().expect("demo builds");
+        let init = demo_init();
         let (graph, _sched) = init(48_000.0, MAX_BLOCK).expect("graph compiles");
         let (prod, _cons) = rtrb::RingBuffer::<Garbage>::new(8);
         let (tprod, _t) = rtrb::RingBuffer::<TelemetryFrame>::new(64);
@@ -780,7 +791,7 @@ mod tests {
     fn reload_restrikes_a_note_in_progress() {
         // Regression: reloading mid-sequence must restrike a note the new
         // sequence already has in progress at the playhead, so there is no gap.
-        let (init, _index, _project, _path) = crate::control::build_demo().expect("demo builds");
+        let init = demo_init();
         let (graph, _sched) = init(48_000.0, MAX_BLOCK).expect("graph compiles");
         let (prod, _cons) = rtrb::RingBuffer::<Garbage>::new(8);
         let empty = Schedule {
@@ -932,17 +943,22 @@ mod tests {
             .fold(0.0f32, f32::max)
     }
 
-    /// The demo plus a gain effect inserted on the lead chain. Instrument ids
-    /// (`lead_synth`, `bass_synth`) and the master are shared, so they are
-    /// adopted across the swap; `lead_fx` is new.
+    /// The demo plus a gain effect inserted on the lead chain: the exact graph
+    /// a live effect insertion would swap in. Everything else (tracks, mixer,
+    /// params) is identical, so node instances are adopted by id and the click
+    /// test sees the swap fade alone.
     fn demo_with_lead_gain() -> Box<CompiledGraph> {
-        let song = r#"{ "bpm": 120, "tracks": [
-            { "id": "lead", "chain": [
-                { "id": "lead_synth", "module": "subtractive" },
-                { "id": "lead_fx", "module": "gain" } ] },
-            { "id": "bass", "chain": [ { "id": "bass_synth", "module": "subtractive" } ] }
-        ] }"#;
-        let project: crate::control::project::Project = serde_json::from_str(song).unwrap();
+        let mut project = crate::control::demo_project().expect("demo parses");
+        let lead = project
+            .tracks
+            .iter_mut()
+            .find(|t| t.id == "lead")
+            .expect("demo has a lead track");
+        lead.chain.push(crate::control::project::NodeSpec {
+            id: "lead_fx".into(),
+            module: "gain".into(),
+            params: Default::default(),
+        });
         let (desc, _index) = project.to_graph().unwrap();
         let graph = crate::engine::graph::compile(
             &desc,
@@ -987,8 +1003,10 @@ mod tests {
         // the instrument box is moved into the new graph, not recreated.
         let (mut rt, _garbage) = demo_rt();
         let mut out = vec![0.0f32; 256 * 2];
+        // Node 2 = `lead_synth` (plucked), audible at once and shared by id
+        // with the swap target so the voice is adopted, not recreated.
         rt.handle(ControlMsg::NoteOn {
-            node: 0,
+            node: 2,
             pitch: 60,
             vel: 110,
         });
@@ -1007,8 +1025,12 @@ mod tests {
         // Inserting an effect must not add a discontinuity beyond the signal's
         // own per-sample deltas (the declick absorbs the boundary step).
         let (mut rt, _garbage) = demo_rt();
+        // Node 1 = `bass_synth` (fm): a steady sustained tone on a chain with
+        // no time-based effect, so any delta beyond the tone's own slope is the
+        // swap's. (The lead chain carries a delay whose first echo would land
+        // inside the capture window and read as a false discontinuity.)
         rt.handle(ControlMsg::NoteOn {
-            node: 0,
+            node: 1,
             pitch: 48,
             vel: 100,
         });

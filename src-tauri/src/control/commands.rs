@@ -40,7 +40,7 @@ pub fn transport_stop(engine: State<'_, AudioEngine>) {
 pub fn load_project(engine: State<'_, AudioEngine>, path: String) -> Result<(), String> {
     let project = Project::load(&path).map_err(|e| e.to_string())?;
     let schedule = project
-        .to_schedule(engine.sample_rate(), engine.index())
+        .to_schedule(engine.sample_rate(), &engine.index())
         .map_err(|e| e.to_string())?;
     if !engine.send(ControlMsg::SetSchedule(Box::new(schedule))) {
         return Err("engine busy: command dropped".into());
@@ -56,8 +56,13 @@ pub fn export_wav(project_path: String, out_path: String) -> Result<(), String> 
         .map_err(|e| e.to_string())
 }
 
-/// Compile a graph description and hot-swap it onto the audio thread.
-fn swap_to(engine: &AudioEngine, desc: &GraphDesc) -> Result<(), String> {
+/// Compile a graph description and hot-swap it onto the audio thread, then
+/// publish its routing index so later schedule builds match the new topology.
+fn swap_to(
+    engine: &AudioEngine,
+    desc: &GraphDesc,
+    index: crate::control::project::GraphIndex,
+) -> Result<(), String> {
     let graph = compile(
         desc,
         registry::create,
@@ -69,13 +74,14 @@ fn swap_to(engine: &AudioEngine, desc: &GraphDesc) -> Result<(), String> {
     if !engine.send(ControlMsg::SwapGraph(Box::new(graph))) {
         return Err("engine busy: command dropped".into());
     }
+    engine.set_index(index);
     Ok(())
 }
 
 /// Build a project's schedule against the running graph's note routing.
 fn schedule_for(engine: &AudioEngine, project: &Project) -> Result<Schedule, String> {
     project
-        .to_schedule(engine.sample_rate(), engine.index())
+        .to_schedule(engine.sample_rate(), &engine.index())
         .map_err(|e| e.to_string())
 }
 
@@ -105,8 +111,32 @@ fn edit_and_swap(
     let mut history = history.lock().map_err(|_| "edit state poisoned")?;
     let mut trial = history.project().clone();
     edit(&mut trial).map_err(|e| e.to_string())?;
-    let (desc, _index) = trial.to_graph().map_err(|e| e.to_string())?;
-    swap_to(engine, &desc)?;
+    let (desc, index) = trial.to_graph().map_err(|e| e.to_string())?;
+    swap_to(engine, &desc, index)?;
+    history.commit(trial);
+    persist(&history, file);
+    Ok(())
+}
+
+/// Apply a validated **track** edit (add/remove/instrument change) to a trial
+/// clone and hot-swap graph **and** schedule together: these edits can shift
+/// instrument node indices, so the playing sequence must be rebuilt against the
+/// new topology in the same step.
+fn edit_and_swap_full(
+    engine: &AudioEngine,
+    history: &Mutex<EditHistory>,
+    file: &ProjectFile,
+    edit: impl FnOnce(&mut Project) -> Result<(), graph_edit::GraphEditError>,
+) -> Result<(), String> {
+    let mut history = history.lock().map_err(|_| "edit state poisoned")?;
+    let mut trial = history.project().clone();
+    edit(&mut trial).map_err(|e| e.to_string())?;
+    let (desc, index) = trial.to_graph().map_err(|e| e.to_string())?;
+    let schedule = trial
+        .to_schedule(engine.sample_rate(), &index)
+        .map_err(|e| e.to_string())?;
+    swap_to(engine, &desc, index)?;
+    set_schedule(engine, schedule)?;
     history.commit(trial);
     persist(&history, file);
     Ok(())
@@ -136,13 +166,19 @@ fn edit_schedule<T, E: std::fmt::Display>(
 /// the sequence changed. Avoids any spurious declick or note re-trigger when the
 /// step only touched notes (or only the graph).
 fn apply_restored(engine: &AudioEngine, prev: &Project, restored: &Project) -> Result<(), String> {
-    let prev_desc = prev.to_graph().map_err(|e| e.to_string())?.0;
-    let new_desc = restored.to_graph().map_err(|e| e.to_string())?.0;
+    // Each project's schedule resolves against its OWN routing index: the two
+    // may differ in tracks (an external edit can add or remove one).
+    let (prev_desc, prev_index) = prev.to_graph().map_err(|e| e.to_string())?;
+    let (new_desc, new_index) = restored.to_graph().map_err(|e| e.to_string())?;
+    let prev_sched = prev
+        .to_schedule(engine.sample_rate(), &prev_index)
+        .map_err(|e| e.to_string())?;
+    let new_sched = restored
+        .to_schedule(engine.sample_rate(), &new_index)
+        .map_err(|e| e.to_string())?;
     if new_desc != prev_desc {
-        swap_to(engine, &new_desc)?;
+        swap_to(engine, &new_desc, new_index)?;
     }
-    let prev_sched = schedule_for(engine, prev)?;
-    let new_sched = schedule_for(engine, restored)?;
     if new_sched != prev_sched {
         set_schedule(engine, new_sched)?;
     }
@@ -198,6 +234,52 @@ pub fn graph_insert_effect(
 ) -> Result<(), String> {
     edit_and_swap(&engine, &history, &file, |p| {
         graph_edit::insert_effect(p, &track_id, &module, &id, params)
+    })
+}
+
+/// Create a track whose chain head is a fresh instance of `module` (an
+/// instrument). The UI generates both ids, like effect inserts.
+#[tauri::command]
+pub fn track_add(
+    engine: State<'_, AudioEngine>,
+    history: State<'_, Mutex<EditHistory>>,
+    file: State<'_, ProjectFile>,
+    track_id: String,
+    name: String,
+    module: String,
+    instrument_id: String,
+) -> Result<(), String> {
+    edit_and_swap_full(&engine, &history, &file, |p| {
+        graph_edit::add_track(p, &track_id, &name, &module, &instrument_id)
+    })
+}
+
+/// Replace a track's instrument with a fresh `module` instance under a new id.
+/// Notes, effects and mixer settings stay; the old instrument rings out.
+#[tauri::command]
+pub fn track_set_instrument(
+    engine: State<'_, AudioEngine>,
+    history: State<'_, Mutex<EditHistory>>,
+    file: State<'_, ProjectFile>,
+    track_id: String,
+    module: String,
+    node_id: String,
+) -> Result<(), String> {
+    edit_and_swap_full(&engine, &history, &file, |p| {
+        graph_edit::set_instrument(p, &track_id, &module, &node_id)
+    })
+}
+
+/// Remove a track entirely (instrument, effects, clips, mixer strip).
+#[tauri::command]
+pub fn track_remove(
+    engine: State<'_, AudioEngine>,
+    history: State<'_, Mutex<EditHistory>>,
+    file: State<'_, ProjectFile>,
+    track_id: String,
+) -> Result<(), String> {
+    edit_and_swap_full(&engine, &history, &file, |p| {
+        graph_edit::remove_track(p, &track_id)
     })
 }
 

@@ -10,33 +10,50 @@ import { reactive } from "vue";
 /** What is being dragged: an existing effect, or a browser item (module/preset). */
 export type DragSource =
   | { kind: "node"; nodeId: string; module: string; fromTrack: string; fromIndex: number }
-  | { kind: "module"; module: string; label: string }
+  | { kind: "module"; module: string; label: string; category: "instrument" | "effect" }
   | { kind: "preset"; name: string; module: string; params: Record<string, number> };
 
-/** A gap in a chain: insert before chain `index` (always in the effects region). */
-export interface DropTarget {
-  trackId: string;
-  index: number;
-}
+/** Where a drop can land: a gap in a chain's effects region, a track's
+ *  instrument slot (chain head), or the new-track zone below the rows. */
+export type DropTarget =
+  | { kind: "gap"; trackId: string; index: number }
+  | { kind: "instrument"; trackId: string }
+  | { kind: "newTrack" };
 
 /** The edit a drop resolves to (executed by the view through the store). */
 export type DropIntent =
   | { kind: "move"; nodeId: string; toTrack: string; index: number }
   | { kind: "copy"; nodeId: string; toTrack: string; index: number }
-  | { kind: "insert"; trackId: string; index: number; module: string; params: Record<string, number> };
+  | { kind: "insert"; trackId: string; index: number; module: string; params: Record<string, number> }
+  | { kind: "setInstrument"; trackId: string; module: string }
+  | { kind: "addTrack"; module: string; name: string };
 
 /**
  * What dropping `source` on `target` means, or `null` for a no-op. A node dropped
  * in the gap just before or after itself (same track) does not move — returning
- * `null` keeps the graph (and its `GraphDesc`) strictly unchanged.
+ * `null` keeps the graph (and its `GraphDesc`) strictly unchanged. Typed slots:
+ * only an instrument module can land on an instrument slot or the new-track
+ * zone, and it can never land in the effects region.
  */
 export function resolveDrop(
   source: DragSource,
   target: DropTarget,
   copy: boolean,
 ): DropIntent | null {
+  const instrument = source.kind === "module" && source.category === "instrument";
+  if (target.kind === "instrument") {
+    return instrument && source.kind === "module"
+      ? { kind: "setInstrument", trackId: target.trackId, module: source.module }
+      : null;
+  }
+  if (target.kind === "newTrack") {
+    return instrument && source.kind === "module"
+      ? { kind: "addTrack", module: source.module, name: source.label }
+      : null;
+  }
   switch (source.kind) {
     case "module":
+      if (instrument) return null; // an instrument is a chain head, never an effect
       return { kind: "insert", trackId: target.trackId, index: target.index, module: source.module, params: {} };
     case "preset":
       return {

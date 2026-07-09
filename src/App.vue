@@ -10,7 +10,7 @@ import ChainPanel from "./views/chain/ChainPanel.vue";
 import PresetBrowser from "./views/browser/PresetBrowser.vue";
 import MixerPanel from "./views/mixer/MixerPanel.vue";
 import { useTimeAxis } from "./views/canvas/timeAxis";
-import { useChainDrag, type DropIntent } from "./views/chain/dragdrop";
+import { useChainDrag, type DropIntent, type DropTarget } from "./views/chain/dragdrop";
 import { useProjectStore } from "./stores/project";
 import { useTelemetryStore } from "./stores/telemetry";
 
@@ -27,11 +27,21 @@ const timeAxis = useTimeAxis();
 // floating ghost, the gap under the pointer, and running the resolved edit.
 const drag = useChainDrag();
 
-// The drop target under the pointer: the whole chain row is a target, and the
-// insert position is the gap nearest the pointer in X — far more forgiving than
-// requiring a hit on the thin gap element itself.
-function targetUnder(x: number, y: number): { trackId: string; index: number } | null {
-  const row = document.elementFromPoint(x, y)?.closest<HTMLElement>("[data-chain]");
+// The drop target under the pointer. An instrument drag only sees instrument
+// slots and the new-track zone (its valid targets); anything else sees the
+// chain gaps — the whole row is a target and the insert position is the gap
+// nearest the pointer in X, far more forgiving than hitting the thin gap itself.
+function targetUnder(x: number, y: number): DropTarget | null {
+  const el = document.elementFromPoint(x, y);
+  const source = drag.state.source;
+  if (source?.kind === "module" && source.category === "instrument") {
+    if (el?.closest("[data-new-track]")) return { kind: "newTrack" };
+    const head = el?.closest<HTMLElement>("[data-instrument]");
+    const row = head?.closest<HTMLElement>("[data-chain]");
+    if (head && row) return { kind: "instrument", trackId: row.dataset.track ?? "" };
+    return null;
+  }
+  const row = el?.closest<HTMLElement>("[data-chain]");
   if (!row) return null;
   const gaps = row.querySelectorAll<HTMLElement>("[data-gap]");
   let best: HTMLElement | null = null;
@@ -45,12 +55,14 @@ function targetUnder(x: number, y: number): { trackId: string; index: number } |
     }
   }
   if (!best) return null;
-  return { trackId: row.dataset.track ?? "", index: Number(best.dataset.index) };
+  return { kind: "gap", trackId: row.dataset.track ?? "", index: Number(best.dataset.index) };
 }
 
 function executeIntent(intent: DropIntent): void {
   if (intent.kind === "move") void project.moveNode(intent.nodeId, intent.toTrack, intent.index);
   else if (intent.kind === "copy") void project.copyNode(intent.nodeId, intent.toTrack, intent.index);
+  else if (intent.kind === "setInstrument") void project.setTrackInstrument(intent.trackId, intent.module);
+  else if (intent.kind === "addTrack") void project.addTrack(intent.module, intent.name);
   else void project.insertNode(intent.trackId, intent.index, intent.module, intent.params);
 }
 

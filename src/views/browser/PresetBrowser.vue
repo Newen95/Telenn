@@ -20,6 +20,7 @@ const { t } = useI18n();
 const project = useProjectStore();
 const drag = useChainDrag();
 
+const instruments = ref<ModuleDesc[]>([]);
 const effects = ref<ModuleDesc[]>([]);
 const presets = ref<NamedPreset[]>([]);
 
@@ -34,8 +35,11 @@ async function reloadPresets(): Promise<void> {
 }
 
 onMounted(async () => {
-  // Only effects are insertable into chains (instruments are the fixed chain head).
-  effects.value = (await project.listModules()).filter((m) => m.category === "effect");
+  // Effects insert into a chain; instruments drop on a chain head (replace) or
+  // on the new-track zone (create a track).
+  const modules = await project.listModules();
+  instruments.value = modules.filter((m) => m.category === "instrument");
+  effects.value = modules.filter((m) => m.category === "effect");
   await reloadPresets();
 });
 
@@ -43,7 +47,11 @@ watch(() => project.presetsVersion, reloadPresets);
 
 function dragModule(e: PointerEvent, m: ModuleDesc): void {
   e.preventDefault();
-  drag.arm({ kind: "module", module: m.id, label: m.name }, e.clientX, e.clientY);
+  drag.arm(
+    { kind: "module", module: m.id, label: m.name, category: m.category },
+    e.clientX,
+    e.clientY,
+  );
 }
 
 function dragPreset(e: PointerEvent, p: NamedPreset): void {
@@ -54,6 +62,20 @@ function dragPreset(e: PointerEvent, p: NamedPreset): void {
 
 <template>
   <div class="browser">
+    <section class="group">
+      <h3 class="group-title">{{ t("browser.instruments") }}</h3>
+      <div class="items">
+        <div
+          v-for="m in instruments"
+          :key="m.id"
+          class="item instrument"
+          @pointerdown="dragModule($event, m)"
+        >
+          {{ m.name }}
+        </div>
+      </div>
+    </section>
+
     <section class="group">
       <h3 class="group-title">{{ t("browser.modules") }}</h3>
       <div class="items">
@@ -125,6 +147,10 @@ function dragPreset(e: PointerEvent, p: NamedPreset): void {
   font-size: 0.85rem;
   cursor: grab;
   user-select: none;
+}
+
+.item.instrument {
+  border-left: 2px solid #5fae7f;
 }
 
 .item.preset {

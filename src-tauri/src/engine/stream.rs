@@ -54,7 +54,8 @@ pub struct AudioEngine {
     garbage: Mutex<Consumer<Garbage>>,
     /// Track → node routing of the running graph, used to resolve a reloaded
     /// project's notes against the topology already on the audio thread.
-    index: GraphIndex,
+    /// Updated with every graph swap (a track edit shifts instrument indices).
+    index: Mutex<GraphIndex>,
     xruns: Arc<AtomicU32>,
     sample_rate: u32,
     /// Kept alive to hold the audio thread open; dropping it releases the
@@ -105,7 +106,7 @@ impl AudioEngine {
         Ok(Self {
             commands: Mutex::new(producer),
             garbage: Mutex::new(garbage_cons),
-            index,
+            index: Mutex::new(index),
             xruns,
             sample_rate,
             shutdown: shutdown_tx,
@@ -132,9 +133,22 @@ impl AudioEngine {
         }
     }
 
-    /// Note-routing index of the running graph.
-    pub fn index(&self) -> &GraphIndex {
-        &self.index
+    /// Note-routing index of the running graph (a small map; cloned so no lock
+    /// is held across schedule building).
+    pub fn index(&self) -> GraphIndex {
+        match self.index.lock() {
+            Ok(index) => index.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    /// Publish the routing index of a newly swapped graph, so later schedule
+    /// builds resolve against the topology actually on the audio thread.
+    pub fn set_index(&self, index: GraphIndex) {
+        match self.index.lock() {
+            Ok(mut current) => *current = index,
+            Err(poisoned) => *poisoned.into_inner() = index,
+        }
     }
 
     pub fn xruns(&self) -> u32 {

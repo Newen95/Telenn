@@ -5,14 +5,23 @@
 // another track. Instruments are never drag-reordered (M6 = effects only).
 
 import { computed, reactive, watchEffect } from "vue";
+import { useI18n } from "vue-i18n";
 
 import { useProjectStore, type ChainNodeView, type ParamInfo } from "../../stores/project";
 import { useChainDrag, type DropTarget } from "./dragdrop";
 import { ChainSelection } from "./selection";
 import NodeMeter from "./NodeMeter.vue";
 
+const { t } = useI18n();
 const project = useProjectStore();
 const drag = useChainDrag();
+
+// True while an instrument module is being dragged from the browser: the drop
+// targets are then the chain heads and the new-track zone, which light up.
+const draggingInstrument = computed(() => {
+  const s = drag.state.source;
+  return s?.kind === "module" && s.category === "instrument";
+});
 
 // Node selection: a selected node carries the focus, so Delete/Ctrl+D act on it
 // and only when the chain (not a text field or the piano roll) owns the focus.
@@ -93,10 +102,15 @@ function onBeforeLeave(el: Element): void {
   e.style.width = `${e.offsetWidth}px`;
 }
 
-/** True while this gap is the one under the pointer (it spreads to show the drop). */
+/** True while this target is the one under the pointer (it lights up). */
 function isOver(target: DropTarget): boolean {
   const h = drag.state.hovered;
-  return !!h && h.trackId === target.trackId && h.index === target.index;
+  if (!h || h.kind !== target.kind) return false;
+  if (h.kind === "gap" && target.kind === "gap")
+    return h.trackId === target.trackId && h.index === target.index;
+  if (h.kind === "instrument" && target.kind === "instrument")
+    return h.trackId === target.trackId;
+  return true; // newTrack: there is only one
 }
 
 // Pressing a node selects and focuses it right away (so Delete/Ctrl+D apply and the
@@ -144,7 +158,14 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
 <template>
   <div class="chain-panel" :class="{ dragging: !!drag.state.source }">
     <div v-for="track in project.tracks" :key="track.id" class="chain-row">
-      <span class="track-name">{{ track.name || track.id }}</span>
+      <span class="track-name">
+        {{ track.name || track.id }}
+        <button
+          class="track-remove"
+          :title="t('chain.removeTrack')"
+          @click="project.removeTrack(track.id)"
+        >✕</button>
+      </span>
       <!-- TransitionGroup so a removed effect's neighbours slide into place. Each
            effect (gap + card) is one keyed item; the trailing gap appends. -->
       <TransitionGroup
@@ -160,14 +181,20 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
           <span
             v-if="!node.isInstrument"
             class="gap"
-            :class="{ over: isOver({ trackId: track.id, index: i }) }"
+            :class="{ over: isOver({ kind: 'gap', trackId: track.id, index: i }) }"
             data-gap
             :data-track="track.id"
             :data-index="i"
           ></span>
           <div
             class="node"
-            :class="{ instrument: node.isInstrument, selected: sel.selected === node.id }"
+            :class="{
+              instrument: node.isInstrument,
+              selected: sel.selected === node.id,
+              'swap-target': node.isInstrument && draggingInstrument,
+              over: node.isInstrument && isOver({ kind: 'instrument', trackId: track.id }),
+            }"
+            :data-instrument="node.isInstrument ? '' : undefined"
             :tabindex="node.isInstrument ? undefined : 0"
             @pointerdown="onNodePointerDown($event, track.id, node, i)"
             @keydown="onNodeKey($event, track.id, node, i)"
@@ -209,12 +236,22 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
         <span
           key="trailing"
           class="gap"
-          :class="{ over: isOver({ trackId: track.id, index: track.chain.length }) }"
+          :class="{ over: isOver({ kind: 'gap', trackId: track.id, index: track.chain.length }) }"
           data-gap
           :data-track="track.id"
           :data-index="track.chain.length"
         ></span>
       </TransitionGroup>
+    </div>
+
+    <!-- Drop an instrument here to create a track. Quiet when idle; lights up
+         while an instrument drag makes it an actual target. -->
+    <div
+      class="new-track"
+      :class="{ active: draggingInstrument, over: isOver({ kind: 'newTrack' }) }"
+      data-new-track
+    >
+      {{ t("chain.newTrack") }}
     </div>
 
     <!-- Drag ghost: a ~50% copy of the real card. Cards are compact (params show
@@ -264,6 +301,49 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
   color: #8e8e93;
   text-transform: uppercase;
   letter-spacing: 0.04em;
+}
+
+/* Revealed on row hover only: removing a track is rare and deliberate. */
+.track-remove {
+  margin-left: 0.2rem;
+  border: none;
+  background: none;
+  padding: 0;
+  font-size: 0.7rem;
+  color: #6e6e73;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 120ms ease, color 120ms ease;
+}
+
+.chain-row:hover .track-remove {
+  opacity: 1;
+}
+
+.track-remove:hover {
+  color: #d06060;
+}
+
+/* The create-a-track drop zone: quiet when idle, lit while it is a target. */
+.new-track {
+  border: 1px dashed #3a3a3c;
+  border-radius: 8px;
+  padding: 0.45rem 0.7rem;
+  font-size: 0.72rem;
+  color: #6e6e73;
+  transition: border-color 120ms ease, background-color 120ms ease, color 120ms ease;
+}
+
+.new-track.active {
+  border-color: #5fae7f;
+  color: #8e8e93;
+}
+
+.new-track.over {
+  border-style: solid;
+  border-color: #5fae7f;
+  background: #26362b;
+  color: #f6f6f6;
 }
 
 .chain {
@@ -337,6 +417,18 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
 .node.instrument {
   background: #20303a;
   border-color: #2f5a6e;
+}
+
+/* While an instrument is dragged, chain heads are the replace targets. */
+.node.instrument.swap-target {
+  border-style: dashed;
+  border-color: #5fae7f;
+}
+
+.node.instrument.over {
+  background: #26362b;
+  border-style: solid;
+  border-color: #5fae7f;
 }
 
 .node-head {

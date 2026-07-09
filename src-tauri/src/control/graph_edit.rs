@@ -1,14 +1,15 @@
-//! Pure edit operations on a [`Project`]'s effect chains.
+//! Pure edit operations on a [`Project`]'s tracks and effect chains.
 //!
 //! Each function mutates a project in place after validating the edit. The
 //! control side applies these to a trial clone, recompiles, and hot-swaps; the
-//! audio thread is never touched here. M4 edits effects only — a track's
-//! instrument (chain head) is never moved or removed, which keeps instrument
-//! node indices stable across swaps.
+//! audio thread is never touched here. Within a chain the instrument (head) is
+//! never moved or removed like an effect — it changes only through the track
+//! operations ([`add_track`], [`set_instrument`], [`remove_track`]), which also
+//! rebuild the schedule since they can shift instrument node indices.
 
 use std::collections::HashMap;
 
-use crate::control::project::{NodeSpec, Project};
+use crate::control::project::{NodeSpec, Project, Track};
 use crate::modules::registry;
 
 /// Reserved id of the implicit master node (see `project::to_graph`).
@@ -28,6 +29,94 @@ pub enum GraphEditError {
     NodeNotFound(String),
     #[error("'{0}' is a track instrument and cannot be moved or removed")]
     CannotEditInstrument(String),
+    #[error("'{0}' is not an instrument module")]
+    NotAnInstrument(String),
+    #[error("track id '{0}' already exists")]
+    DuplicateTrack(String),
+}
+
+/// Validate that `module` is a registered instrument (a chain head).
+fn require_instrument(module: &str) -> Result<(), GraphEditError> {
+    let desc = registry::list()
+        .iter()
+        .find(|m| m.id == module)
+        .ok_or_else(|| GraphEditError::UnknownModule(module.to_string()))?;
+    if desc.category != registry::ModuleCategory::Instrument {
+        return Err(GraphEditError::NotAnInstrument(module.to_string()));
+    }
+    Ok(())
+}
+
+/// Append a new track whose chain head is a fresh instance of `module`. The
+/// caller provides the ids (the UI generates them, like effect inserts); both
+/// must be new — ids are never recycled.
+pub fn add_track(
+    project: &mut Project,
+    track_id: &str,
+    name: &str,
+    module: &str,
+    instrument_id: &str,
+) -> Result<(), GraphEditError> {
+    if instrument_id == MASTER_ID {
+        return Err(GraphEditError::ReservedId(instrument_id.to_string()));
+    }
+    require_instrument(module)?;
+    if project.tracks.iter().any(|t| t.id == track_id) {
+        return Err(GraphEditError::DuplicateTrack(track_id.to_string()));
+    }
+    if id_exists(project, instrument_id) {
+        return Err(GraphEditError::DuplicateId(instrument_id.to_string()));
+    }
+    project.tracks.push(Track {
+        id: track_id.to_string(),
+        name: name.to_string(),
+        mixer: Default::default(),
+        chain: vec![NodeSpec {
+            id: instrument_id.to_string(),
+            module: module.to_string(),
+            params: Default::default(),
+        }],
+        clips: Vec::new(),
+    });
+    Ok(())
+}
+
+/// Replace a track's instrument (chain head) with a fresh instance of `module`
+/// under a **new** id: the old instrument's voices ring out through the swap's
+/// fading graph and its id is never reused. Effects, clips and mixer settings
+/// stay — the new instrument simply plays the existing notes.
+pub fn set_instrument(
+    project: &mut Project,
+    track_id: &str,
+    module: &str,
+    node_id: &str,
+) -> Result<(), GraphEditError> {
+    if node_id == MASTER_ID {
+        return Err(GraphEditError::ReservedId(node_id.to_string()));
+    }
+    require_instrument(module)?;
+    if id_exists(project, node_id) {
+        return Err(GraphEditError::DuplicateId(node_id.to_string()));
+    }
+    let track = project
+        .tracks
+        .iter_mut()
+        .find(|t| t.id == track_id)
+        .ok_or_else(|| GraphEditError::UnknownTrack(track_id.to_string()))?;
+    track.chain[0] = NodeSpec {
+        id: node_id.to_string(),
+        module: module.to_string(),
+        params: Default::default(),
+    };
+    Ok(())
+}
+
+/// Remove a track — instrument, effects, clips and mixer strip. Later tracks'
+/// instrument indices shift, so the caller must swap graph **and** schedule.
+pub fn remove_track(project: &mut Project, track_id: &str) -> Result<(), GraphEditError> {
+    let idx = track_index(project, track_id)?;
+    project.tracks.remove(idx);
+    Ok(())
 }
 
 /// Append a new effect (with initial normalized params) to the end of a track's
@@ -350,6 +439,74 @@ mod tests {
         assert!(matches!(
             set_param(&mut p, "nope", "gain", 0.5),
             Err(GraphEditError::NodeNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn add_track_appends_with_a_fresh_instrument() {
+        let mut p = demo();
+        add_track(&mut p, "drums", "Drums", "drum_sampler", "drums_kit").unwrap();
+        assert_eq!(p.tracks.len(), 2);
+        assert_eq!(ids(&p, 1), ["drums_kit"]);
+        assert!(p.tracks[1].clips.is_empty());
+        // Existing instrument indices are unchanged (instruments-first layout).
+        let (_, index) = p.to_graph().unwrap();
+        assert_eq!(index.instrument["lead"], 0);
+        assert_eq!(index.instrument["drums"], 1);
+    }
+
+    #[test]
+    fn add_track_rejects_effects_and_taken_ids() {
+        let mut p = demo();
+        assert!(matches!(
+            add_track(&mut p, "t2", "T2", "delay", "x"),
+            Err(GraphEditError::NotAnInstrument(_))
+        ));
+        assert!(matches!(
+            add_track(&mut p, "lead", "Lead", "fm", "x"),
+            Err(GraphEditError::DuplicateTrack(_))
+        ));
+        assert!(matches!(
+            add_track(&mut p, "t2", "T2", "fm", "lead_synth"),
+            Err(GraphEditError::DuplicateId(_))
+        ));
+    }
+
+    #[test]
+    fn set_instrument_replaces_the_head_and_keeps_the_rest() {
+        let mut p = demo();
+        insert_effect(&mut p, "lead", "gain", "fx", Default::default()).unwrap();
+        set_instrument(&mut p, "lead", "fm", "lead_fm").unwrap();
+        assert_eq!(ids(&p, 0), ["lead_fm", "fx"]);
+        assert_eq!(p.tracks[0].chain[0].module, "fm");
+        // Fresh instance: default params, never the old instrument's.
+        assert!(p.tracks[0].chain[0].params.is_empty());
+        // The new id must be new (the old one is never recycled).
+        assert!(matches!(
+            set_instrument(&mut p, "lead", "fm", "fx"),
+            Err(GraphEditError::DuplicateId(_))
+        ));
+        assert!(matches!(
+            set_instrument(&mut p, "lead", "reverb", "z"),
+            Err(GraphEditError::NotAnInstrument(_))
+        ));
+    }
+
+    #[test]
+    fn remove_track_drops_it_and_the_project_still_compiles() {
+        let mut p = two_tracks();
+        remove_node(&mut p, "lead_synth").unwrap_err(); // effects path still refuses heads
+        remove_track(&mut p, "lead").unwrap();
+        assert_eq!(p.tracks.len(), 1);
+        assert_eq!(p.tracks[0].id, "bass");
+        let (_, index) = p.to_graph().unwrap();
+        assert_eq!(index.instrument["bass"], 0);
+        // Removing the last track leaves an empty, still-valid project.
+        remove_track(&mut p, "bass").unwrap();
+        assert!(p.to_graph().is_ok());
+        assert!(matches!(
+            remove_track(&mut p, "bass"),
+            Err(GraphEditError::UnknownTrack(_))
         ));
     }
 

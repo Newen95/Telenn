@@ -7,8 +7,13 @@ export default {
     hints: "Double-click: create · drag: move · edges: resize · keyboard: audition · Del: delete · Ctrl+Z: undo",
   },
   browser: {
-    modules: "Modules",
+    instruments: "Instruments",
+    modules: "Effects",
     presets: "Presets",
     dropToSave: "Drag an effect here to save it",
+  },
+  chain: {
+    newTrack: "Drop an instrument here to create a track",
+    removeTrack: "Remove track",
   },
 };

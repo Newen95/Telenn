@@ -231,9 +231,37 @@ export const useProjectStore = defineStore("project", () => {
 
   // --- Effect chain edits (M6). Each is one graph hot-swap; reload reconciles. ---
 
-  /** A fresh, collision-resistant node id (the backend also rejects duplicates). */
-  function freshNodeId(): string {
-    return `fx-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`;
+  /** A fresh, collision-resistant id (the backend also rejects duplicates). */
+  function freshId(prefix: string): string {
+    return `${prefix}-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`;
+  }
+
+  const freshNodeId = (): string => freshId("fx");
+
+  // --- Track edits: create/remove a track, choose its instrument. Each is one
+  // graph + schedule hot-swap (instrument indices can shift). ---
+
+  /** Create a track playing a fresh instance of `module` (an instrument). */
+  async function addTrack(module: string, name: string): Promise<void> {
+    await invoke("track_add", {
+      trackId: freshId("trk"),
+      name,
+      module,
+      instrumentId: freshId("ins"),
+    });
+    await load();
+  }
+
+  /** Swap a track's instrument for a fresh `module` instance (notes stay). */
+  async function setTrackInstrument(trackId: string, module: string): Promise<void> {
+    await invoke("track_set_instrument", { trackId, module, nodeId: freshId("ins") });
+    await load();
+  }
+
+  /** Remove a track entirely (instrument, effects, clips, mixer strip). */
+  async function removeTrack(trackId: string): Promise<void> {
+    await invoke("track_remove", { trackId });
+    await load();
   }
 
   /** Move an effect to a chain at `index`, keeping its id (its tail follows). */
@@ -353,6 +381,9 @@ export const useProjectStore = defineStore("project", () => {
     copyNode,
     insertNode,
     removeNode,
+    addTrack,
+    setTrackInstrument,
+    removeTrack,
     moduleParams,
     setNodeParam,
     commitNodeParam,

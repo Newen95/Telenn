@@ -7,8 +7,13 @@ export default {
     hints: "Double-clic : créer · glisser : déplacer · bords : redimensionner · clavier : préécouter · Suppr : supprimer · Ctrl+Z : annuler",
   },
   browser: {
-    modules: "Modules",
+    instruments: "Instruments",
+    modules: "Effets",
     presets: "Presets",
     dropToSave: "Glissez un effet ici pour l'enregistrer",
+  },
+  chain: {
+    newTrack: "Déposez un instrument ici pour créer une piste",
+    removeTrack: "Supprimer la piste",
   },
 };

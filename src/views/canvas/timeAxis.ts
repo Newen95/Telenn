@@ -19,9 +19,10 @@ export interface TimeAxis {
   originX: number;
 }
 
-/** Width of the left gutter, in CSS pixels — wide enough for real-looking keys
- *  and octave labels (C4, C5…). It is the shared `originX` for both views. */
-export const GUTTER_WIDTH = 56;
+/** Width of the left gutter, in CSS pixels. It is the shared `originX` of both
+ *  views, so it must fit BOTH renderings: the piano roll's keys with octave
+ *  labels and the timeline's track names. */
+export const GUTTER_WIDTH = 96;
 
 /** Create the shared axis. Reactive so a scroll/zoom on one view redraws both. */
 export function useTimeAxis(init: Partial<TimeAxis> = {}): TimeAxis {

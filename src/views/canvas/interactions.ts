@@ -38,6 +38,11 @@ export interface EditAdapter {
   resizableLeft: boolean;
   /** Minimum length in ticks for a created or resized block. */
   minLen: number;
+  /** Whether a persistent selection outline is shown after a click (default
+   *  true). The timeline turns it off: a band click means "select the track",
+   *  and its clip selection drives nothing (no timeline delete; move/resize
+   *  work by direct drag). */
+  showSelection?: boolean;
 }
 
 /** Live view state the machine reads on each gesture (viewport and data change). */

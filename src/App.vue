@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import { invoke } from "@tauri-apps/api/core";
 
@@ -25,10 +25,26 @@ const telemetry = useTelemetryStore();
 const ui = useUiStore();
 ui.init(); // restore the saved zone layout before first paint
 
-const selectedTrackId = ref("");
 // One horizontal time axis for the timeline and the piano roll, so the same
 // instant — the playhead above all — sits at the same X in both.
 const timeAxis = useTimeAxis();
+
+const activeTrackName = computed(() => {
+  const track = project.tracks.find((tr) => tr.id === ui.activeTrackId);
+  return track ? track.name || track.id : "";
+});
+
+// The active track always points at a real track: default to the first, and
+// fall back when the selected one disappears (removal, external reload).
+watch(
+  () => project.tracks,
+  (tracks) => {
+    if (!tracks.some((tr) => tr.id === ui.activeTrackId)) {
+      ui.activeTrackId = tracks[0]?.id ?? "";
+    }
+  },
+  { deep: false },
+);
 
 /** Width of a collapsed zone's rail (chevron + vertical label). */
 const RAIL = 28;
@@ -170,7 +186,7 @@ onMounted(async () => {
   await telemetry.init();
   await project.init(); // file-watcher listeners (external reload + note flash)
   await project.load();
-  selectedTrackId.value = project.tracks[0]?.id ?? "";
+  if (!ui.activeTrackId) ui.activeTrackId = project.tracks[0]?.id ?? "";
   window.addEventListener("keydown", onKeyDown);
   window.addEventListener("pointermove", onDragMove);
   window.addEventListener("pointerup", onDragUp);
@@ -255,18 +271,14 @@ onUnmounted(() => {
                 <section class="zone">
                   <header class="zone-head row">
                     <h2 class="zone-title">{{ t("view.pianoRoll") }}</h2>
-                    <select v-model="selectedTrackId" class="track-select">
-                      <option v-for="tr in project.tracks" :key="tr.id" :value="tr.id">
-                        {{ tr.name || tr.id }}
-                      </option>
-                    </select>
+                    <span class="active-track">{{ activeTrackName }}</span>
                     <span class="hint">{{ t("edit.hints") }}</span>
                   </header>
                   <div class="zone-fill">
                     <PianoRollCanvas
-                      v-if="selectedTrackId"
-                      :key="selectedTrackId"
-                      :track-id="selectedTrackId"
+                      v-if="ui.activeTrackId"
+                      :key="ui.activeTrackId"
+                      :track-id="ui.activeTrackId"
                       :axis="timeAxis"
                     />
                   </div>
@@ -439,13 +451,11 @@ onUnmounted(() => {
   text-overflow: ellipsis;
 }
 
-.track-select {
-  background: var(--surface);
+.active-track {
+  font-size: 0.75rem;
   color: var(--text);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-sm);
-  font-size: 0.8rem;
-  padding: 0.1rem 0.3rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
 }
 
 /* Bottom zone tabs: the bar itself stays when the zone is collapsed. */

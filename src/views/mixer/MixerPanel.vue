@@ -5,11 +5,13 @@
 // and persists on release: one whole gesture = one undo step. Double-click
 // resets a control to neutral.
 
-import { onMounted, onUnmounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref } from "vue";
 import { useI18n } from "vue-i18n";
 
 import { useProjectStore, type TrackView } from "../../stores/project";
 import { useTelemetryStore } from "../../stores/telemetry";
+import { useUiStore } from "../../stores/ui";
+import { projectHues } from "../../styles/theme";
 import { ballistic } from "../transport/meterBallistics";
 import NodeMeter from "../chain/NodeMeter.vue";
 import { formatDb, formatPan, tailIndex } from "./format";
@@ -17,8 +19,12 @@ import { formatDb, formatPan, tailIndex } from "./format";
 const { t } = useI18n();
 const project = useProjectStore();
 const telemetry = useTelemetryStore();
+const ui = useUiStore();
 
 const num = (e: Event): number => Number((e.target as HTMLInputElement).value);
+
+/** Collision-free display hue per track id (explicit colors first). */
+const hues = computed(() => projectHues(project.tracks));
 
 function onGain(track: TrackView, e: Event): void {
   void project.setTrackMix(track.id, num(e), track.mixer.pan);
@@ -67,8 +73,16 @@ onUnmounted(() => cancelAnimationFrame(raf));
 
 <template>
   <div class="mixer-panel">
-    <div v-for="track in project.tracks" :key="track.id" class="strip">
-      <span class="strip-name">{{ track.name || track.id }}</span>
+    <div
+      v-for="track in project.tracks"
+      :key="track.id"
+      class="strip"
+      :class="{ active: track.id === ui.activeTrackId }"
+      @pointerdown="ui.activeTrackId = track.id"
+    >
+      <span class="strip-name" :style="{ borderColor: hues.get(track.id) }">
+        {{ track.name || track.id }}
+      </span>
       <input
         class="fader"
         type="range"
@@ -137,6 +151,13 @@ onUnmounted(() => cancelAnimationFrame(raf));
   border: 1px solid #3a3a3c;
   border-radius: 6px;
   background: #2c2c2e;
+  cursor: pointer;
+  transition: border-color 120ms ease;
+}
+
+/* The active track's strip (the one the chain and piano roll show). */
+.strip.active {
+  border-color: var(--accent);
 }
 
 .strip.master {
@@ -149,6 +170,7 @@ onUnmounted(() => cancelAnimationFrame(raf));
   color: #c7c7cc;
   text-transform: uppercase;
   letter-spacing: 0.04em;
+  border-bottom: 2px solid transparent; /* colored per track inline */
   max-width: 5.5rem;
   overflow: hidden;
   text-overflow: ellipsis;

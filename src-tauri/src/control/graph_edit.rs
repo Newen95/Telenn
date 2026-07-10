@@ -56,6 +56,7 @@ pub fn add_track(
     name: &str,
     module: &str,
     instrument_id: &str,
+    color: Option<&str>,
 ) -> Result<(), GraphEditError> {
     if instrument_id == MASTER_ID {
         return Err(GraphEditError::ReservedId(instrument_id.to_string()));
@@ -70,6 +71,7 @@ pub fn add_track(
     project.tracks.push(Track {
         id: track_id.to_string(),
         name: name.to_string(),
+        color: color.map(str::to_string),
         mixer: Default::default(),
         chain: vec![NodeSpec {
             id: instrument_id.to_string(),
@@ -116,6 +118,22 @@ pub fn set_instrument(
 pub fn remove_track(project: &mut Project, track_id: &str) -> Result<(), GraphEditError> {
     let idx = track_index(project, track_id)?;
     project.tracks.remove(idx);
+    Ok(())
+}
+
+/// Move a track to `index` in the project order (clamped to the end). Track
+/// order is the user's arrangement — it drives the timeline lanes, the mixer
+/// strips AND the instrument node indices, so the caller must swap graph and
+/// schedule together.
+pub fn move_track(
+    project: &mut Project,
+    track_id: &str,
+    index: usize,
+) -> Result<(), GraphEditError> {
+    let from = track_index(project, track_id)?;
+    let track = project.tracks.remove(from);
+    let to = index.min(project.tracks.len());
+    project.tracks.insert(to, track);
     Ok(())
 }
 
@@ -445,7 +463,15 @@ mod tests {
     #[test]
     fn add_track_appends_with_a_fresh_instrument() {
         let mut p = demo();
-        add_track(&mut p, "drums", "Drums", "drum_sampler", "drums_kit").unwrap();
+        add_track(
+            &mut p,
+            "drums",
+            "Drums",
+            "drum_sampler",
+            "drums_kit",
+            Some("#5b8a6f"),
+        )
+        .unwrap();
         assert_eq!(p.tracks.len(), 2);
         assert_eq!(ids(&p, 1), ["drums_kit"]);
         assert!(p.tracks[1].clips.is_empty());
@@ -459,15 +485,15 @@ mod tests {
     fn add_track_rejects_effects_and_taken_ids() {
         let mut p = demo();
         assert!(matches!(
-            add_track(&mut p, "t2", "T2", "delay", "x"),
+            add_track(&mut p, "t2", "T2", "delay", "x", None),
             Err(GraphEditError::NotAnInstrument(_))
         ));
         assert!(matches!(
-            add_track(&mut p, "lead", "Lead", "fm", "x"),
+            add_track(&mut p, "lead", "Lead", "fm", "x", None),
             Err(GraphEditError::DuplicateTrack(_))
         ));
         assert!(matches!(
-            add_track(&mut p, "t2", "T2", "fm", "lead_synth"),
+            add_track(&mut p, "t2", "T2", "fm", "lead_synth", None),
             Err(GraphEditError::DuplicateId(_))
         ));
     }
@@ -506,6 +532,25 @@ mod tests {
         assert!(p.to_graph().is_ok());
         assert!(matches!(
             remove_track(&mut p, "bass"),
+            Err(GraphEditError::UnknownTrack(_))
+        ));
+    }
+
+    #[test]
+    fn move_track_reorders_and_the_graph_indices_follow() {
+        let mut p = two_tracks();
+        move_track(&mut p, "bass", 0).unwrap();
+        let order: Vec<&str> = p.tracks.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(order, ["bass", "lead"]);
+        // Instruments-first layout: indices follow the new track order.
+        let (_, index) = p.to_graph().unwrap();
+        assert_eq!(index.instrument["bass"], 0);
+        assert_eq!(index.instrument["lead"], 1);
+        // An out-of-range target clamps to the end; unknown tracks are refused.
+        move_track(&mut p, "bass", 99).unwrap();
+        assert_eq!(p.tracks[1].id, "bass");
+        assert!(matches!(
+            move_track(&mut p, "nope", 0),
             Err(GraphEditError::UnknownTrack(_))
         ));
     }

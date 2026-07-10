@@ -3,6 +3,7 @@
 //! with viewport culling. Both views differ only in the blocks and lane mapping
 //! they feed in. `hitTest` is exposed now so the 5b gesture machine reuses it.
 
+import { theme } from "../../styles/theme";
 import { laneToY, tickToX, xToTick, yToLane, type Viewport } from "./viewport";
 
 /** A generic rectangle on the grid: a clip (timeline) or a note (piano roll). */
@@ -36,13 +37,34 @@ export interface LaneKey {
   lit?: boolean;
 }
 
-/** Left keyboard gutter for the piano roll. Width must equal `vp.originX`. */
-export interface GutterStyle {
+/** Per-lane content of a label gutter row (the timeline's track column). */
+export interface LaneLabel {
+  label: string;
+  /** The track's hue chip. */
+  color: string;
+  /** The active track row is highlighted. */
+  active?: boolean;
+}
+
+/** The piano roll's keyboard gutter (default kind). */
+export interface KeyGutter {
+  kind?: "keys";
   width: number;
   lane(lane: number): LaneKey;
 }
 
+/** The timeline's clickable track-name gutter. */
+export interface LabelGutter {
+  kind: "labels";
+  width: number;
+  lane(lane: number): LaneLabel;
+}
+
+/** Left gutter. Width must equal `vp.originX`. */
+export type GutterStyle = KeyGutter | LabelGutter;
+
 const BG = "#161618";
+const ACTIVE_LANE = "rgba(232, 228, 220, 0.22)"; // lift of the active track's row (over clips)
 const LANE_LINE = "#232325";
 const BEAT_LINE = "#2a2a2c";
 const BAR_LINE = "#3c3c3f";
@@ -72,6 +94,10 @@ export function draw(
   gutter?: GutterStyle,
   /** Flash intensity (1 → 0) for a block by its `ref`; 0 (or omitted) = none. */
   flash?: (ref: unknown) => number,
+  /** Lane to lift with the active-track tint (the timeline's selected row). */
+  activeLane?: number,
+  /** In-progress gutter reorder: dims `from` and marks the insertion at `to`. */
+  gutterDrag?: { from: number; to: number } | null,
 ): void {
   ctx.fillStyle = BG;
   ctx.fillRect(0, 0, w, h);
@@ -124,6 +150,16 @@ export function draw(
     }
   }
 
+  // The active track's whole band reads as selected, whatever selected it.
+  // Drawn OVER the blocks: a lane fully covered by clips still visibly lifts.
+  if (activeLane !== undefined && activeLane >= 0) {
+    const y = laneToY(vp, activeLane);
+    if (y + vp.laneHeight >= 0 && y <= h) {
+      ctx.fillStyle = ACTIVE_LANE;
+      ctx.fillRect(0, y, w, vp.laneHeight);
+    }
+  }
+
   // Selection outline and the drag ghost, on top of the blocks.
   if (overlay?.selected) outline(ctx, vp, overlay.selected, SELECTED);
   if (overlay?.ghost) {
@@ -149,8 +185,29 @@ export function draw(
   // covered; it owns the [0, originX) column. The piano roll fills it with its
   // keyboard; other views (timeline) reserve a plain strip so the time axes — and
   // thus the playheads — line up across both.
+  // Track-reorder drag: dim the grabbed row and mark the insertion boundary
+  // across the full width (the gutter repeats both over its own column).
+  if (gutterDrag) {
+    const fy = laneToY(vp, gutterDrag.from);
+    ctx.fillStyle = "rgba(0, 0, 0, 0.35)";
+    ctx.fillRect(0, fy, w, vp.laneHeight);
+    if (gutterDrag.to !== gutterDrag.from) {
+      const edgeLane = gutterDrag.to <= gutterDrag.from ? gutterDrag.to : gutterDrag.to + 1;
+      const y = Math.round(laneToY(vp, edgeLane)) + 0.5;
+      ctx.strokeStyle = theme.color.accentBright;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(0, y);
+      ctx.lineTo(w, y);
+      ctx.stroke();
+      ctx.lineWidth = 1;
+    }
+  }
+
   const gw = vp.originX ?? 0;
-  if (gutter) {
+  if (gutter?.kind === "labels") {
+    drawLabelGutter(ctx, h, vp, gutter, laneCount, gutterDrag);
+  } else if (gutter) {
     drawGutter(ctx, h, vp, gutter, laneCount);
   } else if (gw > 0) {
     ctx.fillStyle = GUTTER_BG;
@@ -159,12 +216,76 @@ export function draw(
   }
 }
 
+/** Draw the label gutter: one clickable track row per lane, hue chip + name. */
+function drawLabelGutter(
+  ctx: CanvasRenderingContext2D,
+  h: number,
+  vp: Viewport,
+  gutter: LabelGutter,
+  laneCount: number,
+  drag?: { from: number; to: number } | null,
+): void {
+  const gw = gutter.width;
+  ctx.fillStyle = theme.color.panel;
+  ctx.fillRect(0, 0, gw, h);
+
+  const first = Math.max(0, yToLane(vp, 0));
+  const last = Math.min(laneCount - 1, yToLane(vp, h));
+  ctx.textBaseline = "middle";
+  ctx.font = `600 10px ${theme.font.display}`;
+  for (let lane = first; lane <= last; lane += 1) {
+    const row = gutter.lane(lane);
+    const y = laneToY(vp, lane);
+    if (row.active) {
+      ctx.fillStyle = theme.color.surface2;
+      ctx.fillRect(0, y, gw, vp.laneHeight);
+    }
+    const dimmed = drag && lane === drag.from;
+    ctx.globalAlpha = dimmed ? 0.35 : 1;
+    ctx.fillStyle = row.color;
+    ctx.fillRect(0, y + 1, row.active ? 4 : 2, vp.laneHeight - 2);
+    ctx.fillStyle = row.active ? theme.color.text : theme.color.text2;
+    ctx.fillText(fitText(ctx, row.label.toUpperCase(), gw - 14), 9, y + vp.laneHeight / 2 + 0.5);
+    ctx.globalAlpha = 1;
+    ctx.strokeStyle = LANE_LINE;
+    ctx.beginPath();
+    const by = Math.round(y + vp.laneHeight) + 0.5;
+    ctx.moveTo(0, by);
+    ctx.lineTo(gw, by);
+    ctx.stroke();
+  }
+
+  // Reorder insertion mark: a copper line at the row boundary the dragged
+  // track will land on (above `to` when moving up, below it when moving down).
+  if (drag && drag.to !== drag.from) {
+    const edgeLane = drag.to <= drag.from ? drag.to : drag.to + 1;
+    const y = Math.round(laneToY(vp, edgeLane)) + 0.5;
+    ctx.strokeStyle = theme.color.accentBright;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(0, y);
+    ctx.lineTo(gw, y);
+    ctx.stroke();
+    ctx.lineWidth = 1;
+  }
+
+  gutterEdge(ctx, h, gw);
+}
+
+/** Truncate `text` with an ellipsis so it fits in `maxWidth` pixels. */
+function fitText(ctx: CanvasRenderingContext2D, text: string, maxWidth: number): string {
+  if (ctx.measureText(text).width <= maxWidth) return text;
+  let end = text.length;
+  while (end > 1 && ctx.measureText(`${text.slice(0, end)}…`).width > maxWidth) end -= 1;
+  return `${text.slice(0, end)}…`;
+}
+
 /** Draw the left keyboard gutter: one keycap per visible lane, octave labels. */
 function drawGutter(
   ctx: CanvasRenderingContext2D,
   h: number,
   vp: Viewport,
-  gutter: GutterStyle,
+  gutter: KeyGutter,
   laneCount: number,
 ): void {
   const gw = gutter.width;

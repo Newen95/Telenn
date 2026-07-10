@@ -88,3 +88,54 @@ export function trackColor(index: number): string {
   const palette = theme.track;
   return palette[((index % palette.length) + palette.length) % palette.length];
 }
+
+/** FNV-1a over a string: cheap, deterministic, spreads short ids well. */
+function fnv(text: string): number {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < text.length; i += 1) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash;
+}
+
+/**
+ * The display hue of every track: its explicit persisted color when set, else
+ * a fallback derived from its id — never from its position, so reordering
+ * never repaints anything. Fallbacks probe the palette from the id's hash to
+ * the next hue not already shown, in sorted-id order (order-independent), so
+ * up to a full palette of tracks all read distinct.
+ */
+export function projectHues(tracks: { id: string; color?: string | null }[]): Map<string, string> {
+  const hues = new Map<string, string>();
+  const taken = new Set<string>();
+  for (const track of tracks) {
+    if (track.color) {
+      hues.set(track.id, track.color);
+      taken.add(track.color);
+    }
+  }
+  const fallbacks = tracks.filter((t) => !t.color).sort((a, b) => a.id.localeCompare(b.id));
+  for (const track of fallbacks) {
+    let i = fnv(track.id) % theme.track.length;
+    for (let step = 0; step < theme.track.length && taken.has(theme.track[i]); step += 1) {
+      i = (i + 1) % theme.track.length;
+    }
+    hues.set(track.id, theme.track[i]);
+    taken.add(theme.track[i]);
+  }
+  return hues;
+}
+
+/** One track's hue outside a project context (prefer `projectHues`). */
+export function trackHue(track: { id: string; color?: string | null }): string {
+  return track.color ?? theme.track[fnv(track.id) % theme.track.length];
+}
+
+/** A hue for a new track: random among the palette hues not in use yet (all
+ *  taken → random over the whole palette). */
+export function unusedHue(taken: string[]): string {
+  const free = theme.track.filter((c) => !taken.includes(c));
+  const pool = free.length > 0 ? free : [...theme.track];
+  return pool[Math.floor(Math.random() * pool.length)];
+}

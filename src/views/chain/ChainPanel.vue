@@ -1,20 +1,52 @@
 <script setup lang="ts">
-// Effect chains of every track, rendered in the DOM (few elements). Each track is
-// a row: the fixed instrument head, then its effects. The gaps between/around
-// effects are the drop targets, so an effect can be dragged within a chain or to
-// another track. Instruments are never drag-reordered (M6 = effects only).
+// The ACTIVE track's chain, rendered in the DOM: the instrument head (click to
+// replace it), then its effects. The gaps between/around effects are the drop
+// targets, so an effect can be dragged within the chain (or to another track by
+// selecting it first). The header navigates between tracks; the overview of all
+// tracks is the mixer's job.
 
-import { computed, reactive, watchEffect } from "vue";
+import { computed, reactive, ref, watchEffect } from "vue";
 import { useI18n } from "vue-i18n";
 
-import { useProjectStore, type ChainNodeView, type ParamInfo } from "../../stores/project";
+import { useProjectStore, type ChainNodeView, type ModuleDesc, type ParamInfo } from "../../stores/project";
+import { useUiStore } from "../../stores/ui";
+import { projectHues } from "../../styles/theme";
 import { useChainDrag, type DropTarget } from "./dragdrop";
 import { ChainSelection } from "./selection";
 import NodeMeter from "./NodeMeter.vue";
+import Icon from "../../ui/Icon.vue";
+import InstrumentMenu from "../../ui/InstrumentMenu.vue";
 
 const { t } = useI18n();
 const project = useProjectStore();
+const ui = useUiStore();
 const drag = useChainDrag();
+
+// The displayed track: the active one, falling back to the first so the panel
+// never goes blank when a selection points at a removed track.
+const activeIndex = computed(() => {
+  const i = project.tracks.findIndex((tr) => tr.id === ui.activeTrackId);
+  return i >= 0 ? i : 0;
+});
+const track = computed(() => project.tracks[activeIndex.value]);
+
+/** Collision-free display hue per track id (explicit colors first). */
+const hues = computed(() => projectHues(project.tracks));
+
+function step(dir: number): void {
+  const n = project.tracks.length;
+  if (n === 0) return;
+  const next = (activeIndex.value + dir + n) % n;
+  ui.activeTrackId = project.tracks[next].id;
+}
+
+// Click the instrument card → picker replacing the track's instrument.
+const replacing = ref(false);
+
+async function replaceInstrument(m: ModuleDesc): Promise<void> {
+  replacing.value = false;
+  if (track.value) await project.setTrackInstrument(track.value.id, m.id);
+}
 
 // True while an instrument module is being dragged from the browser: the drop
 // targets are then the chain heads and the new-track zone, which light up.
@@ -157,15 +189,27 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
 
 <template>
   <div class="chain-panel" :class="{ dragging: !!drag.state.source }">
-    <div v-for="track in project.tracks" :key="track.id" class="chain-row">
-      <span class="track-name">
-        {{ track.name || track.id }}
+    <template v-if="track">
+      <header class="chain-head">
+        <button type="button" class="nav" :title="t('chain.prevTrack')" @click="step(-1)">
+          <Icon name="chevron-left" :size="13" />
+        </button>
+        <span class="chip" :style="{ background: hues.get(track.id) }"></span>
+        <span class="chain-track-name">{{ track.name || track.id }}</span>
+        <button type="button" class="nav" :title="t('chain.nextTrack')" @click="step(1)">
+          <Icon name="chevron-right" :size="13" />
+        </button>
+        <span class="track-count num">{{ activeIndex + 1 }}/{{ project.tracks.length }}</span>
         <button
+          type="button"
           class="track-remove"
           :title="t('chain.removeTrack')"
           @click="project.removeTrack(track.id)"
-        >✕</button>
-      </span>
+        >
+          <Icon name="close" :size="12" />
+        </button>
+      </header>
+      <div class="chain-row">
       <!-- TransitionGroup so a removed effect's neighbours slide into place. Each
            effect (gap + card) is one keyed item; the trailing gap appends. -->
       <TransitionGroup
@@ -196,7 +240,9 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
             }"
             :data-instrument="node.isInstrument ? '' : undefined"
             :tabindex="node.isInstrument ? undefined : 0"
+            :title="node.isInstrument ? t('chain.replaceInstrument') : undefined"
             @pointerdown="onNodePointerDown($event, track.id, node, i)"
+            @click="node.isInstrument && (replacing = !replacing)"
             @keydown="onNodeKey($event, track.id, node, i)"
             @focusout="onNodeBlur($event, node.id)"
           >
@@ -231,6 +277,13 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
               </label>
             </div>
           </div>
+          <!-- Click the instrument card: pick its replacement. -->
+          <InstrumentMenu
+            v-if="node.isInstrument && replacing"
+            class="replace-menu"
+            @pick="replaceInstrument"
+            @close="replacing = false"
+          />
         </div>
         <!-- Trailing gap = append to the end of the chain. -->
         <span
@@ -242,7 +295,8 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
           :data-index="track.chain.length"
         ></span>
       </TransitionGroup>
-    </div>
+      </div>
+    </template>
 
     <!-- Drop an instrument here to create a track. Quiet when idle; lights up
          while an instrument drag makes it an actual target. -->
@@ -293,35 +347,73 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
   gap: 0.6rem;
 }
 
-.track-name {
-  min-width: 4rem;
-  /* Optically aligned with the card headers of the top-aligned row. */
-  padding-top: 0.55rem;
-  font-size: 0.75rem;
-  color: #8e8e93;
+/* Header: hue chip + track name + prev/next navigation + remove. */
+.chain-head {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+
+.chip {
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  flex: none;
+}
+
+.chain-track-name {
+  font-family: var(--font-display);
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--text);
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }
 
-/* Revealed on row hover only: removing a track is rare and deliberate. */
-.track-remove {
-  margin-left: 0.2rem;
+.nav {
+  display: flex;
+  align-items: center;
   border: none;
   background: none;
-  padding: 0;
-  font-size: 0.7rem;
-  color: #6e6e73;
+  padding: 0.15rem;
+  color: var(--text-3);
   cursor: pointer;
-  opacity: 0;
-  transition: opacity 120ms ease, color 120ms ease;
+  transition: color 120ms ease;
 }
 
-.chain-row:hover .track-remove {
-  opacity: 1;
+.nav:hover {
+  color: var(--text);
+}
+
+.track-count {
+  font-size: 0.65rem;
+  color: var(--text-3);
+}
+
+.track-remove {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  border: none;
+  background: none;
+  padding: 0.15rem;
+  color: var(--text-3);
+  cursor: pointer;
+  transition: color 120ms ease;
 }
 
 .track-remove:hover {
-  color: #d06060;
+  color: var(--danger);
+}
+
+/* Anchors the instrument-replace picker under the card. */
+.chain-item {
+  position: relative;
+}
+
+.replace-menu {
+  top: calc(100% + 4px);
+  left: 0;
 }
 
 /* The create-a-track drop zone: quiet when idle, lit while it is a target. */

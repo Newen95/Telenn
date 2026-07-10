@@ -11,6 +11,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
 import { flashIntensity, FLASH_MS } from "../views/canvas/flash";
+import { projectHues, unusedHue } from "../styles/theme";
 
 /** Id-keyed diff emitted by the backend after an external `song.json` reload. */
 interface ProjectDiff {
@@ -66,6 +67,8 @@ export interface TrackMixView {
 export interface TrackView {
   id: string;
   name: string;
+  /** Persisted display hue (hex), when the track has one (see trackHue). */
+  color?: string | null;
   instrumentNode: number;
   chain: ChainNodeView[];
   mixer: TrackMixView;
@@ -241,13 +244,15 @@ export const useProjectStore = defineStore("project", () => {
   // --- Track edits: create/remove a track, choose its instrument. Each is one
   // graph + schedule hot-swap (instrument indices can shift). ---
 
-  /** Create a track playing a fresh instance of `module` (an instrument). */
+  /** Create a track playing a fresh instance of `module` (an instrument).
+   *  Its display hue is drawn from the palette hues no track shows yet. */
   async function addTrack(module: string, name: string): Promise<void> {
     await invoke("track_add", {
       trackId: freshId("trk"),
       name,
       module,
       instrumentId: freshId("ins"),
+      color: unusedHue([...projectHues(tracks.value).values()]),
     });
     await load();
   }
@@ -261,6 +266,12 @@ export const useProjectStore = defineStore("project", () => {
   /** Remove a track entirely (instrument, effects, clips, mixer strip). */
   async function removeTrack(trackId: string): Promise<void> {
     await invoke("track_remove", { trackId });
+    await load();
+  }
+
+  /** Move a track to `index` in the project order (timeline gutter drag). */
+  async function moveTrack(trackId: string, index: number): Promise<void> {
+    await invoke("track_move", { trackId, index });
     await load();
   }
 
@@ -384,6 +395,7 @@ export const useProjectStore = defineStore("project", () => {
     addTrack,
     setTrackInstrument,
     removeTrack,
+    moveTrack,
     moduleParams,
     setNodeParam,
     commitNodeParam,

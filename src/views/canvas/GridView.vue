@@ -22,16 +22,19 @@ import {
   zoomAt,
 } from "./navigation";
 
-/** A keyboard gutter plus its non-destructive, held preview (piano roll only). */
-export interface GutterSpec extends GutterStyle {
-  /** Press (and hold) the lane's pitch — sounds until `release`. A new lane while
-   *  held is a glissando: the previous pitch stops, the new one sounds. */
+/** A gutter plus its press behavior: the piano roll's keyboard holds a preview
+ *  note (sliding rows = glissando); the timeline's track labels select, and a
+ *  vertical drag past half a row becomes a reorder. */
+export type GutterSpec = GutterStyle & {
+  /** Press (and hold) the lane — a new lane while held presses again. */
   press(lane: number): void;
-  /** Release the held pitch (pointer up / leaving the view). */
+  /** Release the held lane (pointer up / leaving the view). */
   release(): void;
   /** Whether any preview voice is sounding (keeps the highlight animating). */
   sounding?(): boolean;
-}
+  /** Label gutters only: commit moving the lane `from` to position `to`. */
+  reorder?(from: number, to: number): void;
+};
 
 const props = defineProps<{
   blocks: Block[];
@@ -47,6 +50,10 @@ const props = defineProps<{
   /** Shared horizontal axis: when set, scroll/zoom/origin are common to all
    *  views using it, so the playhead lands at the same X everywhere. */
   axis?: TimeAxis;
+  /** Called with the lane under any grid press (the timeline selects tracks). */
+  onLanePress?: (lane: number) => void;
+  /** Lane lifted with the active-track tint (timeline only). */
+  activeLane?: number;
 }>();
 
 const project = useProjectStore();
@@ -90,6 +97,18 @@ let lastPointerX = 0;
 // the pointer slides to other rows, releases on pointer up.
 let gutterPressing = false;
 let gutterLane = NaN;
+// Label-gutter reorder gesture: armed by the press, becomes a drag past half a
+// row of vertical travel (below that, the press stays a plain click/select).
+let gutterPressY = 0;
+let gutterReorder: { from: number; to: number } | null = null;
+// A press on the band region of a reorderable view (the timeline): watched
+// until an axis wins — horizontal = the clip gesture proceeds, vertical =
+// the whole track reorders (the same drag, another axis).
+let bandWatch: { x: number; y: number; lane: number } | null = null;
+
+const clampLane = (lane: number): number => Math.max(0, Math.min(props.laneCount - 1, lane));
+
+const reorderable = (): boolean => props.gutter?.kind === "labels" && !!props.gutter.reorder;
 
 /** Topmost lane the view may scroll to, so the last lane can't pass the top. */
 function maxScrollLane(): number {
@@ -114,11 +133,30 @@ function frame(ctx: CanvasRenderingContext2D, w: number, h: number): void {
   syncAxis();
   const samples = telemetry.currentSamples(performance.now());
   const tick = samplesToTicks(samples, project.bpm, telemetry.sampleRate, project.ppq);
-  const overlay = fsm ? { ghost: fsm.ghost(), selected: fsm.selected } : undefined;
+  const overlay = fsm
+    ? {
+        ghost: fsm.ghost(),
+        selected: props.adapter?.showSelection === false ? null : fsm.selected,
+      }
+    : undefined;
   const now = performance.now();
   const flash = (ref: unknown): number =>
     typeof ref === "string" ? project.noteFlash(ref, now) : 0;
-  draw(ctx, w, h, vp, props.grid, props.blocks, props.laneCount, tick, overlay, props.gutter, flash);
+  draw(
+    ctx,
+    w,
+    h,
+    vp,
+    props.grid,
+    props.blocks,
+    props.laneCount,
+    tick,
+    overlay,
+    props.gutter,
+    flash,
+    props.activeLane,
+    gutterReorder,
+  );
 }
 
 /** True if `x` falls in the keyboard gutter column. */
@@ -159,11 +197,20 @@ function onPointerDown(e: PointerEvent): void {
     if (lane >= 0 && lane < props.laneCount) {
       gutterPressing = true;
       gutterLane = lane;
+      gutterPressY = e.offsetY;
       canvas.value?.setPointerCapture(e.pointerId);
       props.gutter?.press(lane);
       markDirty();
     }
     return;
+  }
+  // A press anywhere in the grid names its lane first (the timeline selects
+  // that track), then the edit gesture proceeds as usual.
+  const pressedLane = yToLane(vp, e.offsetY);
+  if (pressedLane >= 0 && pressedLane < props.laneCount) {
+    props.onLanePress?.(pressedLane);
+    // Watch the press until an axis wins (vertical → track reorder).
+    if (reorderable()) bandWatch = { x: e.offsetX, y: e.offsetY, lane: pressedLane };
   }
   if (!fsm) return;
   canvas.value?.setPointerCapture(e.pointerId);
@@ -184,9 +231,21 @@ function onPointerMove(e: PointerEvent): void {
     markDirty();
     return;
   }
-  // Glissando while a gutter key is held: switch to the row under the pointer.
   if (gutterPressing) {
     const lane = yToLane(vp, e.offsetY);
+    // Label gutter: vertical travel past half a row turns the press into a
+    // reorder drag (an insertion indicator tracks the target row).
+    if (props.gutter?.kind === "labels" && props.gutter.reorder) {
+      if (gutterReorder || Math.abs(e.offsetY - gutterPressY) > vp.laneHeight / 2) {
+        gutterReorder = {
+          from: gutterLane,
+          to: Math.max(0, Math.min(props.laneCount - 1, lane)),
+        };
+        markDirty();
+      }
+      return;
+    }
+    // Keyboard gutter: glissando — switch to the row under the pointer.
     if (lane >= 0 && lane < props.laneCount && lane !== gutterLane) {
       gutterLane = lane;
       props.gutter?.press(lane);
@@ -196,6 +255,25 @@ function onPointerMove(e: PointerEvent): void {
   }
   if (canvas.value && spaceHeld) {
     canvas.value.style.cursor = "grab"; // hand tool armed, not yet dragging
+    return;
+  }
+  // A watched band press: the first axis to clearly win decides the gesture.
+  if (bandWatch) {
+    const dx = Math.abs(e.offsetX - bandWatch.x);
+    const dy = Math.abs(e.offsetY - bandWatch.y);
+    if (dy > vp.laneHeight / 2 && dy > dx) {
+      fsm?.cancel(); // abort the clip gesture: this drag reorders the track
+      gutterReorder = { from: bandWatch.lane, to: clampLane(yToLane(vp, e.offsetY)) };
+      bandWatch = null;
+      markDirty();
+    } else if (dx > 8) {
+      bandWatch = null; // horizontal: the clip gesture owns the drag
+    }
+  }
+  // A band-originated reorder in progress: track the target row.
+  if (gutterReorder && !gutterPressing) {
+    gutterReorder = { from: gutterReorder.from, to: clampLane(yToLane(vp, e.offsetY)) };
+    markDirty();
     return;
   }
   if (!fsm) return;
@@ -215,6 +293,11 @@ function onPointerUp(e: PointerEvent): void {
     gutterPressing = false;
     gutterLane = NaN;
     canvas.value?.releasePointerCapture(e.pointerId);
+    if (gutterReorder) {
+      const { from, to } = gutterReorder;
+      gutterReorder = null;
+      if (from !== to) props.gutter?.reorder?.(from, to);
+    }
     props.gutter?.release();
     markDirty();
     return;
@@ -223,6 +306,16 @@ function onPointerUp(e: PointerEvent): void {
     panning = false;
     canvas.value?.releasePointerCapture(e.pointerId);
     if (canvas.value) canvas.value.style.cursor = spaceHeld ? "grab" : "default";
+    return;
+  }
+  bandWatch = null;
+  // A band-originated reorder commits here (the gutter one commits above).
+  if (gutterReorder) {
+    const { from, to } = gutterReorder;
+    gutterReorder = null;
+    canvas.value?.releasePointerCapture(e.pointerId);
+    if (from !== to) props.gutter?.reorder?.(from, to);
+    markDirty();
     return;
   }
   if (!fsm) return;
@@ -333,6 +426,11 @@ watch(
   { deep: false },
 );
 watch(() => telemetry.playing, markDirty);
+
+// Redraw when the gutter content changes identity (e.g. the active-track
+// highlight moved) or when the active lane itself changes.
+watch(() => props.gutter, markDirty);
+watch(() => props.activeLane, markDirty);
 
 // Redraw when another view changes the shared horizontal axis (so a scroll or
 // zoom in one view keeps both in step even while the transport is stopped).

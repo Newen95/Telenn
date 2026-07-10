@@ -238,8 +238,10 @@ pub fn graph_insert_effect(
 }
 
 /// Create a track whose chain head is a fresh instance of `module` (an
-/// instrument). The UI generates both ids, like effect inserts.
+/// instrument). The UI generates both ids (like effect inserts) and picks the
+/// display color from the unused hues.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // a Tauri command mirrors the track fields
 pub fn track_add(
     engine: State<'_, AudioEngine>,
     history: State<'_, Mutex<EditHistory>>,
@@ -248,9 +250,17 @@ pub fn track_add(
     name: String,
     module: String,
     instrument_id: String,
+    color: Option<String>,
 ) -> Result<(), String> {
     edit_and_swap_full(&engine, &history, &file, |p| {
-        graph_edit::add_track(p, &track_id, &name, &module, &instrument_id)
+        graph_edit::add_track(
+            p,
+            &track_id,
+            &name,
+            &module,
+            &instrument_id,
+            color.as_deref(),
+        )
     })
 }
 
@@ -267,6 +277,20 @@ pub fn track_set_instrument(
 ) -> Result<(), String> {
     edit_and_swap_full(&engine, &history, &file, |p| {
         graph_edit::set_instrument(p, &track_id, &module, &node_id)
+    })
+}
+
+/// Move a track to `index` in the project order (timeline gutter drag).
+#[tauri::command]
+pub fn track_move(
+    engine: State<'_, AudioEngine>,
+    history: State<'_, Mutex<EditHistory>>,
+    file: State<'_, ProjectFile>,
+    track_id: String,
+    index: usize,
+) -> Result<(), String> {
+    edit_and_swap_full(&engine, &history, &file, |p| {
+        graph_edit::move_track(p, &track_id, index)
     })
 }
 

@@ -55,6 +55,11 @@ pub struct Track {
     pub id: String,
     #[serde(default)]
     pub name: String,
+    /// Display hue of the track (CSS hex), presentation only — the UI assigns
+    /// one at creation and falls back to a stable id-derived hue when absent.
+    /// Persisted so the color survives reorder and is visible to file editors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
     /// Mixer settings (gain dB + pan), applied to the chain tail by the mixer
     /// stage — not a chain node. Defaults keep old files loading unchanged.
     #[serde(default)]
@@ -150,6 +155,8 @@ pub struct TrackMixView {
 pub struct TrackView {
     pub id: String,
     pub name: String,
+    /// Explicit display hue, if the track has one (see [`Track::color`]).
+    pub color: Option<String>,
     /// Flat graph index of the track's instrument node. Instruments occupy the
     /// leading indices (`to_graph` is instruments-first), so this equals the
     /// track's position; the UI uses it to play an audio echo while editing.
@@ -442,6 +449,7 @@ impl Project {
             tracks.push(TrackView {
                 id: track.id.clone(),
                 name: track.name.clone(),
+                color: track.color.clone(),
                 // Instruments-first layout: the instrument's flat index is the
                 // track's position (see `to_graph`).
                 instrument_node: track_idx,

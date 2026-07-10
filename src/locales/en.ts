@@ -34,5 +34,9 @@ export default {
   chain: {
     newTrack: "Drop an instrument here to create a track",
     removeTrack: "Remove track",
+    prevTrack: "Previous track",
+    nextTrack: "Next track",
+    replaceInstrument: "Change instrument",
   },
+  timeline: { addTrack: "Add a track" },
 };

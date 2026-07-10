@@ -47,6 +47,18 @@ export const theme = {
     "#9e5b6f", // rosewood
     "#6f9e5b", // moss
   ],
+  /** Canvas-only shades (grid lines, keyboard keys) — same slate family. */
+  canvas: {
+    laneLine: "#1c232a",
+    trackLine: "#0a0d10", // near-black separation between timeline tracks
+    beatLine: "#222a33",
+    barLine: "#33404c",
+    keyWhite: "#ddd8ce",
+    keyBlack: "#1a2027",
+    keyRow: "#0e1216",
+    keyLabel: "#5f6b76",
+    gutterEdge: "#0a0d10",
+  },
   radius: { xs: "2px", sm: "4px", md: "6px", lg: "10px" },
   transition: { fast: "120ms ease", med: "200ms ease" },
   font: {
@@ -130,6 +142,14 @@ export function projectHues(tracks: { id: string; color?: string | null }[]): Ma
 /** One track's hue outside a project context (prefer `projectHues`). */
 export function trackHue(track: { id: string; color?: string | null }): string {
   return track.color ?? theme.track[fnv(track.id) % theme.track.length];
+}
+
+/** A `#rrggbb` color as an rgba() string at the given opacity. */
+export function withAlpha(hex: string, alpha: number): string {
+  const r = parseInt(hex.slice(1, 3), 16);
+  const g = parseInt(hex.slice(3, 5), 16);
+  const b = parseInt(hex.slice(5, 7), 16);
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
 }
 
 /** A hue for a new track: random among the palette hues not in use yet (all

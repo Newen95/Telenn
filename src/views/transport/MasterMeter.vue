@@ -1,12 +1,13 @@
 <script setup lang="ts">
-// Master VU: instant attack, ~300 ms linear release, driven by the telemetry
-// store's master peak.
+// Master VU string: instant attack, ~300 ms linear release, driven by the
+// telemetry store's master peak (the max of both stereo channels).
 
 import { onMounted, onUnmounted, ref } from "vue";
 import { useI18n } from "vue-i18n";
 
 import { useTelemetryStore } from "../../stores/telemetry";
 import { ballistic } from "./meterBallistics";
+import StringMeter from "../../ui/StringMeter.vue";
 
 const { t } = useI18n();
 const telemetry = useTelemetryStore();
@@ -31,9 +32,7 @@ onUnmounted(() => cancelAnimationFrame(raf));
 <template>
   <div class="meter">
     <span class="label">{{ t("meter.master") }}</span>
-    <div class="bar">
-      <div class="fill" :style="{ width: Math.min(100, level * 100) + '%' }"></div>
-    </div>
+    <StringMeter :rms="level" :peak="level" :size="90" orientation="horizontal" />
   </div>
 </template>
 
@@ -41,22 +40,8 @@ onUnmounted(() => cancelAnimationFrame(raf));
 .meter {
   display: flex;
   align-items: center;
-  gap: 0.5rem;
-  font-size: 0.75rem;
-  color: #8e8e93;
-}
-
-.bar {
-  width: 140px;
-  height: 10px;
-  background: #2c2c2e;
-  border-radius: 3px;
-  overflow: hidden;
-}
-
-.fill {
-  height: 100%;
-  background: linear-gradient(90deg, #2f7d5b, #e0b050);
-  transition: none;
+  gap: 0.4rem;
+  font-size: 0.72rem;
+  color: var(--text-2);
 }
 </style>

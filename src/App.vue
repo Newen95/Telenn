@@ -107,8 +107,12 @@ function executeIntent(intent: DropIntent): void {
   if (intent.kind === "move") void project.moveNode(intent.nodeId, intent.toTrack, intent.index);
   else if (intent.kind === "copy") void project.copyNode(intent.nodeId, intent.toTrack, intent.index);
   else if (intent.kind === "setInstrument") void project.setTrackInstrument(intent.trackId, intent.module);
-  else if (intent.kind === "addTrack") void project.addTrack(intent.module, intent.name);
-  else void project.insertNode(intent.trackId, intent.index, intent.module, intent.params);
+  else if (intent.kind === "addTrack") {
+    void project.addTrack(intent.module, intent.name).then(() => {
+      // The freshly created track (appended last) becomes the active one.
+      ui.activeTrackId = project.tracks[project.tracks.length - 1]?.id ?? ui.activeTrackId;
+    });
+  } else void project.insertNode(intent.trackId, intent.index, intent.module, intent.params);
 }
 
 function onDragMove(e: PointerEvent): void {

@@ -200,14 +200,6 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
           <Icon name="chevron-right" :size="13" />
         </button>
         <span class="track-count num">{{ activeIndex + 1 }}/{{ project.tracks.length }}</span>
-        <button
-          type="button"
-          class="track-remove"
-          :title="t('chain.removeTrack')"
-          @click="project.removeTrack(track.id)"
-        >
-          <Icon name="close" :size="12" />
-        </button>
       </header>
       <div class="chain-row">
       <!-- TransitionGroup so a removed effect's neighbours slide into place. Each
@@ -249,7 +241,7 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
             <div class="node-head">
               <span class="node-name">{{ node.module }}</span>
               <!-- Live VU from the audio thread (peak + RMS), mapped by flat index. -->
-              <NodeMeter :index="node.flatIndex" />
+              <NodeMeter :index="node.flatIndex" :size="22" />
             </div>
             <!-- Params unfold *below* the header on selection, one labelled row
                  each (name — slider — real value), so the card grows down and its
@@ -273,7 +265,7 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
                   @input="project.setNodeParam(node.id, p.name, sliderValue($event))"
                   @change="project.commitNodeParam(node.id, p.name, sliderValue($event))"
                 />
-                <span class="param-value">{{ formatParam(node, p) }}</span>
+                <span class="param-value num">{{ formatParam(node, p) }}</span>
               </label>
             </div>
           </div>
@@ -297,16 +289,6 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
       </TransitionGroup>
       </div>
     </template>
-
-    <!-- Drop an instrument here to create a track. Quiet when idle; lights up
-         while an instrument drag makes it an actual target. -->
-    <div
-      class="new-track"
-      :class="{ active: draggingInstrument, over: isOver({ kind: 'newTrack' }) }"
-      data-new-track
-    >
-      {{ t("chain.newTrack") }}
-    </div>
 
     <!-- Drag ghost: a ~50% copy of the real card. Cards are compact (params show
          only once selected), so the ghost is compact too — its footprint matches
@@ -390,22 +372,6 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
   color: var(--text-3);
 }
 
-.track-remove {
-  margin-left: auto;
-  display: flex;
-  align-items: center;
-  border: none;
-  background: none;
-  padding: 0.15rem;
-  color: var(--text-3);
-  cursor: pointer;
-  transition: color 120ms ease;
-}
-
-.track-remove:hover {
-  color: var(--danger);
-}
-
 /* Anchors the instrument-replace picker under the card. */
 .chain-item {
   position: relative;
@@ -414,28 +380,6 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
 .replace-menu {
   top: calc(100% + 4px);
   left: 0;
-}
-
-/* The create-a-track drop zone: quiet when idle, lit while it is a target. */
-.new-track {
-  border: 1px dashed #3a3a3c;
-  border-radius: 8px;
-  padding: 0.45rem 0.7rem;
-  font-size: 0.72rem;
-  color: #6e6e73;
-  transition: border-color 120ms ease, background-color 120ms ease, color 120ms ease;
-}
-
-.new-track.active {
-  border-color: #5fae7f;
-  color: #8e8e93;
-}
-
-.new-track.over {
-  border-style: solid;
-  border-color: #5fae7f;
-  background: #26362b;
-  color: #f6f6f6;
 }
 
 .chain {
@@ -481,9 +425,9 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
   align-items: stretch;
   gap: 0.3rem;
   padding: 0.3rem 0.5rem;
-  border: 1px solid #3a3a3c;
+  border: 1px solid var(--border-strong);
   border-radius: 6px;
-  background: #2c2c2e;
+  background: var(--surface);
   /* Plain arrow on hover/click: a press selects (the drag only arms past the
      threshold), so the card should not advertise a grab affordance at rest. */
   cursor: default;
@@ -502,25 +446,25 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
    outset box-shadow, whose paint can be left orphaned as a thin green line when
    the card is removed during the leave/move transform (WebView2 compositor). */
 .node.selected {
-  border-color: #5fae7f;
-  background: #26362b;
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, var(--surface));
 }
 
 .node.instrument {
-  background: #20303a;
-  border-color: #2f5a6e;
+  background: color-mix(in srgb, var(--sig-notes) 12%, var(--surface));
+  border-color: color-mix(in srgb, var(--sig-notes) 45%, var(--border-strong));
 }
 
 /* While an instrument is dragged, chain heads are the replace targets. */
 .node.instrument.swap-target {
   border-style: dashed;
-  border-color: #5fae7f;
+  border-color: var(--accent);
 }
 
 .node.instrument.over {
-  background: #26362b;
+  background: color-mix(in srgb, var(--accent) 12%, var(--surface));
   border-style: solid;
-  border-color: #5fae7f;
+  border-color: var(--accent);
 }
 
 .node-head {
@@ -531,7 +475,7 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
 
 .node-name {
   font-size: 0.85rem;
-  color: #f6f6f6;
+  color: var(--text);
   margin-right: auto;
 }
 
@@ -541,7 +485,7 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
   flex-direction: column;
   gap: 0.25rem;
   padding-top: 0.3rem;
-  border-top: 1px solid #3a3a3c;
+  border-top: 1px solid var(--border-strong);
   cursor: default;
 }
 
@@ -554,14 +498,14 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
 
 .param-name {
   font-size: 0.7rem;
-  color: #8e8e93;
+  color: var(--text-2);
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
 .param-value {
   font-size: 0.7rem;
-  color: #c7c7cc;
+  color: var(--text-2);
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
@@ -580,7 +524,7 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
 .param-slider::-webkit-slider-runnable-track {
   height: 4px;
   border-radius: 2px;
-  background: #3a3a3c;
+  background: var(--border-strong);
 }
 
 .param-slider::-webkit-slider-thumb {
@@ -590,7 +534,7 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
   /* Centre the thumb on the 4px track. */
   margin-top: -4px;
   border-radius: 50%;
-  background: #5fae7f;
+  background: var(--accent);
 }
 
 /* Gaps are thin by default; they widen while a drag is active and the one under
@@ -605,12 +549,12 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
 
 .chain-panel.dragging .gap {
   width: 10px;
-  background: #3a3a3c;
+  background: var(--border-strong);
 }
 
 .chain-panel.dragging .gap.over {
   width: 26px;
-  background: #e0b050;
+  background: var(--accent-bright);
 }
 
 /* The ghost follows the pointer; ~50% opacity over the real card styling. */
@@ -629,6 +573,6 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
 
 .ghost-copy {
   font-weight: 700;
-  color: #5fae7f;
+  color: var(--accent);
 }
 </style>

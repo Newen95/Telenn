@@ -1,9 +1,9 @@
 <script setup lang="ts">
-// Mixer panel: one strip per track — vertical gain fader (linear in dB), pan,
-// and a VU on the track's chain tail — plus the master strip. A fader drag
-// streams live values (retargeting the smoothed strips on the audio thread)
-// and persists on release: one whole gesture = one undo step. Double-click
-// resets a control to neutral.
+// Mixer panel: one strip per track — vertical gain fader (linear in dB) with
+// its VU string, pan, plus the master strip. A fader drag streams live values
+// (retargeting the smoothed strips on the audio thread) and persists on
+// release: one whole gesture = one undo step. Double-click resets a control.
+// Clicking a strip makes its track the active one everywhere.
 
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import { useI18n } from "vue-i18n";
@@ -14,6 +14,7 @@ import { useUiStore } from "../../stores/ui";
 import { projectHues } from "../../styles/theme";
 import { ballistic } from "../transport/meterBallistics";
 import NodeMeter from "../chain/NodeMeter.vue";
+import StringMeter from "../../ui/StringMeter.vue";
 import { formatDb, formatPan, tailIndex } from "./format";
 
 const { t } = useI18n();
@@ -83,18 +84,21 @@ onUnmounted(() => cancelAnimationFrame(raf));
       <span class="strip-name" :style="{ borderColor: hues.get(track.id) }">
         {{ track.name || track.id }}
       </span>
-      <input
-        class="fader"
-        type="range"
-        min="-60"
-        max="6"
-        step="0.1"
-        :value="track.mixer.gainDb"
-        @input="onGain(track, $event)"
-        @change="onGainCommit(track, $event)"
-        @dblclick="resetGain(track)"
-      />
-      <span class="value">{{ formatDb(track.mixer.gainDb) }}</span>
+      <div class="fader-row">
+        <input
+          class="fader"
+          type="range"
+          min="-60"
+          max="6"
+          step="0.1"
+          :value="track.mixer.gainDb"
+          @input="onGain(track, $event)"
+          @change="onGainCommit(track, $event)"
+          @dblclick="resetGain(track)"
+        />
+        <NodeMeter :index="tailIndex(track.chain)" :size="96" />
+      </div>
+      <span class="value num">{{ formatDb(track.mixer.gainDb) }}</span>
       <input
         class="pan"
         type="range"
@@ -106,27 +110,26 @@ onUnmounted(() => cancelAnimationFrame(raf));
         @change="onPanCommit(track, $event)"
         @dblclick="resetPan(track)"
       />
-      <span class="value">{{ formatPan(track.mixer.pan) }}</span>
-      <NodeMeter :index="tailIndex(track.chain)" />
+      <span class="value num">{{ formatPan(track.mixer.pan) }}</span>
     </div>
 
     <div class="strip master">
       <span class="strip-name">{{ t("meter.master") }}</span>
-      <input
-        class="fader"
-        type="range"
-        min="-60"
-        max="6"
-        step="0.1"
-        :value="project.masterGainDb"
-        @input="onMaster($event)"
-        @change="onMasterCommit($event)"
-        @dblclick="resetMaster()"
-      />
-      <span class="value">{{ formatDb(project.masterGainDb) }}</span>
-      <div class="vu" :class="{ clip: masterLevel >= 1 }">
-        <div class="fill" :style="{ width: Math.min(100, masterLevel * 100) + '%' }"></div>
+      <div class="fader-row">
+        <input
+          class="fader"
+          type="range"
+          min="-60"
+          max="6"
+          step="0.1"
+          :value="project.masterGainDb"
+          @input="onMaster($event)"
+          @change="onMasterCommit($event)"
+          @dblclick="resetMaster()"
+        />
+        <StringMeter :rms="masterLevel" :peak="masterLevel" :size="96" />
       </div>
+      <span class="value num">{{ formatDb(project.masterGainDb) }}</span>
     </div>
   </div>
 </template>
@@ -148,11 +151,11 @@ onUnmounted(() => cancelAnimationFrame(raf));
   gap: 0.35rem;
   padding: 0.45rem 0.6rem;
   min-width: 4.6rem;
-  border: 1px solid #3a3a3c;
-  border-radius: 6px;
-  background: #2c2c2e;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--surface);
   cursor: pointer;
-  transition: border-color 120ms ease;
+  transition: border-color var(--t-fast);
 }
 
 /* The active track's strip (the one the chain and piano roll show). */
@@ -161,13 +164,14 @@ onUnmounted(() => cancelAnimationFrame(raf));
 }
 
 .strip.master {
-  background: #20303a;
-  border-color: #2f5a6e;
+  background: var(--panel);
 }
 
 .strip-name {
+  font-family: var(--font-display);
   font-size: 0.72rem;
-  color: #c7c7cc;
+  font-weight: 600;
+  color: var(--text-2);
   text-transform: uppercase;
   letter-spacing: 0.04em;
   border-bottom: 2px solid transparent; /* colored per track inline */
@@ -177,44 +181,31 @@ onUnmounted(() => cancelAnimationFrame(raf));
   white-space: nowrap;
 }
 
+.fader-row {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+
 /* Native appearance kept (accent-color themes it); vertical via writing-mode,
    rtl so up = louder. */
 .fader {
   writing-mode: vertical-lr;
   direction: rtl;
-  height: 110px;
+  height: 96px;
   width: 18px;
-  accent-color: #5fae7f;
+  accent-color: var(--accent);
   cursor: pointer;
 }
 
 .pan {
   width: 62px;
-  accent-color: #5fae7f;
+  accent-color: var(--accent);
   cursor: pointer;
 }
 
 .value {
   font-size: 0.68rem;
-  color: #8e8e93;
-  font-variant-numeric: tabular-nums;
-}
-
-.vu {
-  position: relative;
-  width: 44px;
-  height: 6px;
-  background: #1c1c1e;
-  border-radius: 2px;
-  overflow: hidden;
-}
-
-.vu .fill {
-  height: 100%;
-  background: linear-gradient(90deg, #2f7d5b, #e0b050);
-}
-
-.vu.clip .fill {
-  background: #e0564f;
+  color: var(--text-2);
 }
 </style>

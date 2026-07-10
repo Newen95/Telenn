@@ -10,6 +10,7 @@ import { useI18n } from "vue-i18n";
 
 import { useProjectStore, type ModuleDesc } from "../../stores/project";
 import { useUiStore } from "../../stores/ui";
+import { useChainDrag } from "../chain/dragdrop";
 import { projectHues, theme } from "../../styles/theme";
 import GridView, { type GutterSpec } from "../canvas/GridView.vue";
 import type { EditAdapter } from "../canvas/interactions";
@@ -28,6 +29,27 @@ const ui = useUiStore();
 /** Collision-free display hue per track id (explicit colors first). */
 const hues = computed(() => projectHues(project.tracks));
 
+/** A clip's notes as normalized preview marks (pitch range → vertical span). */
+function clipMarks(clip: {
+  startTicks: number;
+  lengthTicks: number;
+  notes: { pitch: number; startTicks: number; lengthTicks: number }[];
+}): Block["marks"] {
+  if (clip.notes.length === 0 || clip.lengthTicks === 0) return undefined;
+  let lo = Infinity;
+  let hi = -Infinity;
+  for (const n of clip.notes) {
+    lo = Math.min(lo, n.pitch);
+    hi = Math.max(hi, n.pitch);
+  }
+  const span = Math.max(hi - lo, 1);
+  return clip.notes.map((n) => ({
+    t: (n.startTicks - clip.startTicks) / clip.lengthTicks,
+    len: n.lengthTicks / clip.lengthTicks,
+    y: (hi - n.pitch) / span,
+  }));
+}
+
 const blocks = computed<Block[]>(() => {
   const out: Block[] = [];
   project.tracks.forEach((track, lane) => {
@@ -38,6 +60,8 @@ const blocks = computed<Block[]>(() => {
         lane,
         color: hues.value.get(track.id) ?? theme.color.panel,
         ref: clip.id,
+        marks: clipMarks(clip),
+        style: "glass",
       });
     }
   });
@@ -99,8 +123,26 @@ function selectLane(lane: number): void {
   if (track) ui.activeTrackId = track.id;
 }
 
-/** The active track's lane, tinted across the whole band. */
+/** The active track's lane, gently tinted across the whole band. */
 const activeLane = computed(() => project.tracks.findIndex((tr) => tr.id === ui.activeTrackId));
+
+/** Delete while the timeline owns the focus removes the active track
+ *  (undoable — the unified history restores it with Ctrl+Z). */
+function deleteActiveTrack(): boolean {
+  const track = project.tracks[activeLane.value];
+  if (!track) return false;
+  void project.removeTrack(track.id);
+  return true;
+}
+
+// Dropping an instrument anywhere on the timeline creates a track: the whole
+// view is the drop target, outlined copper while an instrument is dragged.
+const drag = useChainDrag();
+const draggingInstrument = computed(() => {
+  const s = drag.state.source;
+  return s?.kind === "module" && s.category === "instrument";
+});
+const dropOver = computed(() => drag.state.hovered?.kind === "newTrack");
 
 // "+ track": picker anchored under the gutter, then select the new track.
 const adding = ref(false);
@@ -114,7 +156,11 @@ async function addTrack(m: ModuleDesc): Promise<void> {
 </script>
 
 <template>
-  <div class="timeline">
+  <div
+    class="timeline"
+    :class="{ 'drop-target': draggingInstrument, over: dropOver }"
+    data-new-track
+  >
     <GridView
       :blocks="blocks"
       :lane-count="Math.max(project.tracks.length, 1)"
@@ -125,6 +171,7 @@ async function addTrack(m: ModuleDesc): Promise<void> {
       :axis="axis"
       :on-lane-press="selectLane"
       :active-lane="activeLane"
+      :on-delete-key="deleteActiveTrack"
     />
     <div class="add-track" :style="{ top: `${project.tracks.length * LANE_HEIGHT + 4}px` }">
       <button type="button" class="add-btn" :title="t('timeline.addTrack')" @click="adding = !adding">
@@ -140,6 +187,19 @@ async function addTrack(m: ModuleDesc): Promise<void> {
   position: relative;
   width: 100%;
   height: 100%;
+  outline: 1px dashed transparent;
+  outline-offset: -1px;
+  transition: outline-color var(--t-fast);
+}
+
+/* An instrument dragged from the library: dropping it here creates a track. */
+.timeline.drop-target {
+  outline-color: var(--accent);
+}
+
+.timeline.over {
+  outline-style: solid;
+  outline-color: var(--accent-bright);
 }
 
 /* Pinned under the last track row, inside the gutter column. */

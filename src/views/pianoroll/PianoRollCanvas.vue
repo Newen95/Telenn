@@ -13,10 +13,10 @@ import type { EditAdapter } from "../canvas/interactions";
 import type { Block, Grid } from "../canvas/renderer";
 import { GUTTER_WIDTH, type TimeAxis } from "../canvas/timeAxis";
 import { usePreviewVoices } from "../canvas/previewVoices";
+import { projectHues, theme } from "../../styles/theme";
 
 const LANE_HEIGHT = 10;
 const PITCHES = 128;
-const NOTE_COLOR = "#5fae7f";
 /** Audio echo length when a note is created or auditioned, in milliseconds. */
 const ECHO_MS = 150;
 /** Semitone offsets that are black keys within an octave. */
@@ -41,6 +41,12 @@ function laneToPitch(lane: number): number {
   return PITCHES - 1 - lane;
 }
 
+// Notes wear the track's hue: the same color links this track in the
+// timeline, the chain header, the mixer strip and here.
+const noteColor = computed(
+  () => projectHues(project.tracks).get(props.trackId) ?? theme.color.accent,
+);
+
 const blocks = computed<Block[]>(() => {
   const out: Block[] = [];
   for (const clip of track.value?.clips ?? []) {
@@ -49,7 +55,7 @@ const blocks = computed<Block[]>(() => {
         startTick: note.startTicks,
         lenTick: note.lengthTicks,
         lane: pitchToLane(note.pitch),
-        color: NOTE_COLOR,
+        color: noteColor.value,
         ref: note.id,
       });
     }

@@ -54,6 +54,9 @@ const props = defineProps<{
   onLanePress?: (lane: number) => void;
   /** Lane lifted with the active-track tint (timeline only). */
   activeLane?: number;
+  /** View-level Delete handler, tried before block deletion (the timeline
+   *  deletes the active track). Return true when the key was consumed. */
+  onDeleteKey?: () => boolean;
 }>();
 
 const project = useProjectStore();
@@ -361,12 +364,22 @@ function onKeyDown(e: KeyboardEvent): void {
     fitToContent();
     return;
   }
-  // Editing.
+  // Editing. The view gets Delete first (the timeline deletes the active
+  // track — undoable); block deletion only runs if the view declined.
+  if (e.key === "Delete" || e.key === "Backspace") {
+    if (props.onDeleteKey?.()) {
+      e.preventDefault();
+      markDirty();
+      return;
+    }
+    if (fsm?.deleteSelected()) {
+      e.preventDefault();
+      markDirty();
+    }
+    return;
+  }
   if (!fsm) return;
   if (e.key === "Escape" && fsm.cancel()) {
-    markDirty();
-  } else if ((e.key === "Delete" || e.key === "Backspace") && fsm.deleteSelected()) {
-    e.preventDefault();
     markDirty();
   }
 }

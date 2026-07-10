@@ -9,7 +9,11 @@
 
 use std::collections::HashMap;
 
-use crate::control::project::{NodeSpec, Project, Track};
+use crate::control::ids;
+use crate::control::project::{
+    duration_to_ticks, position_to_ticks, ticks_to_duration, ticks_to_position, Clip, NodeSpec,
+    Project, ProjectError, Track,
+};
 use crate::modules::registry;
 
 /// Reserved id of the implicit master node (see `project::to_graph`).
@@ -33,6 +37,8 @@ pub enum GraphEditError {
     NotAnInstrument(String),
     #[error("track id '{0}' already exists")]
     DuplicateTrack(String),
+    #[error(transparent)]
+    Project(#[from] ProjectError),
 }
 
 /// Validate that `module` is a registered instrument (a chain head).
@@ -68,6 +74,28 @@ pub fn add_track(
     if id_exists(project, instrument_id) {
         return Err(GraphEditError::DuplicateId(instrument_id.to_string()));
     }
+    // A new track ships with one empty clip spanning the current loop: the
+    // piano roll needs a clip to put notes in, and the timeline band IS the
+    // clip. Matching the existing loop keeps the project length unchanged
+    // (empty project → 16 bars).
+    let (tpbar, tpbeat) = project.ticks_per_bar_beat()?;
+    let mut extent = 0u64;
+    for track in &project.tracks {
+        for clip in &track.clips {
+            let end = position_to_ticks(&clip.start, tpbar, tpbeat)?
+                .saturating_add(duration_to_ticks(&clip.length, tpbar, tpbeat)?);
+            extent = extent.max(end);
+        }
+    }
+    if extent == 0 {
+        extent = 16 * tpbar;
+    }
+    let clip = Clip {
+        id: ids::fresh_clip_id(project),
+        start: ticks_to_position(0, tpbar, tpbeat),
+        length: ticks_to_duration(extent, tpbar, tpbeat),
+        notes: Vec::new(),
+    };
     project.tracks.push(Track {
         id: track_id.to_string(),
         name: name.to_string(),
@@ -78,7 +106,7 @@ pub fn add_track(
             module: module.to_string(),
             params: Default::default(),
         }],
-        clips: Vec::new(),
+        clips: vec![clip],
     });
     Ok(())
 }
@@ -474,7 +502,12 @@ mod tests {
         .unwrap();
         assert_eq!(p.tracks.len(), 2);
         assert_eq!(ids(&p, 1), ["drums_kit"]);
-        assert!(p.tracks[1].clips.is_empty());
+        // One empty default clip, so notes can land right away. The demo
+        // fixture has no clips → the default 16-bar span.
+        assert_eq!(p.tracks[1].clips.len(), 1);
+        assert!(p.tracks[1].clips[0].notes.is_empty());
+        assert!(!p.tracks[1].clips[0].id.is_empty());
+        assert_eq!(p.tracks[1].clips[0].length, "16.0.0");
         // Existing instrument indices are unchanged (instruments-first layout).
         let (_, index) = p.to_graph().unwrap();
         assert_eq!(index.instrument["lead"], 0);

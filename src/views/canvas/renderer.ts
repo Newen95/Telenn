@@ -3,7 +3,7 @@
 //! with viewport culling. Both views differ only in the blocks and lane mapping
 //! they feed in. `hitTest` is exposed now so the 5b gesture machine reuses it.
 
-import { theme } from "../../styles/theme";
+import { theme, withAlpha } from "../../styles/theme";
 import { laneToY, tickToX, xToTick, yToLane, type Viewport } from "./viewport";
 
 /** A generic rectangle on the grid: a clip (timeline) or a note (piano roll). */
@@ -14,6 +14,12 @@ export interface Block {
   color: string;
   /** Opaque handle the view's edit adapter interprets (a note or clip id). */
   ref?: unknown;
+  /** Miniature content preview (a clip's notes), normalized inside the block:
+   *  `t`/`len` as fractions of the block length, `y` 0 = top of the row. */
+  marks?: { t: number; len: number; y: number }[];
+  /** How the body renders: `solid` (a note) or `glass` (a clip: a faint tint
+   *  of the hue, a crisp hue border, and the marks in the full hue). */
+  style?: "solid" | "glass";
 }
 
 export interface Grid {
@@ -63,22 +69,28 @@ export interface LabelGutter {
 /** Left gutter. Width must equal `vp.originX`. */
 export type GutterStyle = KeyGutter | LabelGutter;
 
-const BG = "#161618";
-const ACTIVE_LANE = "rgba(232, 228, 220, 0.22)"; // lift of the active track's row (over clips)
-const LANE_LINE = "#232325";
-const BEAT_LINE = "#2a2a2c";
-const BAR_LINE = "#3c3c3f";
-const PLAYHEAD = "#e0b050";
-const SELECTED = "#f6f6f6";
-const FLASH = "#e0b050"; // externally-edited notes pulse in the accent amber
-const GHOST_FILL = "rgba(246, 246, 246, 0.35)";
-const GUTTER_BG = "#161618";
-const GUTTER_WHITE = "#e6e6e9"; // bright white keys, read at a glance
-const GUTTER_BLACK = "#1b1b1d"; // near-black keys
-const GUTTER_ROW = "#0d0d0e"; // crisp separation between key rows
-const GUTTER_EDGE = "#000000"; // border between gutter and grid
-const GUTTER_LABEL = "#4a4a4c"; // dark label, legible on a white key
-const GUTTER_LIT = "#e0b050"; // a sounding key lights up (shared with playback)
+// Every shade comes from the theme (single source of truth). The drag grammar
+// is one language everywhere: what you hold turns into a light ghost, where it
+// lands lights up copper.
+const BG = theme.color.bg;
+const ACTIVE_LANE = "rgba(232, 228, 220, 0.16)"; // gentle lift of the active track's row
+const LANE_LINE = theme.canvas.laneLine;
+const BEAT_LINE = theme.canvas.beatLine;
+const BAR_LINE = theme.canvas.barLine;
+const PLAYHEAD = theme.color.accentBright; // the taut copper string
+const PLAYHEAD_HALO = "rgba(232, 163, 76, 0.25)";
+const SELECTED = theme.color.text;
+const LANDING = theme.color.accentBright; // where a dragged thing will land
+const FLASH = theme.color.sigMod; // externally-edited notes pulse in signal amber
+const GHOST_FILL = "rgba(232, 228, 220, 0.35)";
+const GHOST_ROW = "rgba(232, 228, 220, 0.14)"; // a whole row held during a reorder
+const GUTTER_BG = theme.color.bg;
+const GUTTER_WHITE = theme.canvas.keyWhite;
+const GUTTER_BLACK = theme.canvas.keyBlack;
+const GUTTER_ROW = theme.canvas.keyRow;
+const GUTTER_EDGE = theme.canvas.gutterEdge;
+const GUTTER_LABEL = theme.canvas.keyLabel;
+const GUTTER_LIT = theme.color.accentBright; // a sounding key lights up
 
 /** Draw a frame. `w`/`h` are CSS pixels; `ctx` is already scaled by the dpr. */
 export function draw(
@@ -102,17 +114,10 @@ export function draw(
   ctx.fillStyle = BG;
   ctx.fillRect(0, 0, w, h);
 
-  // Horizontal lane separators (only the visible ones).
-  ctx.strokeStyle = LANE_LINE;
-  ctx.lineWidth = 1;
-  for (let lane = 0; lane <= laneCount; lane += 1) {
-    const y = Math.round(laneToY(vp, lane)) + 0.5;
-    if (y < 0 || y > h) continue;
-    ctx.beginPath();
-    ctx.moveTo(0, y);
-    ctx.lineTo(w, y);
-    ctx.stroke();
-  }
+  // Horizontal lane separators (only the visible ones). In the timeline the
+  // clips fill their whole row, so the separators are redrawn OVER the blocks
+  // further down; here they only serve the empty rows.
+  drawLaneLines(ctx, w, h, vp, laneCount);
 
   // Vertical bar/beat grid across the visible tick range.
   const tpb = grid.ticksPerBeat;
@@ -136,9 +141,26 @@ export function draw(
     if (x + bw < 0 || x > w) continue;
     const y = laneToY(vp, b.lane);
     if (y + vp.laneHeight < 0 || y > h) continue;
-    ctx.fillStyle = b.color;
     const rw = Math.max(bw, 1.5);
-    ctx.fillRect(x, y + 1, rw, vp.laneHeight - 2);
+    if (b.style === "glass") {
+      // Tinted glass: a faint wash of the hue with the notes as the brightest
+      // element — the grid stays visible through it, no border. Full row
+      // height: the hairline separators are redrawn over the blocks below.
+      ctx.fillStyle = withAlpha(b.color, 0.24);
+      ctx.fillRect(x, y, rw, vp.laneHeight);
+      if (b.marks && vp.laneHeight >= 14) {
+        ctx.fillStyle = b.color;
+        const innerH = vp.laneHeight - 8;
+        for (const m of b.marks) {
+          const mx = x + m.t * bw;
+          const mw = Math.max(m.len * bw - 1, 1.5);
+          ctx.fillRect(mx, y + 4 + m.y * (innerH - 2), mw, 2);
+        }
+      }
+    } else {
+      ctx.fillStyle = b.color;
+      ctx.fillRect(x, y + 1, rw, vp.laneHeight - 2);
+    }
     // A note changed by an external reload pulses, fading over its flash window.
     const a = flash ? flash(b.ref) : 0;
     if (a > 0) {
@@ -148,6 +170,13 @@ export function draw(
       ctx.fillRect(x, y + 1, rw, vp.laneHeight - 2);
       ctx.restore();
     }
+  }
+
+  // Timeline (label-gutter) rows: redraw the separators OVER the full-height
+  // clips, so two adjacent filled tracks part with the same hairline as two
+  // empty ones.
+  if (gutter?.kind === "labels") {
+    drawLaneLines(ctx, w, h, vp, laneCount);
   }
 
   // The active track's whole band reads as selected, whatever selected it.
@@ -160,7 +189,8 @@ export function draw(
     }
   }
 
-  // Selection outline and the drag ghost, on top of the blocks.
+  // Selection outline and the drag ghost, on top of the blocks. The ghost's
+  // outline is copper: it marks where the held block will land.
   if (overlay?.selected) outline(ctx, vp, overlay.selected, SELECTED);
   if (overlay?.ghost) {
     const g = overlay.ghost;
@@ -168,13 +198,20 @@ export function draw(
     const y = laneToY(vp, g.lane);
     ctx.fillStyle = GHOST_FILL;
     ctx.fillRect(x, y + 1, Math.max(g.lenTick * vp.pxPerTick, 1.5), vp.laneHeight - 2);
-    outline(ctx, vp, g, SELECTED);
+    outline(ctx, vp, g, LANDING);
   }
 
-  // Playhead.
+  // Playhead: the taut copper string — a bright core with a faint halo.
   const px = Math.round(tickToX(vp, playheadTick)) + 0.5;
   if (px >= 0 && px <= w) {
+    ctx.strokeStyle = PLAYHEAD_HALO;
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(px, 0);
+    ctx.lineTo(px, h);
+    ctx.stroke();
     ctx.strokeStyle = PLAYHEAD;
+    ctx.lineWidth = 1;
     ctx.beginPath();
     ctx.moveTo(px, 0);
     ctx.lineTo(px, h);
@@ -185,16 +222,17 @@ export function draw(
   // covered; it owns the [0, originX) column. The piano roll fills it with its
   // keyboard; other views (timeline) reserve a plain strip so the time axes — and
   // thus the playheads — line up across both.
-  // Track-reorder drag: dim the grabbed row and mark the insertion boundary
-  // across the full width (the gutter repeats both over its own column).
+  // Track-reorder drag, same grammar as every drag: the held row turns into a
+  // light ghost and the landing boundary lights up copper, full width (the
+  // gutter repeats both over its own column).
   if (gutterDrag) {
     const fy = laneToY(vp, gutterDrag.from);
-    ctx.fillStyle = "rgba(0, 0, 0, 0.35)";
+    ctx.fillStyle = GHOST_ROW;
     ctx.fillRect(0, fy, w, vp.laneHeight);
     if (gutterDrag.to !== gutterDrag.from) {
       const edgeLane = gutterDrag.to <= gutterDrag.from ? gutterDrag.to : gutterDrag.to + 1;
       const y = Math.round(laneToY(vp, edgeLane)) + 0.5;
-      ctx.strokeStyle = theme.color.accentBright;
+      ctx.strokeStyle = LANDING;
       ctx.lineWidth = 2;
       ctx.beginPath();
       ctx.moveTo(0, y);
@@ -240,13 +278,15 @@ function drawLabelGutter(
       ctx.fillStyle = theme.color.surface2;
       ctx.fillRect(0, y, gw, vp.laneHeight);
     }
-    const dimmed = drag && lane === drag.from;
-    ctx.globalAlpha = dimmed ? 0.35 : 1;
     ctx.fillStyle = row.color;
     ctx.fillRect(0, y + 1, row.active ? 4 : 2, vp.laneHeight - 2);
     ctx.fillStyle = row.active ? theme.color.text : theme.color.text2;
     ctx.fillText(fitText(ctx, row.label.toUpperCase(), gw - 14), 9, y + vp.laneHeight / 2 + 0.5);
-    ctx.globalAlpha = 1;
+    // The held row of a reorder reads as a light ghost (same drag grammar).
+    if (drag && lane === drag.from) {
+      ctx.fillStyle = GHOST_ROW;
+      ctx.fillRect(0, y, gw, vp.laneHeight);
+    }
     ctx.strokeStyle = LANE_LINE;
     ctx.beginPath();
     const by = Math.round(y + vp.laneHeight) + 0.5;
@@ -270,6 +310,33 @@ function drawLabelGutter(
   }
 
   gutterEdge(ctx, h, gw);
+}
+
+/** Horizontal lane separators as true device hairlines: exactly one physical
+ *  pixel whatever the display scale, aligned to the device grid so every row
+ *  parts with the same thickness. */
+function drawLaneLines(
+  ctx: CanvasRenderingContext2D,
+  w: number,
+  h: number,
+  vp: Viewport,
+  laneCount: number,
+): void {
+  // The context is pre-scaled by the dpr (useGridCanvas); read it back to plant
+  // device hairlines. Mock contexts (perf test) may lack getTransform.
+  const dpr = (typeof ctx.getTransform === "function" ? ctx.getTransform().a : 1) || 1;
+  const hairline = 1 / dpr;
+  ctx.strokeStyle = LANE_LINE;
+  ctx.lineWidth = hairline;
+  for (let lane = 0; lane <= laneCount; lane += 1) {
+    const y = Math.round(laneToY(vp, lane) * dpr) / dpr + hairline / 2;
+    if (y < 0 || y > h) continue;
+    ctx.beginPath();
+    ctx.moveTo(0, y);
+    ctx.lineTo(w, y);
+    ctx.stroke();
+  }
+  ctx.lineWidth = 1;
 }
 
 /** Truncate `text` with an ellipsis so it fits in `maxWidth` pixels. */

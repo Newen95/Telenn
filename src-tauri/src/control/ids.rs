@@ -77,6 +77,11 @@ pub fn fresh_note_id(project: &Project) -> String {
     IdGen::from_project(project).alloc(NOTE_PREFIX)
 }
 
+/// A fresh, unique clip id for a newly created clip. // off-RT
+pub fn fresh_clip_id(project: &Project) -> String {
+    IdGen::from_project(project).alloc(CLIP_PREFIX)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

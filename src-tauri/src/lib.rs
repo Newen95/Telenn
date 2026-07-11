@@ -1,3 +1,4 @@
+pub mod analysis;
 pub mod control;
 pub mod engine;
 pub mod modules;

@@ -9,8 +9,8 @@
 use std::path::Path;
 
 use crate::control::project::{Project, ProjectError};
-use crate::control::sequencer::SequencerCursor;
-use crate::engine::graph::{compile, GraphError};
+use crate::control::sequencer::{Schedule, SequencerCursor};
+use crate::engine::graph::{compile, CompiledGraph, GraphError};
 use crate::engine::mix::Mixer;
 use crate::engine::MAX_BLOCK;
 use crate::modules::registry;
@@ -36,6 +36,20 @@ pub fn render_samples(
     sample_rate: u32,
     loops: u32,
 ) -> Result<Vec<f32>, RenderError> {
+    render_samples_with_tail(project, sample_rate, loops, 0)
+}
+
+/// Like [`render_samples`], then keep processing `tail_frames` more frames
+/// with no scheduled events, so releases and effect tails (delay, reverb)
+/// ring out instead of being cut at the loop boundary. A note still held at
+/// the end of the last loop never receives its note-off and keeps sounding
+/// through the tail — probes should place note-offs inside the loop.
+pub fn render_samples_with_tail(
+    project: &Project,
+    sample_rate: u32,
+    loops: u32,
+    tail_frames: u64,
+) -> Result<Vec<f32>, RenderError> {
     let (desc, index) = project.to_graph()?;
     let mut graph = compile(&desc, registry::create, sample_rate as f32, MAX_BLOCK, 1)?;
     let mut mixer = Mixer::new(
@@ -46,33 +60,63 @@ pub fn render_samples(
     let schedule = project.to_schedule(sample_rate, &index)?;
 
     let total = schedule.loop_len.saturating_mul(loops as u64) as usize;
-    let mut out = Vec::with_capacity(total * 2);
-    let mut stereo = vec![0.0f32; RENDER_BLOCK * 2];
+    let mut out = Vec::with_capacity((total + tail_frames as usize) * 2);
     let mut cursor = SequencerCursor::new();
+    pump(
+        &mut graph,
+        &mut mixer,
+        &mut cursor,
+        Some(&schedule),
+        sample_rate,
+        total,
+        &mut out,
+    );
+    pump(
+        &mut graph,
+        &mut mixer,
+        &mut cursor,
+        None,
+        sample_rate,
+        tail_frames as usize,
+        &mut out,
+    );
+    Ok(out)
+}
+
+/// Drive the graph + mixer for `total` frames, appending interleaved stereo
+/// to `out`. `schedule = None` keeps processing without feeding events (the
+/// tail phase — the cursor would wrap the loop and retrigger notes).
+fn pump(
+    graph: &mut CompiledGraph,
+    mixer: &mut Mixer,
+    cursor: &mut SequencerCursor,
+    schedule: Option<&Schedule>,
+    sample_rate: u32,
+    total: usize,
+    out: &mut Vec<f32>,
+) {
+    let mut stereo = vec![0.0f32; RENDER_BLOCK * 2];
     let mut produced = 0usize;
     while produced < total {
         let n = (total - produced).min(RENDER_BLOCK);
-        {
-            let g = &mut graph;
-            cursor.advance(n, &schedule, |node, ev| g.push_note(node, ev));
+        if let Some(schedule) = schedule {
+            let g = &mut *graph;
+            cursor.advance(n, schedule, |node, ev| g.push_note(node, ev));
         }
         graph.process_block(sample_rate as f32, n);
-        mixer.mix(&graph, n, &mut stereo);
+        mixer.mix(graph, n, &mut stereo);
         out.extend_from_slice(&stereo[..n * 2]);
         graph.clear_notes();
         produced += n;
     }
-    Ok(out)
 }
 
-/// Render the project and write it as a 16-bit stereo PCM WAV.
-pub fn render_to_wav(
-    project: &Project,
+/// Write an interleaved stereo buffer as a 16-bit PCM WAV.
+pub fn write_wav(
+    samples: &[f32],
     sample_rate: u32,
-    loops: u32,
     path: impl AsRef<Path>,
 ) -> Result<(), RenderError> {
-    let samples = render_samples(project, sample_rate, loops)?;
     let spec = hound::WavSpec {
         channels: 2,
         sample_rate,
@@ -81,7 +125,7 @@ pub fn render_to_wav(
     };
     let mut writer =
         hound::WavWriter::create(path, spec).map_err(|e| RenderError::Wav(e.to_string()))?;
-    for &s in &samples {
+    for &s in samples {
         let v = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
         writer
             .write_sample(v)
@@ -93,12 +137,44 @@ pub fn render_to_wav(
     Ok(())
 }
 
+/// Render the project and write it as a 16-bit stereo PCM WAV.
+pub fn render_to_wav(
+    project: &Project,
+    sample_rate: u32,
+    loops: u32,
+    path: impl AsRef<Path>,
+) -> Result<(), RenderError> {
+    let samples = render_samples(project, sample_rate, loops)?;
+    write_wav(&samples, sample_rate, path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn demo() -> Project {
         super::super::demo_project().expect("demo parses")
+    }
+
+    #[test]
+    fn tail_render_extends_without_events() {
+        // tail 0 is bit-identical to the plain render; a tail adds exactly
+        // the requested frames and stays finite (no NaN, no runaway level).
+        let base = render_samples(&demo(), 48_000, 1).unwrap();
+        let with_zero_tail = render_samples_with_tail(&demo(), 48_000, 1, 0).unwrap();
+        assert_eq!(base, with_zero_tail);
+
+        let tail = 4_800u64;
+        let extended = render_samples_with_tail(&demo(), 48_000, 1, tail).unwrap();
+        assert_eq!(extended.len(), base.len() + tail as usize * 2);
+        assert_eq!(&extended[..base.len()], &base[..]);
+        let tail_peak = extended[base.len()..]
+            .iter()
+            .fold(0.0f32, |m, &s| m.max(s.abs()));
+        assert!(
+            tail_peak.is_finite() && tail_peak <= 1.0,
+            "tail peak {tail_peak}"
+        );
     }
 
     #[test]

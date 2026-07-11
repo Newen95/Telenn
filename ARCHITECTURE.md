@@ -196,9 +196,12 @@ pub struct TelemetryFrame {
 ### Paramètres
 
 - Déclarés par le module : `ParamSpec { id, name, unit, min, max, default,
-  curve }` avec `curve ∈ {Linear, Log, Db}`. L'UI et song.json manipulent des
-  valeurs **réelles** (Hz, dB) ; la conversion vers le normalisé 0..1 se fait
-  côté contrôle via la curve.
+  curve }` avec `curve ∈ {Linear, Log, Db}`. `min`/`max`/`default` sont des
+  valeurs **réelles** (Hz, ms, dB) ; `song.json`, les presets et les messages
+  moteur transportent des valeurs **normalisées 0..1**. La conversion se fait
+  via la curve (`normalize`/`denormalize`) : l'UI et les outils affichent le
+  réel, le disque et le fil restent normalisés. Cas particulier `Db` :
+  `min`/`max` sont en dB mais `denormalize` renvoie un **gain linéaire**.
 - Lissage dans le nœud : rampe linéaire 10 ms pour les gains, filtre 1 pôle
   pour le reste. `set_param` pose une cible, jamais la valeur courante.
 

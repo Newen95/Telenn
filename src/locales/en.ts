@@ -14,7 +14,6 @@ export default {
     edit: "Edit",
     view: "View",
     exportWav: "Export as WAV",
-    exported: "Export done",
     reloadProject: "Reload project",
     undo: "Undo",
     redo: "Redo",
@@ -37,4 +36,14 @@ export default {
     replaceInstrument: "Change instrument",
   },
   timeline: { addTrack: "Add a track" },
+  empty: {
+    noTracks: "No tracks — click + or drop an instrument here",
+    pianoRoll: "Create or select a track to edit its notes",
+    chain: "Create a track in the timeline to show its chain",
+  },
+  toast: {
+    exported: "WAV export done",
+    actionFailed: "The action failed",
+    projectError: "Invalid song.json — the project was not reloaded",
+  },
 };

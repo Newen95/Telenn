@@ -29,6 +29,8 @@ export const theme = {
     accent: "#c8873a",
     accentBright: "#e8a34c",
     accentDim: "rgba(200, 135, 58, 0.15)",
+    /** Luminous copper light — what the playhead is sounding right now. */
+    glow: "#ffb54d",
     /** Signal colors (semantic, identical everywhere). */
     sigNotes: "#8f7ad6",
     sigAudio: "#4fa8a0",
@@ -56,7 +58,7 @@ export const theme = {
     keyWhite: "#ddd8ce",
     keyBlack: "#1a2027",
     keyRow: "#0e1216",
-    keyLabel: "#5f6b76",
+    keyLabel: "#454f5a", // dark slate: printed on the cream C keycaps
     gutterEdge: "#0a0d10",
   },
   radius: { xs: "2px", sm: "4px", md: "6px", lg: "10px" },
@@ -66,9 +68,22 @@ export const theme = {
     body: "'Inter Variable', system-ui, sans-serif",
     mono: "'JetBrains Mono Variable', ui-monospace, 'Cascadia Mono', monospace",
   },
+  /** One elevation ladder: the more transient a thing, the higher it floats.
+   *  well (recessed matter) < panels (flat tray) < raised (graspable object)
+   *  < chrome (top bar) < overlay (anchored floater) < held (in hand). */
   shadow: {
-    raised: "0 2px 8px rgba(0, 0, 0, 0.35)",
+    /** Objects sitting on a panel (chain cards…) — barely lifted, graspable:
+     *  a short shadow underneath plus the light catching their top face. */
+    raised: "0 1px 3px rgba(0, 0, 0, 0.3), inset 0 1px 0 rgba(232, 228, 220, 0.06)",
+    /** Global chrome (the top bar): one step in front of the zones. */
+    chrome: "0 2px 6px rgba(0, 0, 0, 0.35)",
+    /** Anchored floaters: menus, popovers, toasts, sheets. */
     overlay: "0 8px 32px rgba(0, 0, 0, 0.55)",
+    /** The dragged ghost — the highest thing in the app. */
+    held: "0 10px 24px rgba(0, 0, 0, 0.5)",
+    /** Inset — cast on the recessed note canvases by the panels in front:
+     *  dominant at the top (light falls from above), softer all around. */
+    well: "inset 0 3px 8px -2px rgba(0, 0, 0, 0.42), inset 0 0 12px 2px rgba(0, 0, 0, 0.32)",
   },
 } as const;
 

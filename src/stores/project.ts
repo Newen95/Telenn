@@ -115,8 +115,10 @@ export const useProjectStore = defineStore("project", () => {
   // Notes flashing after an external reload: note id → flash start (ms). Plain
   // (non-reactive) — the canvas polls it each frame via `noteFlash`/`anyFlash`.
   const flashStart = new Map<string, number>();
-  /** Latest external-edit error, if the changed file failed to parse. */
-  const lastError = ref<string | null>(null);
+  /** Latest external-edit error, if the changed file failed to parse. `seq`
+   *  bumps on every occurrence, so saving the same broken file twice still
+   *  notifies watchers (the text alone would compare equal). */
+  const lastError = ref<{ text: string; seq: number } | null>(null);
 
   /** Register the file-watcher listeners: external reloads refresh the view and
    *  flash the notes that changed; a parse error is surfaced, no reload. */
@@ -129,7 +131,7 @@ export const useProjectStore = defineStore("project", () => {
       lastError.value = null;
     });
     await listen<string>("project_error", (e) => {
-      lastError.value = e.payload;
+      lastError.value = { text: e.payload, seq: (lastError.value?.seq ?? 0) + 1 };
     });
   }
 
@@ -275,15 +277,40 @@ export const useProjectStore = defineStore("project", () => {
     await load();
   }
 
+  /** Optimistically place `node` in `trackId`'s chain at the backend's index
+   *  rule (effects region only, clamped), so a drop lands in its final layout
+   *  on the very frame of the release — no post-reload catch-up movement. */
+  function spliceIntoChain(trackId: string, index: number, node: ChainNodeView): void {
+    const track = tracks.value.find((t) => t.id === trackId);
+    if (!track) return;
+    const pos = Math.min(Math.max(index, 1), track.chain.length);
+    track.chain.splice(pos, 0, node);
+  }
+
   /** Move an effect to a chain at `index`, keeping its id (its tail follows). */
   async function moveNode(id: string, toTrack: string, index: number): Promise<void> {
+    // Mirror of the backend's move: remove first, shift the target left when
+    // the removal happened before it in the same chain.
+    const src = tracks.value.find((t) => t.chain.some((n) => n.id === id));
+    if (src) {
+      const from = src.chain.findIndex((n) => n.id === id);
+      if (from > 0) {
+        const [node] = src.chain.splice(from, 1);
+        spliceIntoChain(toTrack, src.id === toTrack && from < index ? index - 1 : index, node);
+      }
+    }
     await invoke("node_move_to", { id, toTrack, index });
     await load();
   }
 
   /** Copy an effect into a chain at `index` under a fresh id. */
   async function copyNode(id: string, toTrack: string, index: number): Promise<void> {
-    await invoke("node_copy", { id, newId: freshNodeId(), toTrack, index });
+    const newId = freshNodeId();
+    const original = tracks.value.flatMap((t) => t.chain).find((n) => n.id === id);
+    if (original) {
+      spliceIntoChain(toTrack, index, { ...original, id: newId, flatIndex: -1 });
+    }
+    await invoke("node_copy", { id, newId, toTrack, index });
     await load();
   }
 
@@ -294,7 +321,10 @@ export const useProjectStore = defineStore("project", () => {
     module: string,
     params: Record<string, number> = {},
   ): Promise<void> {
-    await invoke("node_insert", { trackId, index, module, id: freshNodeId(), params });
+    const id = freshNodeId();
+    // flatIndex -1 = no meter yet; the reload assigns the real one.
+    spliceIntoChain(trackId, index, { id, module, isInstrument: false, flatIndex: -1, params });
+    await invoke("node_insert", { trackId, index, module, id, params });
     await load();
   }
 

@@ -15,7 +15,7 @@ import { GUTTER_WIDTH, type TimeAxis } from "../canvas/timeAxis";
 import { usePreviewVoices } from "../canvas/previewVoices";
 import { projectHues, theme } from "../../styles/theme";
 
-const LANE_HEIGHT = 10;
+const LANE_HEIGHT = 12;
 const PITCHES = 128;
 /** Audio echo length when a note is created or auditioned, in milliseconds. */
 const ECHO_MS = 150;

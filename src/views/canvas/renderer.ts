@@ -73,7 +73,11 @@ export type GutterStyle = KeyGutter | LabelGutter;
 // is one language everywhere: what you hold turns into a light ghost, where it
 // lands lights up copper.
 const BG = theme.color.bg;
-const ACTIVE_LANE = "rgba(232, 228, 220, 0.16)"; // gentle lift of the active track's row
+// The active track's band: a faint warm wash held between two copper
+// hairlines. An edge reads as a marker where a neutral veil could pass for
+// the track's own color — and it stays in the copper language of "active".
+const ACTIVE_WASH = withAlpha(theme.color.accent, 0.08);
+const ACTIVE_EDGE = withAlpha(theme.color.accentBright, 0.6);
 const LANE_LINE = theme.canvas.laneLine;
 const BEAT_LINE = theme.canvas.beatLine;
 const BAR_LINE = theme.canvas.barLine;
@@ -84,6 +88,10 @@ const LANDING = theme.color.accentBright; // where a dragged thing will land
 const FLASH = theme.color.sigMod; // externally-edited notes pulse in signal amber
 const GHOST_FILL = "rgba(232, 228, 220, 0.35)";
 const GHOST_ROW = "rgba(232, 228, 220, 0.14)"; // a whole row held during a reorder
+// A block under the running playhead reads as lit by warm yellow light — the
+// playhead's warmth spreads to what it is sounding, not a neutral white flash.
+const SOUNDING = withAlpha(theme.color.glow, 0.7);
+const SOUNDING_GLOW = theme.color.glow;
 const GUTTER_BG = theme.color.bg;
 const GUTTER_WHITE = theme.canvas.keyWhite;
 const GUTTER_BLACK = theme.canvas.keyBlack;
@@ -110,6 +118,8 @@ export function draw(
   activeLane?: number,
   /** In-progress gutter reorder: dims `from` and marks the insertion at `to`. */
   gutterDrag?: { from: number; to: number } | null,
+  /** Transport running: blocks under the playhead light up as they sound. */
+  playing?: boolean,
 ): void {
   ctx.fillStyle = BG;
   ctx.fillRect(0, 0, w, h);
@@ -149,17 +159,42 @@ export function draw(
       ctx.fillStyle = withAlpha(b.color, 0.24);
       ctx.fillRect(x, y, rw, vp.laneHeight);
       if (b.marks && vp.laneHeight >= 14) {
-        ctx.fillStyle = b.color;
         const innerH = vp.laneHeight - 8;
         for (const m of b.marks) {
           const mx = x + m.t * bw;
           const mw = Math.max(m.len * bw - 1, 1.5);
-          ctx.fillRect(mx, y + 4 + m.y * (innerH - 2), mw, 2);
+          const my = y + 4 + m.y * (innerH - 2);
+          ctx.fillStyle = b.color;
+          ctx.fillRect(mx, my, mw, 2);
+          // A mark the running playhead is crossing lights up (state-driven:
+          // it is sounding right now). Same geometry with a tight halo — at
+          // this scale a size change would read as a deformation.
+          if (playing) {
+            const ms = b.startTick + m.t * b.lenTick;
+            if (playheadTick >= ms && playheadTick < ms + m.len * b.lenTick) {
+              ctx.save();
+              ctx.shadowColor = SOUNDING_GLOW;
+              ctx.shadowBlur = 3;
+              ctx.fillStyle = SOUNDING;
+              ctx.fillRect(mx, my, mw, 2);
+              ctx.restore();
+            }
+          }
         }
       }
     } else {
       ctx.fillStyle = b.color;
       ctx.fillRect(x, y + 1, rw, vp.laneHeight - 2);
+      // A sounding note lights up: a yellow-lit core and a soft halo around it
+      // (the glow pass fills with the light color so the halo is truly bright).
+      if (playing && playheadTick >= b.startTick && playheadTick < b.startTick + b.lenTick) {
+        ctx.save();
+        ctx.shadowColor = SOUNDING_GLOW;
+        ctx.shadowBlur = 6;
+        ctx.fillStyle = SOUNDING;
+        ctx.fillRect(x, y + 1, rw, vp.laneHeight - 2);
+        ctx.restore();
+      }
     }
     // A note changed by an external reload pulses, fading over its flash window.
     const a = flash ? flash(b.ref) : 0;
@@ -180,12 +215,23 @@ export function draw(
   }
 
   // The active track's whole band reads as selected, whatever selected it.
-  // Drawn OVER the blocks: a lane fully covered by clips still visibly lifts.
+  // Drawn OVER the blocks: a lane fully covered by clips still visibly marks.
   if (activeLane !== undefined && activeLane >= 0) {
     const y = laneToY(vp, activeLane);
     if (y + vp.laneHeight >= 0 && y <= h) {
-      ctx.fillStyle = ACTIVE_LANE;
+      ctx.fillStyle = ACTIVE_WASH;
       ctx.fillRect(0, y, w, vp.laneHeight);
+      ctx.strokeStyle = ACTIVE_EDGE;
+      ctx.lineWidth = 1.5;
+      const yt = Math.round(y) + 0.75;
+      const yb = Math.round(y + vp.laneHeight) - 0.75;
+      ctx.beginPath();
+      ctx.moveTo(0, yt);
+      ctx.lineTo(w, yt);
+      ctx.moveTo(0, yb);
+      ctx.lineTo(w, yb);
+      ctx.stroke();
+      ctx.lineWidth = 1;
     }
   }
 
@@ -361,8 +407,6 @@ function drawGutter(
 
   const first = Math.max(0, yToLane(vp, 0));
   const last = Math.min(laneCount - 1, yToLane(vp, h));
-  ctx.textBaseline = "middle";
-  ctx.font = "10px sans-serif";
   for (let lane = first; lane <= last; lane += 1) {
     const key = gutter.lane(lane);
     const y = laneToY(vp, lane);
@@ -371,11 +415,21 @@ function drawGutter(
     ctx.fillRect(0, y, gw, vp.laneHeight);
     ctx.fillStyle = key.lit ? GUTTER_LIT : key.dark ? GUTTER_BLACK : GUTTER_WHITE;
     ctx.fillRect(0, y + 1, gw - 1, vp.laneHeight - 1);
-    if (key.label) {
-      ctx.fillStyle = GUTTER_LABEL;
-      ctx.fillText(key.label, 4, y + vp.laneHeight / 2 + 0.5);
-    }
   }
+
+  // Octave labels in a second pass: a keycap painted after its neighbour would
+  // otherwise clip the label's glyphs (rows are barely taller than the font).
+  ctx.textBaseline = "middle";
+  ctx.textAlign = "right";
+  ctx.font = `600 9px ${theme.font.mono}`;
+  ctx.fillStyle = GUTTER_LABEL;
+  for (let lane = first; lane <= last; lane += 1) {
+    const key = gutter.lane(lane);
+    if (!key.label) continue;
+    const y = laneToY(vp, lane);
+    ctx.fillText(key.label, gw - 5, y + vp.laneHeight / 2 + 0.5);
+  }
+  ctx.textAlign = "left";
 
   gutterEdge(ctx, h, gw);
 }

@@ -9,6 +9,8 @@
 
 body {
   margin: 0;
+  /* App shell: the zones scroll, the page itself never does. */
+  overflow: hidden;
 }
 
 :root {
@@ -41,6 +43,55 @@ select {
 
 ::selection {
   background: var(--accent-dim);
+}
+
+/* App chrome is not a document: a stray drag or Ctrl+A must not smear a text
+   selection across the labels. Real text entry stays selectable. */
+body {
+  user-select: none;
+}
+
+input,
+textarea {
+  user-select: text;
+}
+
+/* Chromium scrollbars, dressed to the slate palette: a slim thumb on an
+   invisible track, warming to copper under the pointer. */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border: 3px solid transparent;
+  background-clip: padding-box;
+  border-radius: 5px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background-color: var(--accent);
+}
+
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* Empty states: a quiet, centered invitation (shared by every zone). */
+.empty-state {
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+  color: var(--text-3);
+  font-size: 0.8rem;
+  text-align: center;
 }
 
 /* App-wide drag behavior (crosses component boundaries, so it lives here).

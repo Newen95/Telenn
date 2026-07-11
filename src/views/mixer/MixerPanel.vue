@@ -81,6 +81,8 @@ onUnmounted(() => cancelAnimationFrame(raf));
       :class="{ active: track.id === ui.activeTrackId }"
       @pointerdown="ui.activeTrackId = track.id"
     >
+      <!-- Underlined name: the one way a track is named everywhere (piano
+           roll header, chain header, here). -->
       <span class="strip-name" :style="{ borderColor: hues.get(track.id) }">
         {{ track.name || track.id }}
       </span>
@@ -155,6 +157,8 @@ onUnmounted(() => cancelAnimationFrame(raf));
   border-radius: var(--radius-md);
   background: var(--surface);
   cursor: pointer;
+  /* Same elevation as the chain cards: a graspable object on the tray. */
+  box-shadow: var(--shadow-raised);
   transition: border-color var(--t-fast);
 }
 
@@ -174,7 +178,8 @@ onUnmounted(() => cancelAnimationFrame(raf));
   color: var(--text-2);
   text-transform: uppercase;
   letter-spacing: 0.04em;
-  border-bottom: 2px solid transparent; /* colored per track inline */
+  border-bottom: 3px solid transparent; /* colored per track inline */
+  border-radius: 0 0 3px 3px; /* rounds the underline's ends */
   max-width: 5.5rem;
   overflow: hidden;
   text-overflow: ellipsis;

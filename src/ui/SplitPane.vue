@@ -107,8 +107,15 @@ const paneStyle = computed(() =>
   overflow: hidden;
 }
 
+/* Folding/unfolding a zone animates its pane; a live splitter drag must track
+   the pointer 1:1, so the transition is cut while dragging. */
 .pane.sized {
   flex: none;
+  transition: width var(--t-med) ease, height var(--t-med) ease;
+}
+
+.dragging > .pane.sized {
+  transition: none;
 }
 
 /* The handle: a hairline that widens its hit area with padding and lights up

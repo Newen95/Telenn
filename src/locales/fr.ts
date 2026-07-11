@@ -14,7 +14,6 @@ export default {
     edit: "Édition",
     view: "Affichage",
     exportWav: "Exporter en WAV",
-    exported: "Export terminé",
     reloadProject: "Recharger le projet",
     undo: "Annuler",
     redo: "Rétablir",
@@ -37,4 +36,14 @@ export default {
     replaceInstrument: "Changer d'instrument",
   },
   timeline: { addTrack: "Ajouter une piste" },
+  empty: {
+    noTracks: "Aucune piste — cliquez sur + ou déposez un instrument ici",
+    pianoRoll: "Créez ou sélectionnez une piste pour éditer ses notes",
+    chain: "Créez une piste dans la timeline pour afficher sa chaîne",
+  },
+  toast: {
+    exported: "Export WAV terminé",
+    actionFailed: "L'action a échoué",
+    projectError: "song.json invalide — le projet n'a pas été rechargé",
+  },
 };

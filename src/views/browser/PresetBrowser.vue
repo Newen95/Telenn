@@ -228,6 +228,8 @@ function dragPreset(e: PointerEvent, p: NamedPreset): void {
   font-size: 0.85rem;
   cursor: grab;
   user-select: none;
+  /* Same elevation as the chain cards: a graspable object on the tray. */
+  box-shadow: var(--shadow-raised);
   transition: background-color var(--t-fast), border-color var(--t-fast);
 }
 

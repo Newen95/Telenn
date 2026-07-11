@@ -11,12 +11,14 @@ import MasterMeter from "./MasterMeter.vue";
 import Icon from "../../ui/Icon.vue";
 import { useProjectStore } from "../../stores/project";
 import { useTelemetryStore } from "../../stores/telemetry";
+import { useToastStore } from "../../stores/toasts";
 import { useUiStore } from "../../stores/ui";
 import { DEMO_PATH, EXPORT_PATH } from "../../projectPaths";
 
 const { t, locale } = useI18n();
 const project = useProjectStore();
 const telemetry = useTelemetryStore();
+const toasts = useToastStore();
 const ui = useUiStore();
 
 // --- Menus ---
@@ -46,22 +48,21 @@ function onWindowKey(e: KeyboardEvent): void {
   if (e.key === "Escape") closeMenus();
 }
 
-const statusMsg = ref("");
-
+/** Run a menu action; the outcome surfaces as a toast (never a silent failure). */
 async function run(action: () => Promise<void>, done = ""): Promise<void> {
   closeMenus();
   try {
     await action();
-    statusMsg.value = done;
+    if (done) toasts.push("ok", done);
   } catch (e) {
-    statusMsg.value = String(e);
+    toasts.push("error", t("toast.actionFailed"), String(e));
   }
 }
 
 const exportWav = () =>
   run(
     () => invoke("export_wav", { projectPath: DEMO_PATH, outPath: EXPORT_PATH }),
-    t("menu.exported"),
+    t("toast.exported"),
   );
 const reloadProject = () => run(() => invoke("load_project", { path: DEMO_PATH }));
 const editUndo = () =>
@@ -207,7 +208,6 @@ onUnmounted(() => {
           </button>
         </div>
       </div>
-      <span v-if="statusMsg" class="status">{{ statusMsg }}</span>
     </nav>
 
     <!-- Transport (always centered) -->
@@ -250,7 +250,8 @@ onUnmounted(() => {
     <div class="health">
       <MasterMeter />
       <span class="engine-load num" :class="{ hot: cpuHot }">
-        {{ t("meter.cpu") }} {{ cpuPercent }}% · {{ t("meter.xruns") }} {{ telemetry.xruns }}
+        {{ t("meter.cpu") }} <span class="pct">{{ cpuPercent }}%</span> · {{ t("meter.xruns") }}
+        {{ telemetry.xruns }}
       </span>
     </div>
   </header>
@@ -265,6 +266,11 @@ onUnmounted(() => {
   padding: 0.3rem 0.8rem;
   background: var(--panel);
   border-bottom: 1px solid var(--border);
+  /* Global chrome, one step in front of the zones: its shadow falls on them.
+     Positioned above its siblings so the shadow is not painted over. */
+  position: relative;
+  z-index: 10;
+  box-shadow: var(--shadow-chrome);
 }
 
 /* --- Menus --- */
@@ -352,15 +358,6 @@ onUnmounted(() => {
   background: var(--border);
 }
 
-.status {
-  margin-left: 0.5rem;
-  font-size: 0.72rem;
-  color: var(--text-3);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
 /* --- Transport --- */
 .transport {
   display: flex;
@@ -415,6 +412,14 @@ onUnmounted(() => {
 .engine-load {
   font-size: 0.72rem;
   color: var(--text-2);
+}
+
+/* The percentage owns its worst-case width ("100%", mono): a digit appearing
+   shifts neither the master meter on its left nor the xruns on its right. */
+.pct {
+  display: inline-block;
+  min-width: 4ch;
+  text-align: right;
 }
 
 .engine-load.hot {

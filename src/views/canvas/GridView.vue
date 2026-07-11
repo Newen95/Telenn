@@ -159,6 +159,7 @@ function frame(ctx: CanvasRenderingContext2D, w: number, h: number): void {
     flash,
     props.activeLane,
     gutterReorder,
+    telemetry.playing,
   );
 }
 

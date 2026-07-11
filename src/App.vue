@@ -12,16 +12,20 @@ import MixerPanel from "./views/mixer/MixerPanel.vue";
 import DevOverlay from "./views/dev/DevOverlay.vue";
 import SplitPane from "./ui/SplitPane.vue";
 import Icon from "./ui/Icon.vue";
-import { useTimeAxis } from "./views/canvas/timeAxis";
+import ToastHost from "./ui/ToastHost.vue";
+import { GUTTER_WIDTH, useTimeAxis } from "./views/canvas/timeAxis";
 import { useChainDrag, type DropIntent, type DropTarget } from "./views/chain/dragdrop";
 import { useProjectStore } from "./stores/project";
 import { useTelemetryStore } from "./stores/telemetry";
+import { useToastStore } from "./stores/toasts";
 import { useUiStore } from "./stores/ui";
 import { BOUNDS } from "./stores/uiLayout";
+import { projectHues } from "./styles/theme";
 
 const { t } = useI18n();
 const project = useProjectStore();
 const telemetry = useTelemetryStore();
+const toasts = useToastStore();
 const ui = useUiStore();
 ui.init(); // restore the saved zone layout before first paint
 
@@ -34,6 +38,10 @@ const activeTrackName = computed(() => {
   return track ? track.name || track.id : "";
 });
 
+/** The active track's hue: shown next to its name so the piano roll header
+ *  reads as "this track", the same color language as timeline/chain/mixer. */
+const activeTrackHue = computed(() => projectHues(project.tracks).get(ui.activeTrackId));
+
 // The active track always points at a real track: default to the first, and
 // fall back when the selected one disappears (removal, external reload).
 watch(
@@ -44,6 +52,15 @@ watch(
     }
   },
   { deep: false },
+);
+
+// An external edit that failed to parse would otherwise be invisible: the file
+// changed but the app kept playing the previous version. Surface it.
+watch(
+  () => project.lastError,
+  (err) => {
+    if (err) toasts.push("error", t("toast.projectError"), err.text);
+  },
 );
 
 /** Width of a collapsed zone's rail (chevron + vertical label). */
@@ -266,7 +283,7 @@ onUnmounted(() => {
               <template #a>
                 <section class="zone">
                   <h2 class="zone-title padded">{{ t("view.timeline") }}</h2>
-                  <div class="zone-fill">
+                  <div class="zone-fill well" :style="{ '--well-left': `${GUTTER_WIDTH}px` }">
                     <TimelineCanvas :axis="timeAxis" />
                   </div>
                 </section>
@@ -275,16 +292,21 @@ onUnmounted(() => {
                 <section class="zone">
                   <header class="zone-head row">
                     <h2 class="zone-title">{{ t("view.pianoRoll") }}</h2>
-                    <span class="active-track">{{ activeTrackName }}</span>
+                    <span v-if="activeTrackName" class="track-tag">
+                      <span class="active-track" :style="{ borderColor: activeTrackHue }">
+                        {{ activeTrackName }}
+                      </span>
+                    </span>
                     <span class="hint">{{ t("edit.hints") }}</span>
                   </header>
-                  <div class="zone-fill">
+                  <div class="zone-fill well" :style="{ '--well-left': `${GUTTER_WIDTH}px` }">
                     <PianoRollCanvas
                       v-if="ui.activeTrackId"
                       :key="ui.activeTrackId"
                       :track-id="ui.activeTrackId"
                       :axis="timeAxis"
                     />
+                    <div v-else class="empty-state">{{ t("empty.pianoRoll") }}</div>
                   </div>
                 </section>
               </template>
@@ -336,6 +358,7 @@ onUnmounted(() => {
     </SplitPane>
 
     <DevOverlay v-if="ui.layout.devOpen" @close="ui.toggleDev()" />
+    <ToastHost />
   </div>
 </template>
 
@@ -386,9 +409,35 @@ onUnmounted(() => {
   padding-left: 0.8rem;
 }
 
+/* The row right under the top bar (browser head, timeline title) keeps a
+   little air between the bar's shadow and its text — padded on the titles
+   themselves so both texts sit at exactly the same height. */
+.browser-zone .zone-title,
+.zone-title.padded {
+  padding-top: 0.55rem;
+}
+
 .zone-fill {
   flex: 1;
   min-height: 0;
+}
+
+/* Depth: the two note canvases (timeline + piano roll) read as ONE recessed
+   plane behind the tooling — same deepest background, same inset shadow cast
+   by the panels "in front". The left gutters (piano keys, track names) are
+   tooling too: the well starts at their right edge, so its shaded left flank
+   makes them overhang the canvas. Painted by an overlay pseudo-element
+   because the canvas child would cover a shadow set on the container itself. */
+.zone-fill.well {
+  position: relative;
+}
+
+.zone-fill.well::after {
+  content: "";
+  position: absolute;
+  inset: 0 0 0 var(--well-left, 0px);
+  pointer-events: none;
+  box-shadow: var(--shadow-well);
 }
 
 .zone-body {
@@ -414,13 +463,20 @@ onUnmounted(() => {
 
 .zone-toggle.end {
   margin-left: auto;
+  margin-right: 0.4rem;
+}
+
+/* The fold chevron turns as the zone folds/unfolds, in step with the pane. */
+.zone-toggle svg {
+  transition: transform var(--t-med);
 }
 
 .flip {
   transform: rotate(180deg);
 }
 
-/* Collapsed browser: a slim rail with a vertical label that reopens it. */
+/* Collapsed browser: a slim rail with a vertical label that reopens it. Same
+   type treatment as every zone title (.zone-title), only rotated. */
 .rail-label {
   flex: 1;
   border: none;
@@ -428,10 +484,10 @@ onUnmounted(() => {
   padding: 0.6rem 0;
   color: var(--text-2);
   font-family: var(--font-display);
-  font-size: 0.65rem;
+  font-size: 0.7rem;
   font-weight: 600;
   text-transform: uppercase;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.05em;
   writing-mode: vertical-rl;
   cursor: pointer;
   transition: color var(--t-fast);
@@ -455,11 +511,27 @@ onUnmounted(() => {
   text-overflow: ellipsis;
 }
 
+/* The active track's tag: hue chip + name, the same language as the chain
+   header — visually distinct from the muted zone title beside it. */
+.track-tag {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding-left: 0.4rem;
+  border-left: 1px solid var(--border);
+}
+
 .active-track {
+  font-family: var(--font-display);
   font-size: 0.75rem;
+  font-weight: 600;
   color: var(--text);
   text-transform: uppercase;
   letter-spacing: 0.04em;
+  /* Rounded underline: a border can't round alone, so the color rides the
+     bottom 3px of the box as a pill-shaped stripe. Colored per track inline. */
+  border-bottom: 3px solid transparent;
+  border-radius: 0 0 3px 3px;
 }
 
 /* Bottom zone tabs: the bar itself stays when the zone is collapsed. */

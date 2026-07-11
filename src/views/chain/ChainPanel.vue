@@ -5,10 +5,11 @@
 // selecting it first). The header navigates between tracks; the overview of all
 // tracks is the mixer's job.
 
-import { computed, reactive, ref, watchEffect } from "vue";
+import { computed, nextTick, reactive, ref, watch, watchEffect } from "vue";
 import { useI18n } from "vue-i18n";
 
 import { useProjectStore, type ChainNodeView, type ModuleDesc, type ParamInfo } from "../../stores/project";
+import { useTelemetryStore } from "../../stores/telemetry";
 import { useUiStore } from "../../stores/ui";
 import { projectHues } from "../../styles/theme";
 import { useChainDrag, type DropTarget } from "./dragdrop";
@@ -19,8 +20,18 @@ import InstrumentMenu from "../../ui/InstrumentMenu.vue";
 
 const { t } = useI18n();
 const project = useProjectStore();
+const telemetry = useTelemetryStore();
 const ui = useUiStore();
 const drag = useChainDrag();
+
+/** Signal intensity (0..1) on the wire AFTER chain node `index`: the node's
+ *  live output level, so each wire shows what actually flows at that point.
+ *  Square root lifts quiet material into the visible range. */
+function wireLevel(chain: ChainNodeView[], index: number): number {
+  const node = chain[index];
+  if (!node) return 0;
+  return Math.min(1, Math.sqrt(telemetry.meterAt(node.flatIndex).peak));
+}
 
 // The displayed track: the active one, falling back to the first so the panel
 // never goes blank when a selection points at a removed track.
@@ -40,8 +51,17 @@ function step(dir: number): void {
   ui.activeTrackId = project.tracks[next].id;
 }
 
-// Click the instrument card → picker replacing the track's instrument.
+// Click the instrument card → picker replacing the track's instrument. The
+// menu is position: fixed, anchored under the card at click time: an absolute
+// popover would be clipped by the chain's own scroll containers.
 const replacing = ref(false);
+const replaceAt = ref({ x: 0, y: 0 });
+
+function toggleReplace(e: MouseEvent): void {
+  const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+  replaceAt.value = { x: rect.left, y: rect.bottom + 4 };
+  replacing.value = !replacing.value;
+}
 
 async function replaceInstrument(m: ModuleDesc): Promise<void> {
   replacing.value = false;
@@ -58,6 +78,26 @@ const draggingInstrument = computed(() => {
 // Node selection: a selected node carries the focus, so Delete/Ctrl+D act on it
 // and only when the chain (not a text field or the piano roll) owns the focus.
 const sel = reactive(new ChainSelection());
+
+// FLIP move transitions guide removals, but the end of a drag must land with
+// zero motion: the in-place preview already showed the final layout, and the
+// lifted card (display: none, so a 0×0 old rect) would otherwise FLIP in from
+// the panel's corner. `flush: sync` so the flag flips before the drop's patch;
+// a starting node drag also drops its selection (the held card travels folded).
+const flip = ref(true);
+watch(
+  () => drag.state.source,
+  (s, old) => {
+    if (s?.kind === "node" && sel.selected === s.nodeId) sel.clear();
+    if (old && !s) {
+      flip.value = false;
+      void nextTick(() => {
+        flip.value = true;
+      });
+    }
+  },
+  { flush: "sync" },
+);
 
 // Param specs (name, unit, default) per module id, fetched once and reused by
 // every effect of that module. Ranges/curves stay declared in the module.
@@ -134,6 +174,13 @@ function onBeforeLeave(el: Element): void {
   e.style.width = `${e.offsetWidth}px`;
 }
 
+/** True while `nodeId` is the node being dragged: its card leaves the row —
+ *  what you hold is in your hand, and the preview shows where it lands. */
+function lifting(nodeId: string): boolean {
+  const s = drag.state.source;
+  return s?.kind === "node" && s.nodeId === nodeId;
+}
+
 /** True while this target is the one under the pointer (it lights up). */
 function isOver(target: DropTarget): boolean {
   const h = drag.state.hovered;
@@ -194,8 +241,9 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
         <button type="button" class="nav" :title="t('chain.prevTrack')" @click="step(-1)">
           <Icon name="chevron-left" :size="13" />
         </button>
-        <span class="chip" :style="{ background: hues.get(track.id) }"></span>
-        <span class="chain-track-name">{{ track.name || track.id }}</span>
+        <span class="chain-track-name" :style="{ borderColor: hues.get(track.id) }">
+          {{ track.name || track.id }}
+        </span>
         <button type="button" class="nav" :title="t('chain.nextTrack')" @click="step(1)">
           <Icon name="chevron-right" :size="13" />
         </button>
@@ -210,17 +258,41 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
         class="chain"
         data-chain
         :data-track="track.id"
+        :move-class="flip ? 'chain-move' : 'chain-move-off'"
         @before-leave="onBeforeLeave"
       >
-        <div v-for="(node, i) in track.chain" :key="node.id" class="chain-item">
+        <div
+          v-for="(node, i) in track.chain"
+          :key="node.id"
+          class="chain-item"
+          :class="{ lifted: lifting(node.id) }"
+        >
           <!-- A drop gap precedes every effect (none before the instrument). -->
           <span
             v-if="!node.isInstrument"
             class="gap"
             :class="{ over: isOver({ kind: 'gap', trackId: track.id, index: i }) }"
+            :style="{ '--sig': wireLevel(track.chain, i - 1) }"
             data-gap
             :data-track="track.id"
             :data-index="i"
+          ></span>
+          <!-- In-place drop preview: the dragged effect already sitting where it
+               will land — release = exactly this. -->
+          <div
+            v-if="ghost && isOver({ kind: 'gap', trackId: track.id, index: i })"
+            class="node preview"
+          >
+            <div class="node-head">
+              <span class="node-name">{{ ghost.module }}</span>
+              <!-- Silent meter: the preview is exactly as wide as the landed card. -->
+              <NodeMeter :index="-1" :size="20" />
+            </div>
+          </div>
+          <!-- The preview's outgoing wire: the ghost is plugged in, not floating. -->
+          <span
+            v-if="ghost && isOver({ kind: 'gap', trackId: track.id, index: i })"
+            class="ghost-wire"
           ></span>
           <div
             class="node"
@@ -234,14 +306,17 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
             :tabindex="node.isInstrument ? undefined : 0"
             :title="node.isInstrument ? t('chain.replaceInstrument') : undefined"
             @pointerdown="onNodePointerDown($event, track.id, node, i)"
-            @click="node.isInstrument && (replacing = !replacing)"
+            @click="node.isInstrument && toggleReplace($event)"
             @keydown="onNodeKey($event, track.id, node, i)"
             @focusout="onNodeBlur($event, node.id)"
           >
             <div class="node-head">
               <span class="node-name">{{ node.module }}</span>
+              <!-- The instrument is a picker, not a draggable card: a select-like
+                   chevron says "click to change" (and, implicitly, "I don't move"). -->
+              <Icon v-if="node.isInstrument" class="swap-hint" name="chevron-down" :size="12" />
               <!-- Live VU from the audio thread (peak + RMS), mapped by flat index. -->
-              <NodeMeter :index="node.flatIndex" :size="22" />
+              <NodeMeter :index="node.flatIndex" :size="20" />
             </div>
             <!-- Params unfold *below* the header on selection, one labelled row
                  each (name — slider — real value), so the card grows down and its
@@ -272,29 +347,40 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
           <!-- Click the instrument card: pick its replacement. -->
           <InstrumentMenu
             v-if="node.isInstrument && replacing"
-            class="replace-menu"
+            :style="{ position: 'fixed', left: `${replaceAt.x}px`, top: `${replaceAt.y}px` }"
             @pick="replaceInstrument"
             @close="replacing = false"
           />
         </div>
         <!-- Trailing gap = append to the end of the chain. -->
-        <span
-          key="trailing"
-          class="gap"
-          :class="{ over: isOver({ kind: 'gap', trackId: track.id, index: track.chain.length }) }"
-          data-gap
-          :data-track="track.id"
-          :data-index="track.chain.length"
-        ></span>
+        <div key="trailing" class="chain-item">
+          <span
+            class="gap end"
+            :class="{ over: isOver({ kind: 'gap', trackId: track.id, index: track.chain.length }) }"
+            :style="{ '--sig': wireLevel(track.chain, track.chain.length - 1) }"
+            data-gap
+            :data-track="track.id"
+            :data-index="track.chain.length"
+          ></span>
+          <div
+            v-if="ghost && isOver({ kind: 'gap', trackId: track.id, index: track.chain.length })"
+            class="node preview"
+          >
+            <div class="node-head">
+              <span class="node-name">{{ ghost.module }}</span>
+              <NodeMeter :index="-1" :size="20" />
+            </div>
+          </div>
+        </div>
       </TransitionGroup>
       </div>
     </template>
+    <div v-else class="empty-state">{{ t("empty.chain") }}</div>
 
-    <!-- Drag ghost: a ~50% copy of the real card. Cards are compact (params show
-         only once selected), so the ghost is compact too — its footprint matches
-         the card as it will land: unselected, header only. -->
+    <!-- Drag ghost following the pointer — only away from the chain's gaps,
+         where the in-place preview above takes over (one ghost at a time). -->
     <div
-      v-if="ghost"
+      v-if="ghost && drag.state.hovered?.kind !== 'gap'"
       class="drag-ghost"
       :style="{ left: drag.state.x + 'px', top: drag.state.y + 'px' }"
     >
@@ -318,7 +404,7 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
   padding: 0.4rem 0.6rem;
   display: flex;
   flex-direction: column;
-  gap: 0.4rem;
+  gap: 0.65rem;
 }
 
 .chain-row {
@@ -336,13 +422,6 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
   gap: 0.3rem;
 }
 
-.chip {
-  width: 8px;
-  height: 8px;
-  border-radius: 2px;
-  flex: none;
-}
-
 .chain-track-name {
   font-family: var(--font-display);
   font-size: 0.78rem;
@@ -350,6 +429,8 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
   color: var(--text);
   text-transform: uppercase;
   letter-spacing: 0.04em;
+  border-bottom: 3px solid transparent; /* colored per track inline */
+  border-radius: 0 0 3px 3px; /* rounds the underline's ends */
 }
 
 .nav {
@@ -377,11 +458,6 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
   position: relative;
 }
 
-.replace-menu {
-  top: calc(100% + 4px);
-  left: 0;
-}
-
 .chain {
   display: flex;
   align-items: flex-start;
@@ -397,15 +473,18 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
 }
 
 /* One flex box per effect (its drop gap + its card), so a removal animates the
-   neighbours sliding into place via the FLIP `chain-move` transition below. */
+   neighbours sliding into place via the FLIP `chain-move` transition below.
+   Top-aligned: an unfolded (tall) card must not push the preview downward. */
 .chain-item {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
 }
 
 /* When a node is removed, the nodes to its right slide left into place (FLIP
    `move`). The removed node is pinned in place by `onBeforeLeave` and fades out
-   there — it never slides before vanishing. */
+   there — it never slides before vanishing. The end of a drag swaps this class
+   for `chain-move-off` (no rule on purpose: without a transform transition Vue
+   skips FLIP entirely), so a drop lands frozen where the preview stood. */
 .chain-move {
   transition: transform 120ms ease;
 }
@@ -424,10 +503,12 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
   flex-direction: column;
   align-items: stretch;
   gap: 0.3rem;
-  padding: 0.3rem 0.5rem;
+  padding: 0.45rem 0.65rem;
   border: 1px solid var(--border-strong);
   border-radius: 6px;
   background: var(--surface);
+  /* Barely lifted off the panel: a graspable object, not part of the tray. */
+  box-shadow: var(--shadow-raised);
   /* Plain arrow on hover/click: a press selects (the drag only arms past the
      threshold), so the card should not advertise a grab affordance at rest. */
   cursor: default;
@@ -450,9 +531,24 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
   background: color-mix(in srgb, var(--accent) 12%, var(--surface));
 }
 
+/* The instrument: the chain's head, another kind of thing than an effect. A
+   thick Notes-violet spine and a rounder left flank give it its own silhouette;
+   the pointer cursor + chevron advertise "click to replace" (never a drag). */
 .node.instrument {
   background: color-mix(in srgb, var(--sig-notes) 12%, var(--surface));
   border-color: color-mix(in srgb, var(--sig-notes) 45%, var(--border-strong));
+  border-left: 3px solid var(--sig-notes);
+  border-radius: 12px 6px 6px 12px;
+  cursor: pointer;
+}
+
+.swap-hint {
+  color: var(--text-3);
+  transition: color var(--t-fast);
+}
+
+.node.instrument:hover .swap-hint {
+  color: var(--text);
 }
 
 /* While an instrument is dragged, chain heads are the replace targets. */
@@ -474,7 +570,7 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
 }
 
 .node-name {
-  font-size: 0.85rem;
+  font-size: 0.9rem;
   color: var(--text);
   margin-right: auto;
 }
@@ -537,24 +633,85 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
   background: var(--accent);
 }
 
-/* Gaps are thin by default; they widen while a drag is active and the one under
-   the pointer opens the drop slot (pushing its neighbours apart). */
+/* Gaps carry the signal: each one shows the audio wire running card to card,
+   so the chain reads as a path, not a row of boxes — and a drop lands ON the
+   wire. The gap itself stays invisible even during a drag: the in-place
+   preview card is the one and only drop marker. */
 .gap {
-  width: 4px;
+  width: 14px;
   align-self: stretch;
   min-height: 1.8rem;
-  border-radius: 3px;
-  transition: width 120ms ease, background-color 120ms ease;
+  position: relative;
 }
 
-.chain-panel.dragging .gap {
-  width: 10px;
-  background: var(--border-strong);
+/* The wire: a teal (signal Audio) segment at the cards' header height. Its
+   brightness and halo follow --sig, the node's live output level — the wire
+   literally shows the signal flowing through it. */
+.gap::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 1rem;
+  height: 3px;
+  border-radius: 1.5px;
+  /* At full level the wire overshoots the base teal toward white-hot. */
+  background: color-mix(
+    in srgb,
+    color-mix(in srgb, var(--text) calc(var(--sig, 0) * 45%), var(--sig-audio)),
+    transparent calc(70% - var(--sig, 0) * 70%)
+  );
+  box-shadow: 0 0 calc(var(--sig, 0) * 10px) var(--sig-audio);
+  transition: background-color 90ms linear, box-shadow 90ms linear;
 }
 
-.chain-panel.dragging .gap.over {
-  width: 26px;
-  background: var(--accent-bright);
+/* The trailing gap's wire only exists while it feeds a previewed card. */
+.chain-panel.dragging .gap.end.over::before {
+  display: block;
+}
+
+/* Wire out of the previewed card, at the same resting level as real wires. */
+.ghost-wire {
+  flex: none;
+  align-self: flex-start;
+  margin-top: 1rem;
+  width: 14px;
+  height: 3px;
+  border-radius: 1.5px;
+  background: color-mix(in srgb, var(--sig-audio), transparent 70%);
+}
+
+/* The in-place preview: the card as it will land — unmistakably the held one:
+   copper-tinted fill, bright dashed outline and a soft copper glow. Inert to
+   the pointer so hit-testing keeps seeing the row beneath. */
+.node.preview {
+  border: 1px dashed var(--accent-bright);
+  background: color-mix(in srgb, var(--accent) 18%, var(--surface));
+  pointer-events: none;
+  animation: preview-in 120ms ease;
+}
+
+.node.preview .node-name {
+  color: var(--accent-bright);
+}
+
+/* The held node leaves the row entirely (its gap too): the chain reads as
+   "without it", the copper preview shows where it comes back. */
+.chain-item.lifted {
+  display: none;
+}
+
+@keyframes preview-in {
+  from {
+    opacity: 0;
+  }
+}
+
+
+/* End of the chain: no wire after the last card — the path just ends. The
+   trailing gap stays a drop target (it widens like any gap during a drag). */
+.gap.end::before {
+  display: none;
 }
 
 /* The ghost follows the pointer; ~50% opacity over the real card styling. */
@@ -568,7 +725,7 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
 
 .drag-ghost .node {
   cursor: grabbing;
-  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.45);
+  box-shadow: var(--shadow-held);
 }
 
 .ghost-copy {

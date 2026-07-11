@@ -25,6 +25,7 @@ defineProps<{ axis?: TimeAxis }>();
 const { t } = useI18n();
 const project = useProjectStore();
 const ui = useUiStore();
+const rootEl = ref<HTMLElement | null>(null);
 
 /** Collision-free display hue per track id (explicit colors first). */
 const hues = computed(() => projectHues(project.tracks));
@@ -144,19 +145,32 @@ const draggingInstrument = computed(() => {
 });
 const dropOver = computed(() => drag.state.hovered?.kind === "newTrack");
 
-// "+ track": picker anchored under the gutter, then select the new track.
+// "+ track": picker anchored under the button (position: fixed at click time —
+// an absolute popover would be clipped by the timeline pane), then select the
+// new track.
 const adding = ref(false);
+const addAt = ref({ x: 0, y: 0 });
+
+function toggleAdd(e: MouseEvent): void {
+  const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+  addAt.value = { x: rect.left, y: rect.bottom + 4 };
+  adding.value = !adding.value;
+}
 
 async function addTrack(m: ModuleDesc): Promise<void> {
   adding.value = false;
   await project.addTrack(m.id, m.name);
   const last = project.tracks[project.tracks.length - 1];
   if (last) ui.activeTrackId = last.id;
+  // The pick leaves the focus on the menu's remains: hand it to the grid so
+  // keyboard editing (Suppr = remove the new track) works right away.
+  rootEl.value?.querySelector("canvas")?.focus();
 }
 </script>
 
 <template>
   <div
+    ref="rootEl"
     class="timeline"
     :class="{ 'drop-target': draggingInstrument, over: dropOver }"
     data-new-track
@@ -173,11 +187,20 @@ async function addTrack(m: ModuleDesc): Promise<void> {
       :active-lane="activeLane"
       :on-delete-key="deleteActiveTrack"
     />
+    <!-- Inert invitation over the empty grid; the "+" button stays clickable. -->
+    <div v-if="project.tracks.length === 0" class="empty-state overlay">
+      {{ t("empty.noTracks") }}
+    </div>
     <div class="add-track" :style="{ top: `${project.tracks.length * LANE_HEIGHT + 4}px` }">
-      <button type="button" class="add-btn" :title="t('timeline.addTrack')" @click="adding = !adding">
+      <button type="button" class="add-btn" :title="t('timeline.addTrack')" @click="toggleAdd($event)">
         <Icon name="plus" :size="12" />
       </button>
-      <InstrumentMenu v-if="adding" class="menu" @pick="addTrack" @close="adding = false" />
+      <InstrumentMenu
+        v-if="adding"
+        :style="{ position: 'fixed', left: `${addAt.x}px`, top: `${addAt.y}px` }"
+        @pick="addTrack"
+        @close="adding = false"
+      />
     </div>
   </div>
 </template>
@@ -200,6 +223,12 @@ async function addTrack(m: ModuleDesc): Promise<void> {
 .timeline.over {
   outline-style: solid;
   outline-color: var(--accent-bright);
+}
+
+.empty-state.overlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
 }
 
 /* Pinned under the last track row, inside the gutter column. */
@@ -225,10 +254,5 @@ async function addTrack(m: ModuleDesc): Promise<void> {
 .add-btn:hover {
   color: var(--accent-bright);
   border-color: var(--accent);
-}
-
-.menu {
-  top: 24px;
-  left: 0;
 }
 </style>

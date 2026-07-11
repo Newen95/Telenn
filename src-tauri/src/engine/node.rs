@@ -47,8 +47,9 @@ pub enum ParamCurve {
 
 /// Declarative description of a parameter exposed by a module. Real values
 /// (Hz, dB, ms…) live in `min`/`max`/`default`; the wire carries normalized
-/// 0..1 values converted through `curve`.
-#[derive(Debug, Clone)]
+/// 0..1 values converted through `curve`. Serialized for the module catalog
+/// (`module_specs --json`).
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ParamSpec {
     pub id: ParamId,
     pub name: &'static str,

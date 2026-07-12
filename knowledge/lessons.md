@@ -4,6 +4,16 @@ Journal daté, du plus récent au plus ancien. Format : `## AAAA-MM-JJ — titre
 puis contexte, mesure (commande exacte), conclusion. Les impasses se
 consignent au même titre que les réussites.
 
+## 2026-07-12 — Cloche modale : le f0 mesuré ment (pitch virtuel)
+
+`render_probe --module modal --set material=2` sur A4 : YIN lit 48,8 Hz
+(clarté 0,89 !) alors que la cloche est frappée à 440 Hz — le cluster
+inharmonique (hum 0.56·f, prime, tierce 1.19·f…) n'a pas de fondamental
+physique et le tracker trouve un sous-harmonique commun. C'est le
+comportement des vraies cloches (pitch virtuel), pas un bug. Pour juger un
+son de cloche : mesurer les PARTIELS attendus (Goertzel à 0.56/1.19/1.56·f),
+jamais le f0 rapporté.
+
 ## 2026-07-12 — Recette MVP : le pop du kick était dans le sample, pas dans le moteur
 
 La probe d'export du démo (`render_probe --song assets/demo_song.json`)

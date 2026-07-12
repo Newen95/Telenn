@@ -18,6 +18,20 @@ pub fn flush(x: f32) -> f32 {
     }
 }
 
+/// xorshift32 seed — any non-zero constant; fixed so offline renders repeat.
+pub const RNG_SEED: u32 = 0x9e37_79b9;
+
+/// Next white-noise sample in ±1 (xorshift32) — deterministic, allocation-free.
+/// // RT-SAFE
+pub fn next_white(state: &mut u32) -> f32 {
+    let mut x = *state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *state = x;
+    (x as f32 / u32::MAX as f32) * 2.0 - 1.0
+}
+
 /// RBJ cookbook biquad, transposed direct form II. // RT-SAFE
 #[derive(Clone, Copy, Default)]
 pub struct Biquad {

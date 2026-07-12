@@ -5,7 +5,7 @@
 //! All DSP is hand-written. `process` is RT-SAFE: a fixed voice array, no
 //! allocation, no locks. Voice stealing takes the oldest voice.
 
-use crate::engine::dsp::{AdsrSettings, Biquad, Env, MIN_RELEASE_S};
+use crate::engine::dsp::{next_white, AdsrSettings, Biquad, Env, MIN_RELEASE_S, RNG_SEED};
 use crate::engine::node::{
     AudioNode, NodeIo, NoteKind, ParamCurve, ParamId, ParamSpec, Port, PortSpec, ProcessCtx,
     SignalKind,
@@ -466,19 +466,6 @@ fn pulse_blep(phase: f32, inc: f32, width: f32) -> f32 {
     raw + poly_blep(phase, inc)
         - poly_blep((phase - width).rem_euclid(1.0), inc)
         - (2.0 * width - 1.0)
-}
-
-/// xorshift32 seed — any non-zero constant; fixed so offline renders repeat.
-const RNG_SEED: u32 = 0x9e37_79b9;
-
-/// Next white-noise sample in ±1 (xorshift32). // RT-SAFE
-fn next_white(state: &mut u32) -> f32 {
-    let mut x = *state;
-    x ^= x << 13;
-    x ^= x >> 17;
-    x ^= x << 5;
-    *state = x;
-    (x as f32 / u32::MAX as f32) * 2.0 - 1.0
 }
 
 #[cfg(test)]

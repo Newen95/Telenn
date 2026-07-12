@@ -21,6 +21,11 @@ Lire `knowledge/INDEX.md` : un son proche existe peut-être dans `sounds/`
 | métallique, cloche, gong | inharmonicité > 10 cents (fm ratio NON entier) |
 | boîte à musique, mobile, celesta, jouet | ratio harmonique > 0.9 (fm ratio ENTIER, index < 1), attaque < 10 ms |
 | boisé, pincé | attaque < 20 ms, RT60 0,3–1 s, ratio harmonique > 0,8 |
+| marimba, xylophone, boisé frappé | modal `material=0` (mode 3,9 mesurable), decay court |
+| vibraphone, métallique tenu | modal `material=1`, decay 2–4 s |
+| cloche réaliste, carillon | modal `material=2` — juger aux partiels (0.56/1.19·f), le f0 mesuré ment (pitch virtuel) |
+| cristallin, verre | modal `material=3` |
+| nappe qui s'ouvre/se referme | wavetable `pos_env` ±0.5–1, `pos_decay` 300–1500 ms (centroïde qui voyage) |
 | soufflé, airy, bruité | flatness > −20 dB, ratio harmonique < 0,5 (subtractive `noise` + cutoff) |
 | creux, clarinette, chiptune, jeu vidéo | harmoniques impaires seules : H2 ≤ H3 − 20 dB (subtractive `wave=1`, width 0.5) |
 | nasillard, pincé du bout | H2 fort (subtractive `wave=1`, width 0.15–0.3) |
@@ -39,11 +44,16 @@ Poser 2 à 4 cibles chiffrées ; le reste est libre.
 ## 2. Choisir le point de départ
 
 Arbre court :
-- son tenu, filtré, classique → `subtractive`
-- cloche, métal, électrique, basse FM → `fm` (ratio entier = harmonique,
-  non entier = inharmonique)
-- corde pincée, harpe, guitare → `plucked`
-- percussion → `drum_sampler` (+ effets)
+- son tenu, filtré, classique (+ carrée/triangle/bruit/nappes détunées) →
+  `subtractive`
+- électrique, basse FM, EP, cloche synthétique → `fm` (ratio entier =
+  harmonique, non entier = inharmonique ; `index_env` = spectre vivant)
+- corde pincée, harpe, guitare, boîte à musique → `plucked`
+- **barre frappée : marimba, vibraphone, cloche réaliste, verre → `modal`**
+  (le complément frappé de plucked ; `material` choisit la physique)
+- **nappe qui voyage, basse digitale, spectre morphé → `wavetable`**
+  (`position` = sine→triangle→saw→carrée→vox, `pos_env` = le voyage)
+- percussion batterie → `drum_sampler` (+ effets)
 
 Puis `cargo run --bin module_specs` pour les plages réelles exactes et les
 quirks (drum map, threshold du compresseur…).
@@ -59,12 +69,13 @@ fois. Leviers principaux :
 
 | Pour bouger… | Agir sur… |
 |---|---|
-| centroïde ↑/↓ | `cutoff` (subtractive/filter), `index` (fm), `brightness` (plucked), `tone` (delay/saturator) |
+| centroïde ↑/↓ | `cutoff` (subtractive/filter), `index` (fm), `brightness` (plucked/modal), `position` (wavetable), `tone` (delay/saturator) |
 | attaque | `attack` (ms, subtractive/fm) — plucked/drums sont instantanés par nature |
 | RT60 | `release`, `decay` (plucked), `size` (reverb), `time`+`feedback` (delay) |
 | flatness ↑ (plus de souffle) | `noise` (subtractive), `index` (fm) ↑, résonance ↑ |
 | harmoniques paires/impaires | `wave`+`width` (subtractive) — carrée = impaires seules |
-| évolution du timbre dans la note | `index_env`+`index_decay` (fm) — le seul spectre « vivant » hors plucked |
+| évolution du timbre dans la note | `index_env`+`index_decay` (fm), `pos_env`+`pos_decay` (wavetable) — plucked/modal l'ont par physique |
+| dureté de l'attaque frappée | `strike` (modal — le chiff du maillet) |
 | densité/saleté | `feedback` (fm), `drive` (saturator) |
 | épaisseur/mouvement | `osc2`+`detune` (subtractive), `rate`+`depth` (chorus) |
 | niveau | `level` (dB) — viser un peak de probe entre −12 et −6 dBFS |

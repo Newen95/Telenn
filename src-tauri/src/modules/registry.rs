@@ -14,10 +14,12 @@ use crate::modules::delay::Delay;
 use crate::modules::drum_sampler::DrumSampler;
 use crate::modules::filter::Filter;
 use crate::modules::fm::Fm;
+use crate::modules::modal::Modal;
 use crate::modules::plucked::Plucked;
 use crate::modules::reverb::Reverb;
 use crate::modules::saturator::Saturator;
 use crate::modules::subtractive::Subtractive;
+use crate::modules::wavetable::Wavetable;
 
 /// Category of a module, so the UI knows where it may go: `Instrument` heads a
 /// track's chain (never drag-reordered in M6), `Effect` lives in the effects
@@ -55,6 +57,16 @@ const MODULES: &[ModuleDesc] = &[
     ModuleDesc {
         id: "fm",
         name: "FM",
+        category: ModuleCategory::Instrument,
+    },
+    ModuleDesc {
+        id: "wavetable",
+        name: "Wavetable",
+        category: ModuleCategory::Instrument,
+    },
+    ModuleDesc {
+        id: "modal",
+        name: "Modal",
         category: ModuleCategory::Instrument,
     },
     ModuleDesc {
@@ -114,6 +126,8 @@ pub fn create(module_id: &str) -> Option<Box<dyn AudioNode>> {
         "subtractive" => Some(boxed::<Subtractive>()),
         "plucked" => Some(boxed::<Plucked>()),
         "fm" => Some(boxed::<Fm>()),
+        "wavetable" => Some(boxed::<Wavetable>()),
+        "modal" => Some(boxed::<Modal>()),
         "drum_sampler" => Some(boxed::<DrumSampler>()),
         "gain" => Some(boxed::<Gain>()),
         "filter" => Some(boxed::<Filter>()),

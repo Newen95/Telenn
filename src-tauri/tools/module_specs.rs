@@ -45,6 +45,19 @@ const QUIRKS: &str = "\
   (bright pluck fading to purity — EP, natural bell). `feedback` (0..1 →
   0..π rad, DX-style two-sample average) thickens the modulator toward a
   saw-like spectrum; audible from ~0.2.
+- **modal**: `material` is a rounded selector — 0 wood/marimba, 1 metal/
+  vibraphone, 2 bell, 3 glass. Mode coefficients freeze at note-on: a
+  material/decay/tune change only affects the NEXT notes (click-free by
+  construction). Modes above 0.45·sr are omitted — very high bell notes
+  thin out. `strike` is mallet hardness (noise chiff), `brightness` tilts
+  the mode ladder. The bell material fools f0 detection (virtual pitch —
+  YIN reads a subharmonic): judge bells by their partials (0.56/1.19/1.56·f)
+  not by the reported f0.
+- **wavetable**: `position` travels sine → triangle → saw → square → vox
+  (0, 0.25, 0.5, 0.75, 1). Tables are band-limited per register (mip fixed
+  at note-on): high notes legitimately lose upper harmonics instead of
+  aliasing. `pos_env` pushes the position ± during the note (own
+  `pos_decay`, settles back to the knob) — the travelling-spectrum control.
 - **plucked**: `brightness` below ~0.3 lets a DC offset build up in the
   loop (measured -0.013 at 0.1) and skews centroid readings — stay >= 0.3.
   `release` gates the string: for a freely ringing tine set it to the max

@@ -292,6 +292,35 @@ impl Preset {
     }
 }
 
+/// A whole-chain preset: an instrument followed by its effects, each a module
+/// plus parameter values, **without** node ids (fresh ids are minted when the
+/// chain is instantiated). `nodes[0]` is the instrument. Stored as JSON under
+/// the project's `presets/chains/` directory — a named, reusable instrument
+/// (e.g. a tuned synth plus the reverb that defines its sound).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChainPreset {
+    pub nodes: Vec<Preset>,
+}
+
+impl ChainPreset {
+    /// Read a chain preset JSON from disk. // off-RT
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, ProjectError> {
+        let text = std::fs::read_to_string(path).map_err(|e| ProjectError::Io(e.to_string()))?;
+        Ok(serde_json::from_str(&text)?)
+    }
+
+    /// Write a chain preset to disk as pretty JSON, creating the parent dir if
+    /// needed. // off-RT
+    pub fn save(&self, path: impl AsRef<Path>) -> Result<(), ProjectError> {
+        if let Some(dir) = path.as_ref().parent() {
+            std::fs::create_dir_all(dir).map_err(|e| ProjectError::Io(e.to_string()))?;
+        }
+        let mut text = serde_json::to_string_pretty(self)?;
+        text.push('\n');
+        std::fs::write(path, text).map_err(|e| ProjectError::Io(e.to_string()))
+    }
+}
+
 impl Project {
     /// Read and parse a `song.json` from disk. // off-RT
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ProjectError> {
@@ -697,6 +726,31 @@ mod tests {
         let text = serde_json::to_string(&preset).unwrap();
         let back: Preset = serde_json::from_str(&text).unwrap();
         assert_eq!(preset, back);
+    }
+
+    #[test]
+    fn chain_preset_round_trips_through_disk() {
+        let mut params = BTreeMap::new();
+        params.insert("brightness".to_string(), 0.35);
+        let preset = ChainPreset {
+            nodes: vec![
+                Preset {
+                    module: "plucked".to_string(),
+                    params,
+                },
+                Preset {
+                    module: "reverb".to_string(),
+                    params: BTreeMap::new(),
+                },
+            ],
+        };
+        // save/load create the parent dir and preserve node order.
+        let dir = std::env::temp_dir().join(format!("telenn_chain_preset_{}", std::process::id()));
+        let path = dir.join("chains").join("test.json");
+        preset.save(&path).unwrap();
+        let back = ChainPreset::load(&path).unwrap();
+        assert_eq!(preset, back);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -35,6 +35,10 @@ pub enum GraphEditError {
     CannotEditInstrument(String),
     #[error("'{0}' is not an instrument module")]
     NotAnInstrument(String),
+    #[error("'{0}' is not an effect module")]
+    NotAnEffect(String),
+    #[error("a chain needs at least an instrument")]
+    EmptyChain,
     #[error("track id '{0}' already exists")]
     DuplicateTrack(String),
     #[error(transparent)]
@@ -49,6 +53,18 @@ fn require_instrument(module: &str) -> Result<(), GraphEditError> {
         .ok_or_else(|| GraphEditError::UnknownModule(module.to_string()))?;
     if desc.category != registry::ModuleCategory::Instrument {
         return Err(GraphEditError::NotAnInstrument(module.to_string()));
+    }
+    Ok(())
+}
+
+/// Validate that `module` is a registered effect (a chain tail node).
+fn require_effect(module: &str) -> Result<(), GraphEditError> {
+    let desc = registry::list()
+        .iter()
+        .find(|m| m.id == module)
+        .ok_or_else(|| GraphEditError::UnknownModule(module.to_string()))?;
+    if desc.category != registry::ModuleCategory::Effect {
+        return Err(GraphEditError::NotAnEffect(module.to_string()));
     }
     Ok(())
 }
@@ -111,6 +127,22 @@ pub fn add_track(
     Ok(())
 }
 
+/// Append a new track whose whole chain comes from a chain preset: `nodes[0]`
+/// is the instrument (with params), the rest are effects in order. The caller
+/// provides fresh ids for every node (the UI generates them, like effect
+/// inserts) — one atomic edit, so a single undo removes the whole track.
+pub fn add_track_with_chain(
+    project: &mut Project,
+    track_id: &str,
+    name: &str,
+    color: Option<&str>,
+    nodes: &[NodeSpec],
+) -> Result<(), GraphEditError> {
+    let (head, effects) = nodes.split_first().ok_or(GraphEditError::EmptyChain)?;
+    add_track(project, track_id, name, &head.module, &head.id, color)?;
+    set_chain_tail(project, track_id, head, effects)
+}
+
 /// Replace a track's instrument (chain head) with a fresh instance of `module`
 /// under a **new** id: the old instrument's voices ring out through the swap's
 /// fading graph and its id is never reused. Effects, clips and mixer settings
@@ -138,6 +170,41 @@ pub fn set_instrument(
         module: module.to_string(),
         params: Default::default(),
     };
+    Ok(())
+}
+
+/// Replace a track's whole chain (head + effects) from a chain preset, keeping
+/// its clips, mixer, name and color. The old nodes are dropped and their ids
+/// never reused; every incoming node needs a fresh id from the caller.
+pub fn set_chain(
+    project: &mut Project,
+    track_id: &str,
+    nodes: &[NodeSpec],
+) -> Result<(), GraphEditError> {
+    let (head, effects) = nodes.split_first().ok_or(GraphEditError::EmptyChain)?;
+    set_instrument(project, track_id, &head.module, &head.id)?;
+    let idx = track_index(project, track_id)?;
+    project.tracks[idx].chain.truncate(1); // drop the old effects
+    set_chain_tail(project, track_id, head, effects)
+}
+
+/// Shared tail of the chain-preset edits: pose the head's params (the track
+/// edits ship an empty map) and append the preset's effects in order.
+fn set_chain_tail(
+    project: &mut Project,
+    track_id: &str,
+    head: &NodeSpec,
+    effects: &[NodeSpec],
+) -> Result<(), GraphEditError> {
+    for fx in effects {
+        // A hand-edited preset could smuggle an instrument into the tail;
+        // `insert_effect` alone would accept any registered module.
+        require_effect(&fx.module)?;
+        let params: HashMap<String, f32> = fx.params.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        insert_effect(project, track_id, &fx.module, &fx.id, params)?;
+    }
+    let idx = track_index(project, track_id)?;
+    project.tracks[idx].chain[0].params = head.params.clone();
     Ok(())
 }
 
@@ -598,6 +665,85 @@ mod tests {
         assert!(matches!(
             insert_effect(&mut p, "lead", "gain", "lead_synth", Default::default()),
             Err(GraphEditError::DuplicateId(_))
+        ));
+    }
+
+    /// A chain-preset node spec with params, for the whole-chain edits.
+    fn spec(id: &str, module: &str, params: &[(&str, f32)]) -> NodeSpec {
+        NodeSpec {
+            id: id.to_string(),
+            module: module.to_string(),
+            params: params.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+        }
+    }
+
+    #[test]
+    fn add_track_with_chain_builds_the_full_chain() {
+        let mut p = demo();
+        let nodes = [
+            spec("bx_ins", "plucked", &[("brightness", 0.35)]),
+            spec("bx_rev", "reverb", &[("mix", 0.55)]),
+        ];
+        add_track_with_chain(&mut p, "bx", "Berceuse", None, &nodes).unwrap();
+        assert_eq!(ids(&p, 1), ["bx_ins", "bx_rev"]);
+        // Head params land too (plain add_track ships an empty map).
+        assert_eq!(p.tracks[1].chain[0].params.get("brightness"), Some(&0.35));
+        assert_eq!(p.tracks[1].chain[1].params.get("mix"), Some(&0.55));
+        assert_eq!(p.tracks[1].clips.len(), 1); // default empty clip, as add_track
+        assert!(p.to_graph().is_ok());
+    }
+
+    #[test]
+    fn add_track_with_chain_rejects_bad_chains() {
+        let mut p = demo();
+        assert!(matches!(
+            add_track_with_chain(&mut p, "t1", "T", None, &[]),
+            Err(GraphEditError::EmptyChain)
+        ));
+        assert!(matches!(
+            add_track_with_chain(&mut p, "t2", "T", None, &[spec("x1", "gain", &[])]),
+            Err(GraphEditError::NotAnInstrument(_))
+        ));
+        // An instrument smuggled into the tail is refused (hand-edited preset).
+        assert!(matches!(
+            add_track_with_chain(
+                &mut p,
+                "t3",
+                "T",
+                None,
+                &[spec("x2", "plucked", &[]), spec("x3", "fm", &[])]
+            ),
+            Err(GraphEditError::NotAnEffect(_))
+        ));
+        assert!(matches!(
+            add_track_with_chain(&mut p, "t4", "T", None, &[spec("lead_synth", "fm", &[])]),
+            Err(GraphEditError::DuplicateId(_))
+        ));
+    }
+
+    #[test]
+    fn set_chain_swaps_nodes_and_keeps_clips_and_mixer() {
+        let song = r#"{ "bpm": 120, "tracks": [
+            { "id": "lead", "mixer": { "gain_db": -3.0, "pan": 0.2 },
+              "chain": [ { "id": "lead_synth", "module": "subtractive" },
+                         { "id": "old_fx", "module": "delay" } ],
+              "clips": [ { "id": "c1", "start": "1.1.0", "length": "4.0.0", "notes": [] } ] }
+        ] }"#;
+        let mut p: Project = serde_json::from_str(song).unwrap();
+        let nodes = [
+            spec("new_ins", "plucked", &[("decay", 0.98)]),
+            spec("new_rev", "reverb", &[("size", 0.55)]),
+        ];
+        set_chain(&mut p, "lead", &nodes).unwrap();
+        assert_eq!(ids(&p, 0), ["new_ins", "new_rev"]);
+        assert_eq!(p.tracks[0].chain[0].params.get("decay"), Some(&0.98));
+        // Everything that is not the chain survives: clips, mixer, name.
+        assert_eq!(p.tracks[0].clips[0].id, "c1");
+        assert_eq!(p.tracks[0].mixer.gain_db, -3.0);
+        // Fresh ids again: `set_instrument` checks the id before the track.
+        assert!(matches!(
+            set_chain(&mut p, "nope", &[spec("other_ins", "fm", &[])]),
+            Err(GraphEditError::UnknownTrack(_))
         ));
     }
 }

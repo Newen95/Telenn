@@ -5,7 +5,7 @@ use std::sync::Mutex;
 
 use tauri::State;
 
-use crate::control::project::{Preset, Project, ProjectDiff, ProjectView};
+use crate::control::project::{ChainPreset, NodeSpec, Preset, Project, ProjectDiff, ProjectView};
 use crate::control::sequencer::Schedule;
 use crate::control::undo::EditHistory;
 use crate::control::{
@@ -261,6 +261,39 @@ pub fn track_add(
             &instrument_id,
             color.as_deref(),
         )
+    })
+}
+
+/// Create a track whose whole chain (instrument + effects, with params) comes
+/// from a chain preset. One atomic edit: a single hot-swap, a single undo step.
+/// The UI mints fresh ids for the track and every node.
+#[tauri::command]
+pub fn track_add_chain(
+    engine: State<'_, AudioEngine>,
+    history: State<'_, Mutex<EditHistory>>,
+    file: State<'_, ProjectFile>,
+    track_id: String,
+    name: String,
+    color: Option<String>,
+    nodes: Vec<NodeSpec>,
+) -> Result<(), String> {
+    edit_and_swap_full(&engine, &history, &file, |p| {
+        graph_edit::add_track_with_chain(p, &track_id, &name, color.as_deref(), &nodes)
+    })
+}
+
+/// Replace a track's whole chain from a chain preset (fresh ids from the UI),
+/// keeping its clips, mixer, name and color.
+#[tauri::command]
+pub fn track_set_chain(
+    engine: State<'_, AudioEngine>,
+    history: State<'_, Mutex<EditHistory>>,
+    file: State<'_, ProjectFile>,
+    track_id: String,
+    nodes: Vec<NodeSpec>,
+) -> Result<(), String> {
+    edit_and_swap_full(&engine, &history, &file, |p| {
+        graph_edit::set_chain(p, &track_id, &nodes)
     })
 }
 
@@ -841,6 +874,82 @@ pub fn save_preset(
         params: spec.params.clone(),
     };
     let dir = presets_dir(&file).ok_or("no project directory")?;
+    preset
+        .save(dir.join(format!("{safe}.json")))
+        .map_err(|e| e.to_string())
+}
+
+/// The project's `presets/chains/` directory (whole-chain presets — named,
+/// reusable instruments). A subdirectory, so `list_presets` never sees them.
+fn chain_presets_dir(file: &ProjectFile) -> Option<PathBuf> {
+    presets_dir(file).map(|p| p.join("chains"))
+}
+
+/// Names of the chain presets saved in the project (filenames without `.json`).
+#[tauri::command]
+pub fn list_chain_presets(file: State<'_, ProjectFile>) -> Vec<String> {
+    let Some(dir) = chain_presets_dir(&file) else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new(); // no chain presets dir yet
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter_map(|e| {
+            let path = e.path();
+            (path.extension().and_then(|x| x.to_str()) == Some("json"))
+                .then(|| {
+                    path.file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(str::to_string)
+                })
+                .flatten()
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// Read a saved chain preset so the UI can instantiate a track from it.
+#[tauri::command]
+pub fn read_chain_preset(
+    file: State<'_, ProjectFile>,
+    name: String,
+) -> Result<ChainPreset, String> {
+    let safe = safe_preset_name(&name)?;
+    let dir = chain_presets_dir(&file).ok_or("no project directory")?;
+    ChainPreset::load(dir.join(format!("{safe}.json"))).map_err(|e| e.to_string())
+}
+
+/// Save a track's whole chain (instrument + effects, module + params, no ids)
+/// as a named chain preset.
+#[tauri::command]
+pub fn save_chain_preset(
+    history: State<'_, Mutex<EditHistory>>,
+    file: State<'_, ProjectFile>,
+    name: String,
+    track_id: String,
+) -> Result<(), String> {
+    let safe = safe_preset_name(&name)?;
+    let history = history.lock().map_err(|_| "edit state poisoned")?;
+    let track = history
+        .project()
+        .tracks
+        .iter()
+        .find(|t| t.id == track_id)
+        .ok_or_else(|| format!("unknown track '{track_id}'"))?;
+    let preset = ChainPreset {
+        nodes: track
+            .chain
+            .iter()
+            .map(|n| Preset {
+                module: n.module.clone(),
+                params: n.params.clone(),
+            })
+            .collect(),
+    };
+    let dir = chain_presets_dir(&file).ok_or("no project directory")?;
     preset
         .save(dir.join(format!("{safe}.json")))
         .map_err(|e| e.to_string())

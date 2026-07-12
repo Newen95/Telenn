@@ -1,5 +1,6 @@
-//! Subtractive synthesiser: 8-voice polyphony, band-limited saw (polyBLEP) →
-//! resonant low-pass (RBJ biquad) → ADSR amplitude envelope.
+//! Subtractive synthesiser: 8-voice polyphony, band-limited oscillators
+//! (polyBLEP saw / pulse / triangle) + white noise + a detunable second
+//! oscillator → resonant low-pass (RBJ biquad) → ADSR amplitude envelope.
 //!
 //! All DSP is hand-written. `process` is RT-SAFE: a fixed voice array, no
 //! allocation, no locks. Voice stealing takes the oldest voice.
@@ -22,8 +23,19 @@ const P_DECAY: ParamId = 3;
 const P_SUSTAIN: ParamId = 4;
 const P_RELEASE: ParamId = 5;
 const P_LEVEL: ParamId = 6;
+// Appended (ids are frozen — presets address params by name, order by id).
+const P_WAVE: ParamId = 7;
+const P_WIDTH: ParamId = 8;
+const P_NOISE: ParamId = 9;
+const P_OSC2: ParamId = 10;
+const P_DETUNE: ParamId = 11;
 
-const PARAMS: [ParamSpec; 7] = [
+/// Waveform selector values (P_WAVE, rounded): saw, pulse, triangle.
+const WAVE_SAW: usize = 0;
+const WAVE_PULSE: usize = 1;
+const WAVE_TRIANGLE: usize = 2;
+
+const PARAMS: [ParamSpec; 12] = [
     ParamSpec {
         id: P_CUTOFF,
         name: "cutoff",
@@ -87,7 +99,63 @@ const PARAMS: [ParamSpec; 7] = [
         default: -6.0,
         curve: ParamCurve::Db,
     },
+    ParamSpec {
+        id: P_WAVE,
+        name: "wave",
+        unit: "",
+        min: 0.0,
+        max: 2.0,
+        default: 0.0,
+        curve: ParamCurve::Linear,
+    },
+    ParamSpec {
+        id: P_WIDTH,
+        name: "width",
+        unit: "",
+        min: 0.05,
+        max: 0.5,
+        default: 0.5,
+        curve: ParamCurve::Linear,
+    },
+    ParamSpec {
+        id: P_NOISE,
+        name: "noise",
+        unit: "",
+        min: 0.0,
+        max: 1.0,
+        default: 0.0,
+        curve: ParamCurve::Linear,
+    },
+    ParamSpec {
+        id: P_OSC2,
+        name: "osc2",
+        unit: "",
+        min: 0.0,
+        max: 1.0,
+        default: 0.0,
+        curve: ParamCurve::Linear,
+    },
+    ParamSpec {
+        id: P_DETUNE,
+        name: "detune",
+        unit: "ct",
+        min: 0.0,
+        max: 50.0,
+        default: 7.0,
+        curve: ParamCurve::Linear,
+    },
 ];
+
+/// Per-block oscillator settings, shared by every voice (smoothed once per
+/// block; `det` is the osc2 frequency ratio derived from the detune cents).
+#[derive(Clone, Copy)]
+struct OscParams {
+    wave: usize,
+    width: f32,
+    noise: f32,
+    osc2: f32,
+    det: f32,
+}
 
 #[derive(Clone, Copy, Default)]
 struct Voice {
@@ -96,8 +164,13 @@ struct Voice {
     age: u64,
     /// Oscillator phase in turns (0..1).
     phase: f32,
+    /// Second oscillator phase (runs at `inc · det`).
+    phase2: f32,
     /// Phase increment per sample (`freq / sr`).
     inc: f32,
+    /// Triangle leaky-integrator states (one per oscillator).
+    tri1: f32,
+    tri2: f32,
     /// Velocity amplitude (0..1).
     amp: f32,
     filter: Biquad,
@@ -106,13 +179,33 @@ struct Voice {
 
 impl Voice {
     // RT-SAFE
-    fn render(&mut self, adsr: &AdsrSettings, sr: f32) -> f32 {
-        let saw = 2.0 * self.phase - 1.0 - poly_blep(self.phase, self.inc);
+    fn render(&mut self, p: &OscParams, white: f32, adsr: &AdsrSettings, sr: f32) -> f32 {
+        let o1 = osc_sample(p.wave, self.phase, self.inc, p.width, &mut self.tri1);
         self.phase += self.inc;
         if self.phase >= 1.0 {
             self.phase -= 1.0;
         }
-        let filtered = self.filter.process(saw);
+        // The second oscillator only runs once mixed in; its level fades the
+        // normalized sum continuously, so osc2 = 0 is exactly the legacy voice.
+        let osc = if p.osc2 > 0.0 {
+            let inc2 = self.inc * p.det;
+            let o2 = osc_sample(p.wave, self.phase2, inc2, p.width, &mut self.tri2);
+            self.phase2 += inc2;
+            if self.phase2 >= 1.0 {
+                self.phase2 -= 1.0;
+            }
+            (o1 + p.osc2 * o2) / (1.0 + p.osc2)
+        } else {
+            o1
+        };
+        // Noise joins BEFORE the filter, so cutoff/resonance shape it (wind,
+        // breath); the crossfade keeps noise = 0 bit-identical to the old path.
+        let raw = if p.noise > 0.0 {
+            osc * (1.0 - p.noise) + white * p.noise
+        } else {
+            osc
+        };
+        let filtered = self.filter.process(raw);
         let env = self.env.tick(adsr, sr);
         if !self.env.is_active() {
             self.active = false;
@@ -129,6 +222,13 @@ pub struct Subtractive {
     level: LinearRamp,
     adsr: AdsrSettings,
     next_age: u64,
+    wave_idx: usize,
+    width: OnePole,
+    noise: OnePole,
+    osc2: OnePole,
+    detune: OnePole,
+    /// xorshift32 state — deterministic white noise, no crate, no alloc.
+    rng: u32,
 }
 
 impl Default for Subtractive {
@@ -141,6 +241,12 @@ impl Default for Subtractive {
             level: LinearRamp::new(1.0, 10.0, 48_000.0),
             adsr: AdsrSettings::default(),
             next_age: 0,
+            wave_idx: WAVE_SAW,
+            width: OnePole::new(0.5, 0.99),
+            noise: OnePole::new(0.0, 0.99),
+            osc2: OnePole::new(0.0, 0.99),
+            detune: OnePole::new(7.0, 0.99),
+            rng: RNG_SEED,
         }
     }
 }
@@ -217,14 +323,25 @@ impl AudioNode for Subtractive {
                 v.filter.set_lowpass(fc, q, sr);
             }
         }
+        // Oscillator settings once per block; det converts cents → freq ratio.
+        let osc = OscParams {
+            wave: self.wave_idx,
+            width: self.width.advance(frames),
+            noise: self.noise.advance(frames),
+            osc2: self.osc2.advance(frames),
+            det: (self.detune.advance(frames) / 1200.0).exp2(),
+        };
 
         let out = io.output(0);
         for slot in out.iter_mut() {
             let level = self.level.tick();
+            // One noise source per frame, enveloped per voice (a shared VCA'd
+            // noise bed — cheaper than a generator per voice, same sound).
+            let white = next_white(&mut self.rng);
             let mut sum = 0.0;
             for v in &mut self.voices {
                 if v.active {
-                    sum += v.render(&self.adsr, sr);
+                    sum += v.render(&osc, white, &self.adsr, sr);
                 }
             }
             *slot = sum * level;
@@ -258,6 +375,11 @@ impl AudioNode for Subtractive {
             P_SUSTAIN => self.adsr.sustain = real,
             P_RELEASE => self.adsr.release_s = (real / 1000.0).max(MIN_RELEASE_S),
             P_LEVEL => self.level.set_target(real),
+            P_WAVE => self.wave_idx = (real.round() as usize).min(WAVE_TRIANGLE),
+            P_WIDTH => self.width.set_target(real),
+            P_NOISE => self.noise.set_target(real),
+            P_OSC2 => self.osc2.set_target(real),
+            P_DETUNE => self.detune.set_target(real),
             _ => {}
         }
     }
@@ -282,6 +404,12 @@ impl AudioNode for Subtractive {
             sustain: default_real(P_SUSTAIN),
             release_s: (default_real(P_RELEASE) / 1000.0).max(MIN_RELEASE_S),
         };
+        self.wave_idx = default_real(P_WAVE).round() as usize;
+        self.width = OnePole::new(default_real(P_WIDTH), coef);
+        self.noise = OnePole::new(default_real(P_NOISE), coef);
+        self.osc2 = OnePole::new(default_real(P_OSC2), coef);
+        self.detune = OnePole::new(default_real(P_DETUNE), coef);
+        self.rng = RNG_SEED; // fixed seed: offline renders stay deterministic
         self.voices = [Voice::default(); VOICES];
         self.next_age = 0;
     }
@@ -313,6 +441,44 @@ fn poly_blep(t: f32, dt: f32) -> f32 {
     } else {
         0.0
     }
+}
+
+/// One band-limited oscillator sample. `tri` is the voice's leaky-integrator
+/// state, used by the triangle only. // RT-SAFE
+fn osc_sample(wave: usize, phase: f32, inc: f32, width: f32, tri: &mut f32) -> f32 {
+    match wave {
+        WAVE_PULSE => pulse_blep(phase, inc, width),
+        WAVE_TRIANGLE => {
+            // Leaky integral of the width-0.5 pulse: slope ±4·inc gives a ~±1
+            // triangle; the 0.999 leak keeps DC from accumulating.
+            let sq = pulse_blep(phase, inc, 0.5);
+            *tri = *tri * 0.999 + sq * 4.0 * inc;
+            *tri
+        }
+        _ => 2.0 * phase - 1.0 - poly_blep(phase, inc),
+    }
+}
+
+/// Band-limited pulse: BLEP at BOTH edges (rise at 0, fall at `width`), plus
+/// the DC the asymmetric duty cycle would otherwise leave. // RT-SAFE
+fn pulse_blep(phase: f32, inc: f32, width: f32) -> f32 {
+    let raw = if phase < width { 1.0 } else { -1.0 };
+    raw + poly_blep(phase, inc)
+        - poly_blep((phase - width).rem_euclid(1.0), inc)
+        - (2.0 * width - 1.0)
+}
+
+/// xorshift32 seed — any non-zero constant; fixed so offline renders repeat.
+const RNG_SEED: u32 = 0x9e37_79b9;
+
+/// Next white-noise sample in ±1 (xorshift32). // RT-SAFE
+fn next_white(state: &mut u32) -> f32 {
+    let mut x = *state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *state = x;
+    (x as f32 / u32::MAX as f32) * 2.0 - 1.0
 }
 
 #[cfg(test)]
@@ -436,6 +602,164 @@ mod tests {
             .map(|w| (w[1] - w[0]).abs())
             .fold(0.0f32, f32::max);
         assert!(max_delta < 0.2, "release click, max delta {max_delta}");
+    }
+
+    /// Single-bin DFT magnitude (Goertzel-style), normalized by length.
+    fn mag_at(buf: &[f32], freq: f32, sr: f32) -> f32 {
+        let mut re = 0.0f32;
+        let mut im = 0.0f32;
+        for (n, &s) in buf.iter().enumerate() {
+            let w = core::f32::consts::TAU * freq * n as f32 / sr;
+            re += s * w.cos();
+            im += s * w.sin();
+        }
+        (re * re + im * im).sqrt() / buf.len() as f32
+    }
+
+    /// Render a settled sustain of pitch 57 (220 Hz) with the filter wide open.
+    fn sustain_at(s: &mut Subtractive, frames: usize) -> Vec<f32> {
+        s.set_param(P_CUTOFF, 1.0); // 20 kHz: measure the oscillator, not the filter
+        let on = [NoteEvent {
+            frame: 0,
+            kind: NoteKind::On {
+                pitch: 57,
+                vel: 110,
+            },
+        }];
+        let mut buf = Vec::new();
+        render_notes(s, &on, 4096, &mut buf); // settle smoothers + envelope
+        let mut tail = Vec::new();
+        render_notes(s, &[], frames, &mut tail);
+        tail
+    }
+
+    fn set_real(s: &mut Subtractive, id: ParamId, real: f32) {
+        s.set_param(id, PARAMS[id as usize].normalize(real));
+    }
+
+    #[test]
+    fn square_spectrum_is_odd_only() {
+        let mut s = synth();
+        set_real(&mut s, P_WAVE, 1.0); // pulse, default width 0.5 = square
+        let tail = sustain_at(&mut s, 8192);
+        let h2 = mag_at(&tail, 440.0, 48_000.0);
+        let h3 = mag_at(&tail, 660.0, 48_000.0);
+        assert!(
+            h3 > 10.0 * h2,
+            "square should have no even harmonics: H2 {h2}, H3 {h3}"
+        );
+    }
+
+    #[test]
+    fn pulse_width_adds_even_harmonics() {
+        let mut s = synth();
+        set_real(&mut s, P_WAVE, 1.0);
+        set_real(&mut s, P_WIDTH, 0.25);
+        let tail = sustain_at(&mut s, 8192);
+        let h1 = mag_at(&tail, 220.0, 48_000.0);
+        let h2 = mag_at(&tail, 440.0, 48_000.0);
+        // At 25% duty the 2nd harmonic is strong (comparable to the 1st).
+        assert!(
+            h2 > 0.3 * h1,
+            "narrow pulse should grow H2: H1 {h1}, H2 {h2}"
+        );
+        // And the duty asymmetry must not leave DC behind.
+        let dc = tail.iter().sum::<f32>() / tail.len() as f32;
+        assert!(dc.abs() < 0.005, "pulse leaves DC {dc}");
+    }
+
+    #[test]
+    fn triangle_is_darker_than_saw() {
+        let mut saw = synth();
+        let saw_tail = sustain_at(&mut saw, 8192);
+        let mut tri = synth();
+        set_real(&mut tri, P_WAVE, 2.0);
+        let tri_tail = sustain_at(&mut tri, 8192);
+        // Normalize by each wave's fundamental: triangle harmonics fall as
+        // 1/n² (and evens vanish) vs the saw's 1/n.
+        let rel = |t: &[f32], h: f32| mag_at(t, 220.0 * h, 48_000.0) / mag_at(t, 220.0, 48_000.0);
+        assert!(
+            rel(&saw_tail, 4.0) > 5.0 * rel(&tri_tail, 4.0),
+            "triangle should lack H4"
+        );
+        assert!(
+            rel(&saw_tail, 5.0) > 2.0 * rel(&tri_tail, 5.0),
+            "triangle H5 should sit far below the saw's"
+        );
+    }
+
+    #[test]
+    fn full_noise_is_spectrally_flat() {
+        use crate::analysis::{fft, spectral};
+        let mut s = synth();
+        set_real(&mut s, P_NOISE, 1.0);
+        let tail = sustain_at(&mut s, 8192);
+        let power = fft::power_spectrum(&tail).expect("power of two");
+        let flatness = spectral::spectral_flatness_db(&power, tail.len(), 48_000);
+        assert!(
+            flatness > -20.0,
+            "full noise should be broadband, flatness {flatness} dB"
+        );
+    }
+
+    #[test]
+    fn detuned_second_oscillator_beats() {
+        let mut s = synth();
+        set_real(&mut s, P_OSC2, 1.0);
+        set_real(&mut s, P_DETUNE, 30.0); // ≈ 3.8 Hz beat at 220 Hz
+                                          // Isolate the fundamental (cutoff just above 220 Hz): each harmonic
+                                          // beats at its own rate, so the full spectrum never dips together —
+                                          // the fundamental alone cancels nearly completely.
+        set_real(&mut s, P_CUTOFF, 300.0);
+        let on = [NoteEvent {
+            frame: 0,
+            kind: NoteKind::On {
+                pitch: 57,
+                vel: 110,
+            },
+        }];
+        let mut buf = Vec::new();
+        render_notes(&mut s, &on, 4096, &mut buf);
+        let mut tail = Vec::new();
+        render_notes(&mut s, &[], 48_000, &mut tail);
+        // Windowed RMS over the sustain: the level must swell and dip.
+        let rms: Vec<f32> = tail
+            .chunks(4800) // 100 ms
+            .map(|c| (c.iter().map(|x| x * x).sum::<f32>() / c.len() as f32).sqrt())
+            .collect();
+        let hi = rms.iter().fold(0.0f32, |m, &v| m.max(v));
+        let lo = rms.iter().fold(f32::MAX, |m, &v| m.min(v));
+        assert!(hi > 2.0 * lo, "no beating heard: rms {lo}..{hi}");
+    }
+
+    #[test]
+    fn smoothed_param_sweeps_are_click_free() {
+        use crate::analysis::levels;
+        let mut s = synth();
+        set_real(&mut s, P_WAVE, 1.0);
+        let on = [NoteEvent {
+            frame: 0,
+            kind: NoteKind::On {
+                pitch: 57,
+                vel: 110,
+            },
+        }];
+        let mut buf = Vec::new();
+        render_notes(&mut s, &on, 4096, &mut buf);
+        // Sweep every glided oscillator param while the note holds.
+        let mut whole = Vec::new();
+        for k in 0..64 {
+            let v = k as f32 / 63.0;
+            s.set_param(P_WIDTH, 1.0 - v);
+            s.set_param(P_NOISE, v);
+            s.set_param(P_OSC2, v);
+            s.set_param(P_DETUNE, v);
+            render_notes(&mut s, &[], 256, &mut buf);
+            whole.extend_from_slice(&buf);
+        }
+        assert!(whole.iter().all(|x| x.is_finite()));
+        let clicks = levels::detect_clicks(&whole, 48_000);
+        assert!(clicks.is_empty(), "sweep clicked: {clicks:?}");
     }
 
     #[test]

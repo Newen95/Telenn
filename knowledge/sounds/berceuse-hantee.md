@@ -81,3 +81,7 @@ catalogue pour amincir davantage — manque noté dans lessons.md).
   ré-étalonnée (voir table : size 0.55 / mix 0.55 / predelay 20 ms, RT60
   re-mesuré 3.4 s ≈ l'ancien 3.2 s), **re-validée à l'oreille le
   2026-07-11. Statut : VALIDÉ**.
+- 2026-07-12 — installée comme **preset de chaîne** `berceuse-hantee`
+  (`projects/demo/presets/chains/`, données projet non versionnées) : la
+  recette complète plucked → reverb apparaît dans le navigateur (groupe
+  Instruments) et le menu « + piste », prête en un geste.

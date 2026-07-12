@@ -6,7 +6,7 @@
 // Identity: "ardoise & cuivre". Telenn is Breton for harp — slate-blue darks
 // (wet granite) under a warm copper accent (the wound strings). The copper
 // always means "you are in control" (interactive/active); the signal colors
-// keep their semantic role everywhere: notes are violet, audio is teal,
+// keep their semantic role everywhere: notes are magenta, audio is teal,
 // modulation is amber.
 
 export const theme = {
@@ -32,7 +32,7 @@ export const theme = {
     /** Luminous copper light — what the playhead is sounding right now. */
     glow: "#ffb54d",
     /** Signal colors (semantic, identical everywhere). */
-    sigNotes: "#8f7ad6",
+    sigNotes: "#c678dd",
     sigAudio: "#4fa8a0",
     sigMod: "#d9a441",
     danger: "#d96459",

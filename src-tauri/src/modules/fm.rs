@@ -4,12 +4,15 @@
 //! A single modulator → carrier pair (the classic 2-op cell) already covers bells,
 //! electric pianos and metallic basses: `ratio` sets the modulator frequency as a
 //! multiple of the carrier, `index` the modulation depth (in radians of carrier
-//! phase). All DSP is hand-written. `process` is RT-SAFE: a fixed voice array, no
+//! phase). `index_env` lets a per-voice envelope shape the index over the note
+//! (bright pluck softening into a purer sustain — the living-spectrum FM sound),
+//! and `feedback` feeds the modulator back into itself for saw-like density.
+//! All DSP is hand-written. `process` is RT-SAFE: a fixed voice array, no
 //! allocation, no locks. Voice stealing takes the oldest voice.
 
-use std::f32::consts::TAU;
+use std::f32::consts::{PI, TAU};
 
-use crate::engine::dsp::{AdsrSettings, Env, MIN_RELEASE_S};
+use crate::engine::dsp::{flush, AdsrSettings, Env, MIN_RELEASE_S};
 use crate::engine::node::{
     AudioNode, NodeIo, NoteKind, ParamCurve, ParamId, ParamSpec, Port, PortSpec, ProcessCtx,
     SignalKind,
@@ -27,8 +30,12 @@ const P_DECAY: ParamId = 3;
 const P_SUSTAIN: ParamId = 4;
 const P_RELEASE: ParamId = 5;
 const P_LEVEL: ParamId = 6;
+// Appended (ids are frozen — presets address params by name, order by id).
+const P_INDEX_ENV: ParamId = 7;
+const P_INDEX_DECAY: ParamId = 8;
+const P_FEEDBACK: ParamId = 9;
 
-const PARAMS: [ParamSpec; 7] = [
+const PARAMS: [ParamSpec; 10] = [
     ParamSpec {
         id: P_RATIO,
         name: "ratio",
@@ -92,7 +99,45 @@ const PARAMS: [ParamSpec; 7] = [
         default: -6.0,
         curve: ParamCurve::Db,
     },
+    ParamSpec {
+        id: P_INDEX_ENV,
+        name: "index_env",
+        unit: "",
+        min: 0.0,
+        max: 1.0,
+        default: 0.0,
+        curve: ParamCurve::Linear,
+    },
+    ParamSpec {
+        id: P_INDEX_DECAY,
+        name: "index_decay",
+        unit: "ms",
+        min: 1.0,
+        max: 2000.0,
+        default: 200.0,
+        curve: ParamCurve::Log,
+    },
+    ParamSpec {
+        id: P_FEEDBACK,
+        name: "feedback",
+        unit: "",
+        min: 0.0,
+        max: 1.0,
+        default: 0.0,
+        curve: ParamCurve::Linear,
+    },
 ];
+
+/// Per-block operator settings, shared by every voice.
+#[derive(Clone, Copy)]
+struct OpParams {
+    ratio: f32,
+    index: f32,
+    /// How much of the index the modulator envelope shapes (0 = static).
+    index_env: f32,
+    /// Modulator self-feedback amount (0..1, scaled to 0..π radians).
+    feedback: f32,
+}
 
 #[derive(Clone, Copy, Default)]
 struct Voice {
@@ -108,17 +153,39 @@ struct Voice {
     /// Velocity amplitude (0..1).
     amp: f32,
     env: Env,
+    /// Modulator-index envelope (attack/release follow the amp ADSR, decay is
+    /// `index_decay`, sustain 0 — the spectrum settles toward a purer tone).
+    mod_env: Env,
+    /// Last two modulator samples, for the DX-style averaged self-feedback.
+    fb1: f32,
+    fb2: f32,
 }
 
 impl Voice {
     // RT-SAFE
-    fn render(&mut self, ratio: f32, index: f32, adsr: &AdsrSettings, sr: f32) -> f32 {
-        let mod_sig = (TAU * self.mod_phase).sin();
-        let carrier = (TAU * self.carrier_phase + index * mod_sig).sin();
+    fn render(
+        &mut self,
+        p: &OpParams,
+        mod_adsr: &AdsrSettings,
+        adsr: &AdsrSettings,
+        sr: f32,
+    ) -> f32 {
+        // Averaging the last two feedback samples tames the chaos a 1-sample
+        // loop develops at high amounts (the classic DX trick).
+        let fb = p.feedback * PI * (self.fb1 + self.fb2) * 0.5;
+        let mod_sig = (TAU * self.mod_phase + fb).sin();
+        self.fb2 = self.fb1;
+        self.fb1 = flush(mod_sig);
+
+        // Effective index: crossfade between the static knob and the same
+        // knob shaped by the per-voice modulator envelope.
+        let idx_env = self.mod_env.tick(mod_adsr, sr);
+        let index_now = p.index * ((1.0 - p.index_env) + p.index_env * idx_env);
+        let carrier = (TAU * self.carrier_phase + index_now * mod_sig).sin();
 
         self.carrier_phase += self.inc;
         self.carrier_phase -= self.carrier_phase.floor();
-        self.mod_phase += self.inc * ratio;
+        self.mod_phase += self.inc * p.ratio;
         self.mod_phase -= self.mod_phase.floor();
 
         let env = self.env.tick(adsr, sr);
@@ -137,6 +204,10 @@ pub struct Fm {
     level: LinearRamp,
     adsr: AdsrSettings,
     next_age: u64,
+    index_env: OnePole,
+    /// Modulator envelope decay, seconds.
+    index_decay_s: f32,
+    feedback: OnePole,
 }
 
 impl Default for Fm {
@@ -149,6 +220,9 @@ impl Default for Fm {
             level: LinearRamp::new(1.0, 10.0, 48_000.0),
             adsr: AdsrSettings::default(),
             next_age: 0,
+            index_env: OnePole::new(0.0, 0.99),
+            index_decay_s: 0.2,
+            feedback: OnePole::new(0.0, 0.99),
         }
     }
 }
@@ -167,14 +241,19 @@ impl Fm {
         v.age = age;
         v.carrier_phase = 0.0;
         v.mod_phase = 0.0;
+        v.fb1 = 0.0;
+        v.fb2 = 0.0;
         v.env = Env::default();
         v.env.note_on();
+        v.mod_env = Env::default();
+        v.mod_env.note_on();
     }
 
     fn note_off(&mut self, pitch: u8) {
         for v in &mut self.voices {
             if v.active && v.pitch == pitch {
                 v.env.note_off();
+                v.mod_env.note_off();
             }
         }
     }
@@ -221,10 +300,22 @@ impl AudioNode for Fm {
 
         let frames = io.frames();
         let sr = self.sample_rate;
-        // Ratio and index glide once per block (anti-zipper), like the subtractive
-        // synth's cutoff/resonance; voices read the settled values for this block.
-        let ratio = self.ratio.advance(frames);
-        let index = self.index.advance(frames);
+        // Operator settings glide once per block (anti-zipper), like the
+        // subtractive synth's cutoff/resonance; voices read the settled values.
+        let op = OpParams {
+            ratio: self.ratio.advance(frames),
+            index: self.index.advance(frames),
+            index_env: self.index_env.advance(frames),
+            feedback: self.feedback.advance(frames),
+        };
+        // The modulator envelope borrows the amp attack/release; its decay is
+        // its own knob and it always settles to 0 (purer sustain by design).
+        let mod_adsr = AdsrSettings {
+            attack_s: self.adsr.attack_s,
+            decay_s: self.index_decay_s,
+            sustain: 0.0,
+            release_s: self.adsr.release_s,
+        };
 
         let out = io.output(0);
         for slot in out.iter_mut() {
@@ -232,7 +323,7 @@ impl AudioNode for Fm {
             let mut sum = 0.0;
             for v in &mut self.voices {
                 if v.active {
-                    sum += v.render(ratio, index, &self.adsr, sr);
+                    sum += v.render(&op, &mod_adsr, &self.adsr, sr);
                 }
             }
             *slot = sum * level;
@@ -266,6 +357,9 @@ impl AudioNode for Fm {
             P_SUSTAIN => self.adsr.sustain = real,
             P_RELEASE => self.adsr.release_s = (real / 1000.0).max(MIN_RELEASE_S),
             P_LEVEL => self.level.set_target(real),
+            P_INDEX_ENV => self.index_env.set_target(real),
+            P_INDEX_DECAY => self.index_decay_s = real / 1000.0,
+            P_FEEDBACK => self.feedback.set_target(real),
             _ => {}
         }
     }
@@ -274,6 +368,7 @@ impl AudioNode for Fm {
         for v in &mut self.voices {
             if v.active {
                 v.env.note_off();
+                v.mod_env.note_off();
             }
         }
     }
@@ -290,6 +385,9 @@ impl AudioNode for Fm {
             sustain: default_real(P_SUSTAIN),
             release_s: (default_real(P_RELEASE) / 1000.0).max(MIN_RELEASE_S),
         };
+        self.index_env = OnePole::new(default_real(P_INDEX_ENV), coef);
+        self.index_decay_s = default_real(P_INDEX_DECAY) / 1000.0;
+        self.feedback = OnePole::new(default_real(P_FEEDBACK), coef);
         self.voices = [Voice::default(); VOICES];
         self.next_age = 0;
     }
@@ -392,6 +490,94 @@ mod tests {
         assert!(
             b > 10.0 * q,
             "index added no sidebands: quiet {q}, bright {b}"
+        );
+    }
+
+    fn set_real(s: &mut Fm, id: ParamId, real: f32) {
+        s.set_param(id, PARAMS[id as usize].normalize(real));
+    }
+
+    #[test]
+    fn index_envelope_makes_the_spectrum_evolve() {
+        // With the full index enveloped (sustain 0), the sideband must be loud
+        // during the pluck and gone once the modulator envelope has decayed —
+        // the living-spectrum behaviour a static index cannot produce.
+        let sr = 48_000.0;
+        let pitch = 57u8;
+        let sideband = 3.0 * midi_to_freq(pitch);
+
+        let mut s = synth();
+        set_real(&mut s, P_RATIO, 2.0);
+        set_real(&mut s, P_INDEX, 4.0);
+        set_real(&mut s, P_INDEX_ENV, 1.0);
+        set_real(&mut s, P_INDEX_DECAY, 100.0);
+        let mut buf = Vec::new();
+        render_notes(&mut s, &[on(pitch)], 48_000, &mut buf);
+
+        let early = mag_at(&buf[512..8192], sideband, sr); // after the 2 ms attack
+        let late = mag_at(&buf[24_000..44_000], sideband, sr); // envelope long gone
+        assert!(early > 0.01, "enveloped index never got bright: {early}");
+        assert!(
+            early > 5.0 * late,
+            "spectrum did not settle: early {early}, late {late}"
+        );
+    }
+
+    #[test]
+    fn feedback_thickens_the_modulator() {
+        // Modulator self-feedback enriches its waveform, which spreads carrier
+        // energy into higher sidebands (ratio 1 → harmonics of the carrier).
+        let sr = 48_000.0;
+        let pitch = 57u8;
+        let f0 = midi_to_freq(pitch);
+
+        let render_with_fb = |fb: f32| {
+            let mut s = synth();
+            set_real(&mut s, P_RATIO, 1.0);
+            set_real(&mut s, P_INDEX, 2.0);
+            set_real(&mut s, P_FEEDBACK, fb);
+            let mut buf = Vec::new();
+            render_notes(&mut s, &[on(pitch)], 16_384, &mut buf);
+            buf
+        };
+        let plain = render_with_fb(0.0);
+        let thick = render_with_fb(0.8);
+        let hi = |b: &[f32]| mag_at(&b[8192..], 6.0 * f0, sr) + mag_at(&b[8192..], 7.0 * f0, sr);
+        let (p, t) = (hi(&plain), hi(&thick));
+        assert!(
+            t > 3.0 * p,
+            "feedback added no high harmonics: plain {p}, fed back {t}"
+        );
+        assert!(thick.iter().all(|x| x.is_finite()), "feedback blew up");
+    }
+
+    #[test]
+    fn new_param_sweeps_are_click_free() {
+        // NOTE: not `detect_clicks` here — high-feedback FM is legitimately
+        // edgy (near-saw waveform) and the detector flags its per-period
+        // fronts. A parameter discontinuity would jump far beyond the
+        // waveform's own slope, so an adjacent-delta bound is the right tool.
+        let mut s = synth();
+        set_real(&mut s, P_RATIO, 2.0);
+        set_real(&mut s, P_INDEX, 4.0);
+        let mut buf = Vec::new();
+        render_notes(&mut s, &[on(57)], 4096, &mut buf);
+        let mut whole = Vec::new();
+        for k in 0..64 {
+            let v = k as f32 / 63.0;
+            s.set_param(P_INDEX_ENV, v);
+            s.set_param(P_FEEDBACK, v);
+            render_notes(&mut s, &[], 256, &mut buf);
+            whole.extend_from_slice(&buf);
+        }
+        assert!(whole.iter().all(|x| x.is_finite()));
+        let max_delta = whole
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_delta < 0.6,
+            "sweep discontinuity, max delta {max_delta}"
         );
     }
 

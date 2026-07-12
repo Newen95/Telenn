@@ -9,5 +9,6 @@ commit** que toute fiche créée/modifiée (voir `README.md`).
 | `workflows/compose-style.md` | workflow | composer dans un style donné | — | — |
 | `techniques/mixing.md` | technique | cibles de mix et gain-staging | — | — |
 | `lessons.md` | leçons | journal transverse daté | — | — |
+| `sounds/berceuse-hantee.md` | son | mobile musical hanté (lame pincée + reverb), calé sur une référence réelle ; démo Brahms incluse | plucked, reverb | **validé 2026-07-11 (oreille humaine, reverb plate comprise)** |
 | `styles/_template.md` | gabarit | fiche de style | — | — |
 | `sounds/_template.md` | gabarit | recette de son | — | — |

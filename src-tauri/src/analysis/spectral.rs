@@ -34,13 +34,26 @@ pub struct Harmonic {
 }
 
 /// Measure partials k = 1..=16 (below 0.45·fs). Each partial is peak-searched
-/// within ±3% of `k·f0` (Goertzel scan) so slightly inharmonic partials are
-/// still captured, and its deviation from the harmonic grid is reported.
+/// within ±3% of `k·f0` (coarse Goertzel scan, then a fine pass around the
+/// best coarse hit — one pass alone quantizes deviations to ~13 cents),
+/// and its deviation from the harmonic grid is reported.
 pub fn harmonics(x: &[f32], sample_rate: u32, f0: f32) -> Vec<Harmonic> {
     if f0 <= 0.0 || x.is_empty() {
         return Vec::new();
     }
     let sr = sample_rate as f32;
+    let scan = |centre: f32, span: f32, steps: i32| -> (f32, f32) {
+        let (mut best_freq, mut best_mag) = (centre, 0.0f32);
+        for step in -steps..=steps {
+            let freq = centre * (1.0 + span * step as f32 / steps as f32);
+            let mag = goertzel(x, sr, freq);
+            if mag > best_mag {
+                best_mag = mag;
+                best_freq = freq;
+            }
+        }
+        (best_freq, best_mag)
+    };
     let mut out = Vec::new();
     let mut fundamental_mag = 0.0f32;
     for k in 1..=16u32 {
@@ -48,16 +61,9 @@ pub fn harmonics(x: &[f32], sample_rate: u32, f0: f32) -> Vec<Harmonic> {
         if target >= 0.45 * sr {
             break;
         }
-        // Scan ±3% in 9 steps for the local peak.
-        let (mut best_freq, mut best_mag) = (target, 0.0f32);
-        for step in -4i32..=4 {
-            let freq = target * (1.0 + 0.03 * step as f32 / 4.0);
-            let mag = goertzel(x, sr, freq);
-            if mag > best_mag {
-                best_mag = mag;
-                best_freq = freq;
-            }
-        }
+        // Coarse ±3% (13-cent grid), then fine ±0.375% (1.6-cent grid).
+        let (coarse_freq, _) = scan(target, 0.03, 4);
+        let (best_freq, best_mag) = scan(coarse_freq, 0.00375, 4);
         if k == 1 {
             fundamental_mag = best_mag;
             if fundamental_mag <= 0.0 {
@@ -129,8 +135,9 @@ pub fn spectral_flatness_db(power: &[f32], fft_len: usize, sample_rate: u32) -> 
     (10.0 * (geometric / arithmetic).log10()) as f32
 }
 
-/// Fraction of total band power (50 Hz..Nyquist) lying within ±1 bin of the
-/// measured partials. 1.0 = fully tonal, low = noisy.
+/// Fraction of total band power (50 Hz..Nyquist) lying within ±3 bins of the
+/// measured partials (the Hann-windowed peak spreads over a few bins).
+/// 1.0 = fully tonal, low = noisy.
 pub fn harmonic_ratio(
     power: &[f32],
     fft_len: usize,
@@ -149,8 +156,8 @@ pub fn harmonic_ratio(
     let mut tonal = 0.0f64;
     for h in harmonics {
         let bin = (h.freq_hz * fft_len as f32 / sample_rate as f32).round() as usize;
-        let lo = bin.saturating_sub(1).max(first);
-        let hi = (bin + 2).min(power.len());
+        let lo = bin.saturating_sub(3).max(first);
+        let hi = (bin + 4).min(power.len());
         if lo < hi {
             tonal += power[lo..hi].iter().map(|&p| p as f64).sum::<f64>();
         }

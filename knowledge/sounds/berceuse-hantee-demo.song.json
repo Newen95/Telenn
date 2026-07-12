@@ -1,0 +1,58 @@
+{
+  "version": 1,
+  "bpm": 87,
+  "time_signature": [3, 4],
+  "master_gain_db": 0.0,
+  "tracks": [
+    {
+      "id": "berceuse",
+      "name": "Berceuse comparaison",
+      "chain": [
+        {
+          "id": "ins",
+          "module": "plucked",
+          "params": {
+            "brightness": 0.35,
+            "decay": 0.98,
+            "level": 0.867,
+            "release": 1.0
+          }
+        },
+        { "id": "rev", "module": "reverb", "params": { "mix": 0.35, "size": 0.82 } }
+      ],
+      "clips": [
+        {
+          "id": "c1",
+          "start": "1.1.0",
+          "length": "8.0.0",
+          "notes": [
+            { "id": "b01", "pitch": 90, "start": "1.1.0",   "length": "0.0.480", "vel": 78 },
+            { "id": "b02", "pitch": 90, "start": "1.1.480", "length": "0.0.480", "vel": 74 },
+            { "id": "b03", "pitch": 93, "start": "1.2.0",   "length": "0.1.480", "vel": 82 },
+            { "id": "b04", "pitch": 90, "start": "1.3.480", "length": "0.0.480", "vel": 76 },
+            { "id": "b05", "pitch": 90, "start": "2.1.0",   "length": "0.0.480", "vel": 74 },
+            { "id": "b06", "pitch": 93, "start": "2.2.0",   "length": "0.1.480", "vel": 82 },
+            { "id": "b07", "pitch": 90, "start": "3.1.0",   "length": "0.0.480", "vel": 78 },
+            { "id": "b08", "pitch": 93, "start": "3.1.480", "length": "0.0.480", "vel": 80 },
+            { "id": "b09", "pitch": 86, "start": "3.2.0",   "length": "0.1.0",   "vel": 82 },
+            { "id": "b10", "pitch": 85, "start": "3.3.0",   "length": "0.1.480", "vel": 78 },
+            { "id": "b11", "pitch": 91, "start": "4.1.480", "length": "0.1.480", "vel": 80 },
+            { "id": "b12", "pitch": 93, "start": "4.3.0",   "length": "0.1.0",   "vel": 80 },
+            { "id": "b13", "pitch": 88, "start": "5.1.0",   "length": "0.0.480", "vel": 76 },
+            { "id": "b14", "pitch": 90, "start": "5.1.480", "length": "0.0.480", "vel": 76 },
+            { "id": "b15", "pitch": 88, "start": "5.3.0",   "length": "0.0.480", "vel": 74 },
+            { "id": "b16", "pitch": 88, "start": "5.3.480", "length": "0.0.480", "vel": 72 },
+            { "id": "b17", "pitch": 86, "start": "6.1.0",   "length": "0.1.0",   "vel": 76 },
+            { "id": "b18", "pitch": 91, "start": "6.2.0",   "length": "0.1.0",   "vel": 78 },
+            { "id": "b19", "pitch": 91, "start": "7.1.480", "length": "0.0.480", "vel": 78 },
+            { "id": "b20", "pitch": 97, "start": "7.2.0",   "length": "0.0.480", "vel": 84 },
+            { "id": "b21", "pitch": 95, "start": "7.2.480", "length": "0.0.480", "vel": 80 },
+            { "id": "b22", "pitch": 93, "start": "7.3.0",   "length": "0.1.0",   "vel": 80 },
+            { "id": "b23", "pitch": 97, "start": "8.1.0",   "length": "0.1.0",   "vel": 78 },
+            { "id": "b24", "pitch": 86, "start": "8.2.0",   "length": "0.2.0",   "vel": 80 }
+          ]
+        }
+      ]
+    }
+  ]
+}

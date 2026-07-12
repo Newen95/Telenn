@@ -314,7 +314,8 @@ impl RtState {
                 });
             }
 
-            self.graph.process_block(self.sample_rate, n);
+            self.graph
+                .process_block(self.sample_rate, n, self.schedule.samples_per_beat as f32);
             // The mixer stage: mono track tails → interleaved stereo, with
             // per-track gain/pan and the master gain applied inside.
             self.mixer.mix(&self.graph, n, &mut self.mix);
@@ -324,7 +325,9 @@ impl RtState {
             // its fade window elapses.
             let mut collect = false;
             if let Some(fading) = self.fading.as_mut() {
-                fading.process_block(self.sample_rate, n);
+                // Same tempo as the live graph: a removed synced delay's tail
+                // must not glide back to its ms fallback while fading out.
+                fading.process_block(self.sample_rate, n, self.schedule.samples_per_beat as f32);
                 fading.clear_notes();
                 let energy = self
                     .mixer

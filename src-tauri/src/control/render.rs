@@ -60,6 +60,9 @@ pub fn render_samples_with_tail(
     let schedule = project.to_schedule(sample_rate, &index)?;
 
     let total = schedule.loop_len.saturating_mul(loops as u64) as usize;
+    // The tail phase feeds no events but keeps the song's tempo: a synced
+    // delay must not glide back to its ms fallback while ringing out.
+    let samples_per_beat = schedule.samples_per_beat as f32;
     let mut out = Vec::with_capacity((total + tail_frames as usize) * 2);
     let mut cursor = SequencerCursor::new();
     pump(
@@ -68,6 +71,7 @@ pub fn render_samples_with_tail(
         &mut cursor,
         Some(&schedule),
         sample_rate,
+        samples_per_beat,
         total,
         &mut out,
     );
@@ -77,6 +81,7 @@ pub fn render_samples_with_tail(
         &mut cursor,
         None,
         sample_rate,
+        samples_per_beat,
         tail_frames as usize,
         &mut out,
     );
@@ -86,12 +91,14 @@ pub fn render_samples_with_tail(
 /// Drive the graph + mixer for `total` frames, appending interleaved stereo
 /// to `out`. `schedule = None` keeps processing without feeding events (the
 /// tail phase — the cursor would wrap the loop and retrigger notes).
+#[allow(clippy::too_many_arguments)]
 fn pump(
     graph: &mut CompiledGraph,
     mixer: &mut Mixer,
     cursor: &mut SequencerCursor,
     schedule: Option<&Schedule>,
     sample_rate: u32,
+    samples_per_beat: f32,
     total: usize,
     out: &mut Vec<f32>,
 ) {
@@ -103,7 +110,7 @@ fn pump(
             let g = &mut *graph;
             cursor.advance(n, schedule, |node, ev| g.push_note(node, ev));
         }
-        graph.process_block(sample_rate as f32, n);
+        graph.process_block(sample_rate as f32, n, samples_per_beat);
         mixer.mix(graph, n, &mut stereo);
         out.extend_from_slice(&stereo[..n * 2]);
         graph.clear_notes();

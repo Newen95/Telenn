@@ -1,12 +1,17 @@
-//! Reverb effect: mono Freeverb topology — 8 parallel damped comb filters into
-//! 4 series allpasses. Honest quality, not a Lexicon; mono by design for the MVP
-//! (the mixer pans it with its track), stereo is the first post-MVP beneficiary
-//! of the channel-agnostic seam.
+//! Reverb effect: mono Dattorro plate (Jon Dattorro, "Effect Design Part 1:
+//! Reverberator and Other Filters", JAES 1997) — predelay, input diffusion,
+//! and a modulated figure-of-eight tank. Denser and smoother than the old
+//! Freeverb topology, with the tank allpasses gently modulated so the tail
+//! never locks into metallic resonances. Mono by design for the MVP (the
+//! mixer pans it with its track); the tap tables already exist in left/right
+//! pairs for the day the channel seam opens.
 //!
-//! `size` sets the comb feedback (tail length), `damp` low-passes inside each
-//! comb loop (darker tail), `mix` blends dry/wet. Comb/allpass delay lengths are
-//! the classic Freeverb tunings, scaled to the engine sample rate. All feedback
-//! paths flush denormals (inside `DelayLine::write` and the damping one-pole).
+//! `size` sets the tank decay (tail length), `damp` low-passes inside the
+//! tank (darker tail), `predelay` separates the dry attack from the wet
+//! field, `mix` blends dry/wet. All tunings are Dattorro's, given at his
+//! 29.761 kHz reference rate and scaled to the engine sample rate in
+//! `prepare`. Every feedback path flushes denormals (`DelayLine::write` and
+//! the one-pole stores).
 
 use crate::engine::dsp::{flush, DelayLine};
 use crate::engine::node::{
@@ -14,32 +19,56 @@ use crate::engine::node::{
 };
 use crate::engine::params::{LinearRamp, OnePole};
 
-/// Freeverb delay tunings, in samples at the reference rate.
-const REF_SR: f32 = 44_100.0;
-const COMB_TUNINGS: [usize; 8] = [1116, 1188, 1277, 1356, 1422, 1491, 1557, 1617];
-const ALLPASS_TUNINGS: [usize; 4] = [556, 441, 341, 225];
+/// Dattorro's reference sample rate: every tuning below is in samples at it.
+const REF_SR: f32 = 29_761.0;
 
-/// Input attenuation before the comb bank (8 combs sum back up), and the wet
-/// make-up after it — both straight from Freeverb.
-const INPUT_GAIN: f32 = 0.015;
-const WET_GAIN: f32 = 3.0;
-/// `size` 0..1 maps to comb feedback `0.7 + 0.28 * size` (Freeverb roomsize).
-const FEEDBACK_BASE: f32 = 0.7;
-const FEEDBACK_SPAN: f32 = 0.28;
-/// `damp` 0..1 is scaled down so full damping still lets the tail breathe.
-const DAMP_SCALE: f32 = 0.4;
-/// Allpass diffusion feedback.
-const ALLPASS_FEEDBACK: f32 = 0.5;
+/// Input diffusion allpasses: (length, coefficient).
+const INPUT_APS: [(usize, f32); 4] = [(142, 0.75), (107, 0.75), (379, 0.625), (277, 0.625)];
+/// Input bandwidth one-pole (barely-there high shave, per the paper).
+const BANDWIDTH: f32 = 0.9995;
 
-/// Smoothing for size/damp (block rate) and mix (per sample).
+/// Tank tunings per branch: modulated allpass, delay 1, allpass 2, delay 2.
+const TANK_A: [usize; 4] = [672, 4453, 1800, 3720];
+const TANK_B: [usize; 4] = [908, 4217, 2656, 3163];
+/// Decay-diffusion-1 coefficient (the modulated tank allpasses).
+const TANK_AP1_G: f32 = -0.70;
+/// LFO rates of the two modulated allpasses, detuned so the branches never
+/// phase-lock; excursion in samples at the reference rate.
+const LFO_RATES_HZ: [f32; 2] = [0.60, 0.71];
+const LFO_EXCURSION: f32 = 12.0;
+
+/// Output tap offsets (paper, table 2), read positions per branch line, and
+/// their signs. Order: D1b, D1b, AP2b, D2b, D1a, AP2a, D2a for the left ear,
+/// mirrored for the right; mono output averages the two.
+const TAPS_L: [usize; 7] = [266, 2974, 1913, 1996, 1990, 187, 1066];
+const TAPS_R: [usize; 7] = [353, 3627, 1228, 2673, 2111, 335, 121];
+const TAP_SIGNS: [f32; 7] = [1.0, 1.0, -1.0, 1.0, -1.0, -1.0, -1.0];
+const TAP_GAIN: f32 = 0.6;
+
+/// Wet make-up, calibrated so the default-mix level matches the old reverb.
+const WET_GAIN: f32 = 1.0;
+
+/// `size` 0..1 maps to the tank decay gain. The plan's 0.55 floor measured
+/// out to a 2 s minimum RT60; 0.25..0.90 spans ~0.9 s (tight booth) to ~12 s
+/// (grandiose) with the default 0.5 landing near 2 s.
+const DECAY_BASE: f32 = 0.25;
+const DECAY_SPAN: f32 = 0.65;
+/// `damp` 0..1 scaled so full damping still lets the tail breathe.
+const DAMP_SCALE: f32 = 0.7;
+
+/// Smoothing: size/damp at block rate, mix per sample, predelay per sample
+/// (τ 50 ms — moving the knob tape-bends instead of clicking).
 const SMOOTH_S: f32 = 0.015;
 const RAMP_MS: f32 = 10.0;
+const PREDELAY_SMOOTH_S: f32 = 0.05;
+const PREDELAY_MAX_MS: f32 = 100.0;
 
 const P_SIZE: ParamId = 0;
 const P_DAMP: ParamId = 1;
 const P_MIX: ParamId = 2;
+const P_PREDELAY: ParamId = 3;
 
-const PARAMS: [ParamSpec; 3] = [
+const PARAMS: [ParamSpec; 4] = [
     ParamSpec {
         id: P_SIZE,
         name: "size",
@@ -67,57 +96,145 @@ const PARAMS: [ParamSpec; 3] = [
         default: 0.3,
         curve: ParamCurve::Linear,
     },
+    // Linear, not Log: Log cannot reach 0 ms (denormalize divides by min).
+    ParamSpec {
+        id: P_PREDELAY,
+        name: "predelay",
+        unit: "ms",
+        min: 0.0,
+        max: PREDELAY_MAX_MS,
+        default: 10.0,
+        curve: ParamCurve::Linear,
+    },
 ];
 
-/// Feedback comb with a one-pole low-pass in the loop (Freeverb's damped comb).
+/// Lattice allpass with a signed coefficient; output taps read its internal
+/// line (the `v` history), as the plate's tap tables require.
 #[derive(Default)]
-struct Comb {
+struct PlateAllpass {
     line: DelayLine,
     len: usize,
-    /// Damping low-pass state.
-    store: f32,
+    g: f32,
 }
 
-impl Comb {
-    fn prepare(&mut self, len: usize) {
+impl PlateAllpass {
+    fn prepare(&mut self, len: usize, g: f32) {
         self.line.prepare(len);
         self.len = len;
-        self.store = 0.0;
-    }
-
-    // RT-SAFE
-    fn tick(&mut self, x: f32, feedback: f32, damp: f32) -> f32 {
-        let out = self.line.read_at(self.len);
-        self.store = flush(out * (1.0 - damp) + self.store * damp);
-        self.line.write(x + self.store * feedback);
-        out
-    }
-}
-
-/// Freeverb allpass diffuser.
-#[derive(Default)]
-struct Allpass {
-    line: DelayLine,
-    len: usize,
-}
-
-impl Allpass {
-    fn prepare(&mut self, len: usize) {
-        self.line.prepare(len);
-        self.len = len;
+        self.g = g;
     }
 
     // RT-SAFE
     fn tick(&mut self, x: f32) -> f32 {
-        let bufout = self.line.read_at(self.len);
-        self.line.write(x + bufout * ALLPASS_FEEDBACK);
-        bufout - x
+        let d = self.line.read_at(self.len);
+        let v = x + self.g * d;
+        let y = d - self.g * v;
+        self.line.write(v);
+        y
+    }
+
+    // RT-SAFE
+    fn tap(&self, offset: usize) -> f32 {
+        self.line.read_at(offset)
+    }
+}
+
+/// Tank allpass whose length breathes under a slow sine LFO — the plate's
+/// anti-metallic trick: resonances never sit still long enough to ring.
+#[derive(Default)]
+struct ModAllpass {
+    line: DelayLine,
+    base_len: f32,
+    g: f32,
+    lfo_phase: f32,
+    lfo_inc: f32,
+    excursion: f32,
+}
+
+impl ModAllpass {
+    fn prepare(&mut self, base_len: f32, excursion: f32, g: f32, phase: f32, inc: f32) {
+        // +4: linear interpolation reads i and i+1 at the maximum excursion.
+        self.line
+            .prepare((base_len + excursion).ceil() as usize + 4);
+        self.base_len = base_len;
+        self.excursion = excursion;
+        self.g = g;
+        self.lfo_phase = phase;
+        self.lfo_inc = inc;
+    }
+
+    // RT-SAFE
+    fn tick(&mut self, x: f32) -> f32 {
+        self.lfo_phase += self.lfo_inc;
+        if self.lfo_phase >= 1.0 {
+            self.lfo_phase -= 1.0;
+        }
+        let offset = (std::f32::consts::TAU * self.lfo_phase).sin() * self.excursion;
+        let d = self.line.read(self.base_len + offset);
+        let v = x + self.g * d;
+        let y = d - self.g * v;
+        self.line.write(v);
+        y
+    }
+}
+
+/// One half of the figure-of-eight: modulated allpass → delay → damping
+/// one-pole → decay → allpass → delay. `fb` holds the last delay-2 output,
+/// the z⁻¹ the other branch reads (cross-coupling).
+#[derive(Default)]
+struct TankBranch {
+    ap1: ModAllpass,
+    delay1: DelayLine,
+    d1_len: usize,
+    damp_store: f32,
+    ap2: PlateAllpass,
+    delay2: DelayLine,
+    d2_len: usize,
+    fb: f32,
+}
+
+impl TankBranch {
+    fn prepare(&mut self, tunings: &[usize; 4], scale: f32, lfo_phase: f32, lfo_inc: f32) {
+        let len = |t: usize| ((t as f32 * scale).round() as usize).max(1);
+        self.ap1.prepare(
+            tunings[0] as f32 * scale,
+            LFO_EXCURSION * scale,
+            TANK_AP1_G,
+            lfo_phase,
+            lfo_inc,
+        );
+        self.d1_len = len(tunings[1]);
+        self.delay1.prepare(self.d1_len);
+        self.damp_store = 0.0;
+        self.ap2.prepare(len(tunings[2]), 0.5);
+        self.d2_len = len(tunings[3]);
+        self.delay2.prepare(self.d2_len);
+        self.fb = 0.0;
+    }
+
+    // RT-SAFE. `other_fb` is the opposite branch's previous-sample output.
+    fn tick(&mut self, diffused: f32, other_fb: f32, decay: f32, damping: f32) {
+        let x = self.ap1.tick(diffused + decay * other_fb);
+        let d1 = self.delay1.read_at(self.d1_len);
+        self.delay1.write(x);
+        self.damp_store = flush(d1 * (1.0 - damping) + self.damp_store * damping);
+        let y = self.ap2.tick(self.damp_store * decay);
+        let d2 = self.delay2.read_at(self.d2_len);
+        self.delay2.write(y);
+        self.fb = d2;
     }
 }
 
 pub struct Reverb {
-    combs: [Comb; 8],
-    allpasses: [Allpass; 4],
+    sample_rate: f32,
+    predelay_line: DelayLine,
+    predelay_len: OnePole,
+    bw_store: f32,
+    input_aps: [PlateAllpass; 4],
+    a: TankBranch,
+    b: TankBranch,
+    taps_l: [usize; 7],
+    taps_r: [usize; 7],
     size: OnePole,
     damp: OnePole,
     mix: LinearRamp,
@@ -127,8 +244,15 @@ impl Default for Reverb {
     fn default() -> Self {
         // Real state is rebuilt in `prepare` once the sample rate is known.
         Self {
-            combs: Default::default(),
-            allpasses: Default::default(),
+            sample_rate: 48_000.0,
+            predelay_line: DelayLine::default(),
+            predelay_len: OnePole::new(480.0, 0.99),
+            bw_store: 0.0,
+            input_aps: Default::default(),
+            a: TankBranch::default(),
+            b: TankBranch::default(),
+            taps_l: [0; 7],
+            taps_r: [0; 7],
             size: OnePole::new(default_real(P_SIZE), 0.99),
             damp: OnePole::new(default_real(P_DAMP), 0.99),
             mix: LinearRamp::new(default_real(P_MIX), RAMP_MS, 48_000.0),
@@ -136,24 +260,55 @@ impl Default for Reverb {
     }
 }
 
+impl Reverb {
+    /// Sum a branch's seven output taps with the plate's signs. // RT-SAFE
+    fn read_taps(own: &TankBranch, other: &TankBranch, taps: &[usize; 7]) -> f32 {
+        // Order: D1other ×2, AP2other, D2other, then D1own, AP2own, D2own.
+        TAP_GAIN
+            * (TAP_SIGNS[0] * other.delay1.read_at(taps[0])
+                + TAP_SIGNS[1] * other.delay1.read_at(taps[1])
+                + TAP_SIGNS[2] * other.ap2.tap(taps[2])
+                + TAP_SIGNS[3] * other.delay2.read_at(taps[3])
+                + TAP_SIGNS[4] * own.delay1.read_at(taps[4])
+                + TAP_SIGNS[5] * own.ap2.tap(taps[5])
+                + TAP_SIGNS[6] * own.delay2.read_at(taps[6]))
+    }
+}
+
 impl AudioNode for Reverb {
     fn process(&mut self, _ctx: &ProcessCtx, io: &mut NodeIo) {
         let frames = io.frames();
-        let feedback = FEEDBACK_BASE + FEEDBACK_SPAN * self.size.advance(frames);
-        let damp = self.damp.advance(frames) * DAMP_SCALE;
+        let decay = DECAY_BASE + DECAY_SPAN * self.size.advance(frames);
+        let damping = self.damp.advance(frames) * DAMP_SCALE;
+        // Decay-diffusion-2 follows decay (paper's recommendation), capped.
+        let g2 = (decay + 0.15).clamp(0.25, 0.5);
+        self.a.ap2.g = g2;
+        self.b.ap2.g = g2;
 
         let (input, output) = io.in_out(0, 0);
         for (out, &x) in output.iter_mut().zip(input) {
             let mix = self.mix.tick();
-            let inject = x * INPUT_GAIN;
-            let mut wet = 0.0;
-            for comb in &mut self.combs {
-                wet += comb.tick(inject, feedback, damp);
+
+            let pd = self.predelay_len.advance(1).max(1.0);
+            let delayed = self.predelay_line.read(pd);
+            self.predelay_line.write(x);
+
+            self.bw_store = flush(delayed * BANDWIDTH + self.bw_store * (1.0 - BANDWIDTH));
+            let mut diffused = self.bw_store;
+            for ap in &mut self.input_aps {
+                diffused = ap.tick(diffused);
             }
-            for ap in &mut self.allpasses {
-                wet = ap.tick(wet);
-            }
-            *out = x * (1.0 - mix) + wet * WET_GAIN * mix;
+
+            // Cross-feed with the previous sample's branch outputs (z⁻¹).
+            let (fb_a, fb_b) = (self.a.fb, self.b.fb);
+            self.a.tick(diffused, fb_b, decay, damping);
+            self.b.tick(diffused, fb_a, decay, damping);
+
+            let yl = Self::read_taps(&self.a, &self.b, &self.taps_l);
+            let yr = Self::read_taps(&self.b, &self.a, &self.taps_r);
+            let wet = 0.5 * (yl + yr) * WET_GAIN;
+
+            *out = x * (1.0 - mix) + wet * mix;
         }
     }
 
@@ -180,22 +335,40 @@ impl AudioNode for Reverb {
             P_SIZE => self.size.set_target(real),
             P_DAMP => self.damp.set_target(real),
             P_MIX => self.mix.set_target(real),
+            P_PREDELAY => self
+                .predelay_len
+                .set_target(real * 0.001 * self.sample_rate),
             _ => {}
         }
     }
 
     fn prepare(&mut self, sample_rate: f32, _max_block: usize) {
+        self.sample_rate = sample_rate;
         let scale = sample_rate / REF_SR;
-        for (comb, &len) in self.combs.iter_mut().zip(&COMB_TUNINGS) {
-            comb.prepare(((len as f32 * scale) as usize).max(1));
+        let len = |t: usize| ((t as f32 * scale).round() as usize).max(1);
+
+        self.predelay_line
+            .prepare((PREDELAY_MAX_MS * 0.001 * sample_rate).ceil() as usize + 2);
+        self.bw_store = 0.0;
+        for (ap, &(l, g)) in self.input_aps.iter_mut().zip(&INPUT_APS) {
+            ap.prepare(len(l), g);
         }
-        for (ap, &len) in self.allpasses.iter_mut().zip(&ALLPASS_TUNINGS) {
-            ap.prepare(((len as f32 * scale) as usize).max(1));
+        // Phases 0.0 / 0.5: decorrelated from the first sample, deterministic.
+        self.a
+            .prepare(&TANK_A, scale, 0.0, LFO_RATES_HZ[0] / sample_rate);
+        self.b
+            .prepare(&TANK_B, scale, 0.5, LFO_RATES_HZ[1] / sample_rate);
+        for i in 0..7 {
+            self.taps_l[i] = len(TAPS_L[i]);
+            self.taps_r[i] = len(TAPS_R[i]);
         }
+
         let coef = (-1.0 / (SMOOTH_S * sample_rate)).exp();
         self.size = OnePole::new(default_real(P_SIZE), coef);
         self.damp = OnePole::new(default_real(P_DAMP), coef);
         self.mix = LinearRamp::new(default_real(P_MIX), RAMP_MS, sample_rate);
+        let pd_coef = (-1.0 / (PREDELAY_SMOOTH_S * sample_rate)).exp();
+        self.predelay_len = OnePole::new(default_real(P_PREDELAY) * 0.001 * sample_rate, pd_coef);
     }
 }
 
@@ -208,6 +381,10 @@ fn default_real(id: ParamId) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis::envelope::decay_rt60;
+    use crate::analysis::fft::power_spectrum;
+    use crate::analysis::levels::detect_clicks;
+    use crate::analysis::spectral::spectral_flatness_db;
 
     const SR: f32 = 48_000.0;
 
@@ -224,6 +401,7 @@ mod tests {
             sample_rate: SR,
             frames,
             channels: 1,
+            samples_per_beat: 0.0,
         };
         let mut io = NodeIo::new(&[], input, out, frames);
         r.process(&ctx, &mut io);
@@ -248,7 +426,7 @@ mod tests {
 
     #[test]
     fn impulse_response_decays_to_silence() {
-        // Default size (feedback 0.84): the tail must die out — finite RT60.
+        // Default size (decay 0.575, RT60 ≈ 2 s): finite tail, silent by 3.5 s.
         let mut r = fx();
         r.set_param(P_MIX, 1.0);
         let out = impulse_response(&mut r, 4.0);
@@ -308,5 +486,96 @@ mod tests {
         for (i, (&y, &x)) in out.iter().zip(&input).enumerate().skip(1_000) {
             assert!((y - x).abs() < 1.0e-6, "wet leak at {i}: out {y} vs in {x}");
         }
+    }
+
+    #[test]
+    fn predelay_shifts_the_onset() {
+        // 10τ of silence lets the predelay glide settle before the impulse.
+        let settle = 24_000usize;
+        let onset = |predelay_norm: f32| -> usize {
+            let mut r = fx();
+            r.set_param(P_MIX, 1.0);
+            r.set_param(P_PREDELAY, predelay_norm);
+            let mut input = vec![0.0; settle + 48_000];
+            input[settle] = 1.0;
+            let mut out = Vec::new();
+            render(&mut r, &input, &mut out);
+            out[settle..]
+                .iter()
+                .position(|s| s.abs() > 1.0e-6)
+                .expect("no output at all")
+        };
+        let base = onset(PARAMS[P_PREDELAY as usize].normalize(0.0));
+        let shifted = onset(PARAMS[P_PREDELAY as usize].normalize(50.0));
+        let diff = shifted as i64 - base as i64;
+        assert!(
+            (diff - 2_400).abs() <= 2,
+            "predelay 50 ms shifted the onset by {diff} samples (expected 2400)"
+        );
+    }
+
+    #[test]
+    fn late_tail_is_spectrally_flat() {
+        // The anti-metallic regression: a diffuse plate tail has no dominant
+        // resonances. The old Freeverb topology measured far lower (comby).
+        let mut r = fx();
+        r.set_param(P_MIX, 1.0);
+        r.set_param(P_SIZE, 0.8);
+        let out = impulse_response(&mut r, 2.0);
+        let slice = &out[48_000..72_000]; // 1.0–1.5 s into the tail
+        let power = power_spectrum(slice).expect("spectrum");
+        let flatness = spectral_flatness_db(&power, slice.len().next_power_of_two(), 48_000);
+        assert!(
+            flatness > -45.0,
+            "tail is resonant/metallic: flatness {flatness} dB"
+        );
+    }
+
+    #[test]
+    fn param_sweep_produces_no_clicks() {
+        // Sweep every knob while processing: smoothing must keep it click-free.
+        let mut r = fx();
+        r.set_param(P_MIX, 0.5);
+        let total = 3 * 48_000usize;
+        let block = 256usize;
+        let mut out = Vec::with_capacity(total);
+        let mut buf = Vec::new();
+        let blocks = total / block;
+        for i in 0..blocks {
+            let t = i as f32 / blocks as f32;
+            // size 0→1→0, damp 1→0, predelay 0→80 ms.
+            let tri = 1.0 - (2.0 * t - 1.0).abs();
+            r.set_param(P_SIZE, tri);
+            r.set_param(P_DAMP, 1.0 - t);
+            r.set_param(P_PREDELAY, PARAMS[P_PREDELAY as usize].normalize(80.0 * t));
+            let input: Vec<f32> = (0..block)
+                .map(|j| {
+                    let n = i * block + j;
+                    (std::f32::consts::TAU * 440.0 * n as f32 / SR).sin() * 0.5
+                })
+                .collect();
+            render(&mut r, &input, &mut buf);
+            out.extend_from_slice(&buf);
+        }
+        let clicks = detect_clicks(&out[4_800..], 48_000);
+        assert!(clicks.is_empty(), "param sweep clicked: {clicks:?}");
+    }
+
+    #[test]
+    fn rt60_grows_monotonically_with_size() {
+        let rt = |size: f32| -> f32 {
+            let mut r = fx();
+            r.set_param(P_MIX, 1.0);
+            r.set_param(P_SIZE, size);
+            let out = impulse_response(&mut r, 6.0);
+            decay_rt60(&out, 48_000, 0.0)
+                .expect("measurable decay")
+                .rt60_s
+        };
+        let (a, b, c) = (rt(0.2), rt(0.5), rt(0.9));
+        assert!(
+            a < b && b < c,
+            "rt60 not monotonic in size: {a} / {b} / {c}"
+        );
     }
 }

@@ -104,6 +104,10 @@ pub enum NoteKind {
 
 /// Per-block context passed to every node.
 pub struct ProcessCtx {
+    /// Samples per beat from the active schedule; 0.0 = no tempo known
+    /// (live keyboard before a project loads, offline tail phase of a probe).
+    /// Tempo-aware effects fall back to their absolute-time params on 0.0.
+    pub samples_per_beat: f32,
     pub sample_rate: f32,
     pub frames: usize,
     /// Channels per port. Fixed to 1 today (the graph is mono upstream of the

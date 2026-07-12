@@ -396,6 +396,7 @@ mod tests {
             sample_rate: 48_000.0,
             frames,
             channels: 1,
+            samples_per_beat: 0.0,
         };
         let mut io = NodeIo::new(notes, &[], out, frames);
         s.process(&ctx, &mut io);

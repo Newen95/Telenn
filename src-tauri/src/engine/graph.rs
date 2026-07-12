@@ -202,8 +202,9 @@ impl CompiledGraph {
     }
 
     /// Process one block of `frames` samples (≤ the compiled `max_block`). The
-    /// caller routes notes and params beforehand. // RT-SAFE
-    pub fn process_block(&mut self, sample_rate: f32, frames: usize) {
+    /// caller routes notes and params beforehand; `samples_per_beat` comes from
+    /// the active schedule (0.0 = no tempo known). // RT-SAFE
+    pub fn process_block(&mut self, sample_rate: f32, frames: usize, samples_per_beat: f32) {
         self.last_frames = frames;
         for pos in 0..self.order.len() {
             let node = self.order[pos];
@@ -234,6 +235,7 @@ impl CompiledGraph {
             let (_left, right) = self.outputs.split_at_mut(pos);
             let out_buf = &mut right[0][..out_len];
             let ctx = ProcessCtx {
+                samples_per_beat,
                 sample_rate,
                 frames,
                 channels: self.channels,
@@ -499,7 +501,7 @@ mod tests {
             master_gain_db: 0.0,
         };
         let mut g = compile(&desc, create, 48_000.0, 64, 1).expect("compiles");
-        g.process_block(48_000.0, 32);
+        g.process_block(48_000.0, 32, 0.0);
         // const(1.0) → half(×0.5) = 0.5 on the tail buffer.
         assert!(g.node_output(1).iter().all(|&s| (s - 0.5).abs() < 1e-6));
     }
@@ -531,7 +533,7 @@ mod tests {
             master_gain_db: 0.0,
         };
         let mut g = compile(&desc, create, 48_000.0, 64, 1).expect("compiles");
-        g.process_block(48_000.0, 32);
+        g.process_block(48_000.0, 32, 0.0);
         let m = g.meters();
         assert_eq!(m.len(), 2, "one meter per node");
         // A constant signal: peak == rms == the level.
@@ -591,7 +593,7 @@ mod tests {
         // Ring the tail (struck to 1.0 by prepare) well down.
         let mut a = compile(&desc, test_support::create, 48_000.0, 64, 1).expect("compiles");
         for _ in 0..16 {
-            a.process_block(48_000.0, 64);
+            a.process_block(48_000.0, 64, 0.0);
         }
         let decayed = a.node_output(0)[0];
         assert!(decayed < 0.7, "tail should have decayed: {decayed}");
@@ -600,7 +602,7 @@ mod tests {
         // live node must carry the decayed state instead of restarting at 1.0.
         let mut b = compile(&desc, test_support::create, 48_000.0, 64, 1).expect("compiles");
         b.adopt_nodes_from(&mut a);
-        b.process_block(48_000.0, 64);
+        b.process_block(48_000.0, 64, 0.0);
         assert!(
             b.node_output(0)[0] <= decayed,
             "live state was not moved into the new graph: {}",

@@ -203,7 +203,7 @@ mod tests {
     fn mix_one_block(track: TrackMix, master_db: f32) -> Vec<f32> {
         let mut graph = dc_graph(track, master_db);
         let mut mixer = Mixer::new(48_000.0, graph.track_mix(), graph.master_gain_db());
-        graph.process_block(48_000.0, 64);
+        graph.process_block(48_000.0, 64, 0.0);
         let mut out = vec![0.0f32; 64 * 2];
         mixer.mix(&graph, 64, &mut out);
         out
@@ -266,7 +266,7 @@ mod tests {
     fn retarget_glides_without_a_step() {
         let mut graph = dc_graph(TrackMix::default(), 0.0);
         let mut mixer = Mixer::new(48_000.0, graph.track_mix(), graph.master_gain_db());
-        graph.process_block(48_000.0, 64);
+        graph.process_block(48_000.0, 64, 0.0);
         let mut out = vec![0.0f32; 64 * 2];
         mixer.mix(&graph, 64, &mut out);
 
@@ -280,7 +280,7 @@ mod tests {
         );
         let mut whole = Vec::new();
         for _ in 0..20 {
-            graph.process_block(48_000.0, 64);
+            graph.process_block(48_000.0, 64, 0.0);
             mixer.mix(&graph, 64, &mut out);
             whole.extend(out.iter().step_by(2).copied()); // left channel
         }

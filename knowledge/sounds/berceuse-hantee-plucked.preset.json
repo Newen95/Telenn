@@ -1,0 +1,9 @@
+{
+  "module": "plucked",
+  "params": {
+    "brightness": 0.35,
+    "decay": 0.98,
+    "level": 0.867,
+    "release": 1.0
+  }
+}

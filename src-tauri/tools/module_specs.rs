@@ -32,6 +32,10 @@ const QUIRKS: &str = "\
 - **fm**: `ratio` = modulator/carrier frequency ratio — integer ratios give
   harmonic tones, non-integer give inharmonic/bell timbres. `index` =
   modulation depth (radians): more index, brighter and noisier spectrum.
+- **plucked**: `brightness` below ~0.3 lets a DC offset build up in the
+  loop (measured -0.013 at 0.1) and skews centroid readings — stay >= 0.3.
+  `release` gates the string: for a freely ringing tine set it to the max
+  (1000 ms) and let `decay` govern the ring length.
 - **compressor**: `threshold` is declared `curve: linear` with unit dB ON
   PURPOSE — the gain computer consumes the dB number itself (normalize/
   denormalize stay a plain ramp over -60..0 dB), unlike `makeup`/`level`

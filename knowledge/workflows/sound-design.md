@@ -18,7 +18,8 @@ Lire `knowledge/INDEX.md` : un son proche existe peut-être dans `sounds/`
 | sombre, chaud, rond | centroïde < 800 Hz, H2–H3 dominants |
 | percussif, claquant | attaque < 10 ms |
 | nappe, doux, qui monte | attaque > 200 ms, sustain élevé |
-| métallique, cloche | inharmonicité > 10 cents (ou fm ratio non entier) |
+| métallique, cloche, gong | inharmonicité > 10 cents (fm ratio NON entier) |
+| boîte à musique, mobile, celesta, jouet | ratio harmonique > 0.9 (fm ratio ENTIER, index < 1), attaque < 10 ms |
 | boisé, pincé | attaque < 20 ms, RT60 0,3–1 s, ratio harmonique > 0,8 |
 | soufflé, airy, bruité | flatness > −20 dB, ratio harmonique < 0,5 |
 | sec | RT60 < 0,3 s |

@@ -98,6 +98,25 @@ let panLastY = 0;
 let spaceHeld = false;
 // Last cursor X, so keyboard zoom (+/-) stays centred where the user is looking.
 let lastPointerX = 0;
+// Last hover position while the pointer is over the canvas (NaN once it
+// leaves): the world can change UNDER a stationary pointer — keyboard delete,
+// an external edit adding/removing a note right there — and the cursor shape
+// must follow without waiting for a mouse move.
+let hoverX = NaN;
+let hoverY = NaN;
+
+/** Re-derive the hover cursor in place after the blocks changed. */
+function refreshCursor(): void {
+  if (!canvas.value || !fsm || Number.isNaN(hoverX)) return;
+  if (panning || spaceHeld || gutterPressing || gutterReorder) return;
+  if (inGutter(hoverX)) return;
+  canvas.value.style.cursor = fsm.cursorAt(hoverX, hoverY);
+}
+
+function onPointerLeave(): void {
+  hoverX = NaN;
+  hoverY = NaN;
+}
 // A held gutter key (the keyboard preview): sounds while pressed, glissandos as
 // the pointer slides to other rows, releases on pointer up.
 let gutterPressing = false;
@@ -133,6 +152,14 @@ const fsm = props.adapter
       adapter: props.adapter,
     })
   : null;
+
+// The blocks changed (a keyboard delete, an undo, an external reload adding
+// or removing a note): whatever now sits under the stationary pointer decides
+// the cursor — don't wait for the next mouse move.
+watch(
+  () => props.blocks,
+  () => refreshCursor(),
+);
 
 function frame(ctx: CanvasRenderingContext2D, w: number, h: number): void {
   syncAxis();
@@ -227,6 +254,8 @@ function onPointerDown(e: PointerEvent): void {
 
 function onPointerMove(e: PointerEvent): void {
   lastPointerX = e.offsetX;
+  hoverX = e.offsetX;
+  hoverY = e.offsetY;
   syncAxis();
   // A pan drag: move the content with the cursor (drag right → reveal earlier
   // time / higher lanes), on both axes at once.
@@ -476,6 +505,7 @@ onMounted(() => {
     @pointerdown="onPointerDown"
     @pointermove="onPointerMove"
     @pointerup="onPointerUp"
+    @pointerleave="onPointerLeave"
     @dblclick="onDoubleClick"
     @keydown="onKeyDown"
     @keyup="onKeyUp"

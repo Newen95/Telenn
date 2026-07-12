@@ -61,7 +61,12 @@ const QUIRKS: &str = "\
 - **plucked**: `brightness` below ~0.3 lets a DC offset build up in the
   loop (measured -0.013 at 0.1) and skews centroid readings — stay >= 0.3.
   `release` gates the string: for a freely ringing tine set it to the max
-  (1000 ms) and let `decay` govern the ring length.
+  (1000 ms) and let `decay` govern the ring length. `broken` ages the
+  tuning: keys below C3 stay honest, above it each key gets a STABLE
+  hashed detune growing with the register, up to ±150 cents at C7 at
+  full knob (quadratic response: 0.5 ≈ a haunted ±37 cents, 1.0 =
+  deranged) — the worn music box / broken piano; applied at pluck time,
+  changes affect next notes.
 - **filter**: `type` is a rounded selector — 0 lowpass, 1 highpass,
   2 bandpass (constant skirt, peak gain ≈ Q), 3 notch. Cutoff/resonance
   glide; a TYPE change swaps coefficients instantly and can click on a hot

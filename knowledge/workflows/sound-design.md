@@ -25,6 +25,7 @@ Lire `knowledge/INDEX.md` : un son proche existe peut-être dans `sounds/`
 | vibraphone, métallique tenu | modal `material=1`, decay 2–4 s |
 | cloche réaliste, carillon | modal `material=2` — juger aux partiels (0.56/1.19·f), le f0 mesuré ment (pitch virtuel) |
 | cristallin, verre | modal `material=3` |
+| cassé, désaccordé, piano hanté, mécanisme usé | plucked `broken` 0.4–1 (détune stable par touche, croissant vers l'aigu) |
 | nappe qui s'ouvre/se referme | wavetable `pos_env` ±0.5–1, `pos_decay` 300–1500 ms (centroïde qui voyage) |
 | soufflé, airy, bruité | flatness > −20 dB, ratio harmonique < 0,5 (subtractive `noise` + cutoff) |
 | creux, clarinette, chiptune, jeu vidéo | harmoniques impaires seules : H2 ≤ H3 − 20 dB (subtractive `wave=1`, width 0.5) |

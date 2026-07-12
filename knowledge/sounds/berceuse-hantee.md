@@ -20,10 +20,11 @@ KS devient rêche (H2 fort).
 | RT60 | ≥ 2 s | 3.2 s (avec reverb) ✓ |
 | caractère | plink brillant → tenue quasi pure | idem (physique KS) ✓ |
 
-## Recette (v3 — lame pincée)
+## Recette (v3.1 — lame pincée + amincissement)
 
-- Chaîne : `plucked -> reverb`
+- Chaîne : `plucked -> filter -> reverb`
 - Presets : [`berceuse-hantee-plucked.preset.json`](./berceuse-hantee-plucked.preset.json)
+  + [`berceuse-hantee-filter.preset.json`](./berceuse-hantee-filter.preset.json)
   + [`berceuse-hantee-reverb.preset.json`](./berceuse-hantee-reverb.preset.json)
 
 | Param | Valeur réelle | Normalisé |
@@ -32,8 +33,10 @@ KS devient rêche (H2 fort).
 | plucked.decay | 0.98 (la lame résonne) | 0.980 |
 | plucked.release | 1000 ms (**libère la résonance** — un release court coupe la lame) | 1.000 |
 | plucked.level | −8 dB | 0.867 |
+| filter.cutoff | 2200 Hz (lp — amincit H2 vers la cible −26 dB de la référence) | 0.681 |
+| filter.resonance | 0.7 | 0.010 |
 | reverb.size | 0.55 | 0.550 |
-| reverb.mix | 0.55 | 0.550 |
+| reverb.mix | 0.38 (baissé à l'oreille en v3.1 — 0.55 était trop fort avec la lame amincie) | 0.377 |
 | reverb.predelay | 20 ms | 0.200 |
 
 Ré-étalonnage 2026-07-11 : la reverb est devenue une **plate Dattorro** (queue
@@ -49,8 +52,19 @@ cargo run --bin render_probe -- --module plucked --set brightness=0.35 --set dec
 ```
 
 f0 exact aux trois registres (clarity 0.91–0.99), zéro défaut, RT60 3.2 s.
-Limite connue : H2 reste ~7 dB au-dessus de la référence (pas d'effet EQ au
-catalogue pour amincir davantage — manque noté dans lessons.md).
+~~Limite connue : H2 reste ~7 dB au-dessus de la référence (pas d'effet EQ
+au catalogue).~~ **Comblée en v3.1** : le lowpass 2200 Hz ramène H2 à
+−26 dB rel F1 à F#6 (pile la cible) et H4+ sous −45 dB ; H3 −32 dB (réf.
+≤ −44 — resterait 12 dB, mais l'échelle globale colle). Mesures v3.1
+mono-pitch obligatoires (voir leçon bleed) :
+
+```
+cargo run --bin render_probe -- --module plucked --set brightness=0.35 --set decay=0.98 --set release=1000 --set level=-8 --fx filter --set filter.cutoff=2200 --set filter.resonance=0.7 --pitches 90 --note-beats 2 --tail 2
+```
+
+RT60 chaîne complète (filter + plate) : 3.45 s. Registre mélodie réel :
+85–97 (C#6–C#7) — le lowpass fixe y mord bien (H2 ≥ 2,2 kHz) ; sous F#5
+la lame redevient riche (H2 −3 dB), hors usage actuel.
 
 ## Historique des recettes
 
@@ -85,3 +99,12 @@ catalogue pour amincir davantage — manque noté dans lessons.md).
   (`projects/demo/presets/chains/`, données projet non versionnées) : la
   recette complète plucked → reverb apparaît dans le navigateur (groupe
   Instruments) et le menu « + piste », prête en un geste.
+- 2026-07-12 — **v3.1 : lowpass 2200 Hz inséré** (le nouvel effet `filter`
+  comble le manque EQ noté en v3) : H2 à F#6 passe de −20 à −26 dB rel F1
+  = la cible de la référence ; H3 de −18 à −32 ; RT60 conservé (3.45 s).
+  Chaîne, preset de chaîne et projet vivant mis à jour.
+- 2026-07-12 — **écoute v3.1 : « parfait »** après un ajustement utilisateur
+  (reverb.mix 0.55 → 0.38, la lame amincie demandait moins de halo).
+  **Statut : VALIDÉ (oreille humaine).** L'instrument est sauvegardé comme
+  preset de chaîne **`berceuse`** (le « hanté » est retiré du nom, à la
+  demande de l'utilisateur ; cette fiche garde son slug historique).

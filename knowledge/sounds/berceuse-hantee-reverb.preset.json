@@ -1,7 +1,7 @@
 {
   "module": "reverb",
   "params": {
-    "mix": 0.55,
+    "mix": 0.377,
     "predelay": 0.2,
     "size": 0.55
   }

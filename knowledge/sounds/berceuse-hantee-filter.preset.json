@@ -1,0 +1,7 @@
+{
+  "module": "filter",
+  "params": {
+    "cutoff": 0.681,
+    "resonance": 0.01
+  }
+}

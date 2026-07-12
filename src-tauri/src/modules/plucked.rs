@@ -1,6 +1,11 @@
 //! Plucked-string synthesiser (Karplus-Strong): 8-voice polyphony, a noise burst
 //! excites a tuned delay loop with a damping low-pass and energy decay.
 //!
+//! `broken` ages the instrument: each key above C3 gets a stable, hashed
+//! detune that grows with the register — low notes stay honest, the top turns
+//! sour the SAME way every time, like the bent tines of a worn music box
+//! (the Pianoteq-"Condition" idea, at the instrument where pitch is decided).
+//!
 //! All DSP is hand-written. `process` is RT-SAFE: a fixed voice array, per-voice
 //! delay buffers allocated once in `prepare`, no allocation or locks on the
 //! audio path. Voice stealing takes the oldest voice.
@@ -18,8 +23,15 @@ const P_BRIGHTNESS: ParamId = 0;
 const P_DECAY: ParamId = 1;
 const P_RELEASE: ParamId = 2;
 const P_LEVEL: ParamId = 3;
+// Appended (ids are frozen — presets address params by name, order by id).
+const P_BROKEN: ParamId = 4;
 
-const PARAMS: [ParamSpec; 4] = [
+/// `broken` detune ceiling (cents) for the very top of the register at 1.0 —
+/// a full 1.5 semitone: properly deranged. The knob's response is squared so
+/// the lower half stays in the musical "slightly haunted" zone.
+const BROKEN_MAX_CENTS: f32 = 150.0;
+
+const PARAMS: [ParamSpec; 5] = [
     ParamSpec {
         id: P_BRIGHTNESS,
         name: "brightness",
@@ -56,6 +68,15 @@ const PARAMS: [ParamSpec; 4] = [
         default: -6.0,
         curve: ParamCurve::Db,
     },
+    ParamSpec {
+        id: P_BROKEN,
+        name: "broken",
+        unit: "",
+        min: 0.0,
+        max: 1.0,
+        default: 0.0,
+        curve: ParamCurve::Linear,
+    },
 ];
 
 /// Settings shared by all voices, mapped from the params into loop coefficients.
@@ -67,6 +88,8 @@ struct Settings {
     decay: f32,
     /// Note-off damping time in seconds.
     release_s: f32,
+    /// "Aged instrument" amount (0 = perfectly tuned).
+    broken: f32,
 }
 
 impl Default for Settings {
@@ -75,8 +98,27 @@ impl Default for Settings {
             brightness: 0.5,
             decay: 0.996,
             release_s: 0.06,
+            broken: 0.0,
         }
     }
+}
+
+/// Detune (cents) of a "broken" key: zero below C3, growing toward the top of
+/// the register, hashed per pitch so a given key is always out of tune the
+/// SAME way — the ear reads a damaged instrument, not randomness. // RT-SAFE
+fn broken_cents(pitch: u8, broken: f32) -> f32 {
+    if broken <= 0.0 {
+        return 0.0;
+    }
+    // Integer hash finalizer → a stable signed offset in [-1, 1] per key.
+    let mut h = (pitch as u32).wrapping_mul(0x9e37_79b9);
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x85eb_ca6b);
+    h ^= h >> 13;
+    let signed = (h as f32 / u32::MAX as f32) * 2.0 - 1.0;
+    // Register weight: honest below C3 (48), fully worn at C7 (96).
+    let weight = ((pitch as f32 - 48.0) / 48.0).clamp(0.0, 1.0);
+    broken * broken * BROKEN_MAX_CENTS * weight * signed
 }
 
 /// One plucked-string voice: a circular delay line fed back through a one-zero
@@ -143,7 +185,7 @@ impl Voice {
     /// Pluck the string: tune the loop for `pitch`, fill the delay with a noise
     /// burst scaled by velocity. // RT-SAFE
     fn pluck(&mut self, pitch: u8, vel: u8, s: &Settings, sr: f32) {
-        let freq = midi_to_freq(pitch);
+        let freq = midi_to_freq(pitch) * (broken_cents(pitch, s.broken) / 1200.0).exp2();
         // Total loop delay = buffer + low-pass group delay (1-b) + all-pass frac.
         let period = (sr / freq).max(2.0);
         let lp_delay = 1.0 - s.brightness;
@@ -326,6 +368,8 @@ impl AudioNode for Plucked {
             P_DECAY => self.settings.decay = 0.99 + 0.0099 * real,
             P_RELEASE => self.settings.release_s = real / 1000.0,
             P_LEVEL => self.level.set_target(real),
+            // Applied at pluck time: a change only affects the NEXT notes.
+            P_BROKEN => self.settings.broken = real,
             _ => {}
         }
     }
@@ -351,6 +395,7 @@ impl AudioNode for Plucked {
             brightness: 0.5 + 0.45 * default_real(P_BRIGHTNESS),
             decay: 0.99 + 0.0099 * default_real(P_DECAY),
             release_s: default_real(P_RELEASE) / 1000.0,
+            broken: default_real(P_BROKEN),
         };
         self.level =
             crate::engine::params::LinearRamp::new(default_real(P_LEVEL), 10.0, sample_rate);
@@ -464,6 +509,67 @@ mod tests {
         }];
         render(&mut s, &ninth, 64, &mut buf);
         assert_eq!(s.active_voice_count(), 8);
+    }
+
+    /// Goertzel-style magnitude of a single bin, normalised by length.
+    fn mag_at(buf: &[f32], freq: f32) -> f32 {
+        let w = std::f32::consts::TAU * freq / 48_000.0;
+        let (mut re, mut im) = (0.0f32, 0.0f32);
+        for (n, &x) in buf.iter().enumerate() {
+            let p = w * n as f32;
+            re += x * p.cos();
+            im += x * p.sin();
+        }
+        (re * re + im * im).sqrt() / buf.len() as f32
+    }
+
+    #[test]
+    fn broken_curve_is_stable_and_register_shaped() {
+        // Honest below C3, deterministic per key, spread across the top keys.
+        assert_eq!(broken_cents(40, 1.0), 0.0);
+        assert_eq!(broken_cents(90, 1.0), broken_cents(90, 1.0));
+        assert_eq!(broken_cents(90, 0.0), 0.0);
+        let spread: Vec<f32> = (84u8..=97).map(|p| broken_cents(p, 1.0)).collect();
+        assert!(
+            spread.iter().any(|c| c.abs() > 20.0),
+            "no key is audibly sour at full broken: {spread:?}"
+        );
+        let distinct = spread.windows(2).any(|w| (w[0] - w[1]).abs() > 5.0);
+        assert!(
+            distinct,
+            "neighbouring keys are identically sour: {spread:?}"
+        );
+    }
+
+    #[test]
+    fn broken_detunes_a_top_note_by_the_predicted_amount() {
+        // Pick the key with the biggest programmed offset in the top register
+        // and verify the rendered string actually rings at the shifted pitch.
+        let pitch = (84u8..=97)
+            .max_by(|a, b| {
+                broken_cents(*a, 1.0)
+                    .abs()
+                    .total_cmp(&broken_cents(*b, 1.0).abs())
+            })
+            .unwrap();
+        let nominal = midi_to_freq(pitch);
+        let expected = nominal * (broken_cents(pitch, 1.0) / 1200.0).exp2();
+
+        let mut s = synth();
+        s.set_param(P_BROKEN, 1.0);
+        let on = [NoteEvent {
+            frame: 0,
+            kind: NoteKind::On { pitch, vel: 110 },
+        }];
+        let mut buf = Vec::new();
+        render(&mut s, &on, 16_384, &mut buf);
+        let at_expected = mag_at(&buf[4096..], expected);
+        let at_nominal = mag_at(&buf[4096..], nominal);
+        assert!(
+            at_expected > 2.0 * at_nominal,
+            "string did not ring at the broken pitch: expected {expected} Hz \
+             ({at_expected}) vs nominal {nominal} Hz ({at_nominal})"
+        );
     }
 
     #[test]

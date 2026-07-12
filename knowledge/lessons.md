@@ -4,6 +4,16 @@ Journal daté, du plus récent au plus ancien. Format : `## AAAA-MM-JJ — titre
 puis contexte, mesure (commande exacte), conclusion. Les impasses se
 consignent au même titre que les réussites.
 
+## 2026-07-12 — Sons à longue résonance : mesurer les pitches UN PAR UN
+
+`render_probe --pitches 78,84,90` sur la berceuse (release 1 s, decay
+0.98) : la fenêtre d'analyse de chaque note contient encore la résonance
+des précédentes. Concret : le « H2 de F#6 » lisait −18 dB alors qu'en
+mono-pitch il vaut −26 — c'était le H4 de F#5 (2960 Hz, la même case) qui
+sonnait encore. Règle : dès que la queue d'une note dépasse l'espacement
+des notes de la probe, lancer UNE probe PAR pitch (ou espacer avec
+--note-beats). Les chiffres multi-pitch de sons résonants sont pollués.
+
 ## 2026-07-12 — Cloche modale : le f0 mesuré ment (pitch virtuel)
 
 `render_probe --module modal --set material=2` sur A4 : YIN lit 48,8 Hz

@@ -8,12 +8,15 @@ use serde::Serialize;
 
 use crate::engine::node::AudioNode;
 use crate::modules::_template::Gain;
+use crate::modules::chorus::Chorus;
 use crate::modules::compressor::Compressor;
 use crate::modules::delay::Delay;
 use crate::modules::drum_sampler::DrumSampler;
+use crate::modules::filter::Filter;
 use crate::modules::fm::Fm;
 use crate::modules::plucked::Plucked;
 use crate::modules::reverb::Reverb;
+use crate::modules::saturator::Saturator;
 use crate::modules::subtractive::Subtractive;
 
 /// Category of a module, so the UI knows where it may go: `Instrument` heads a
@@ -65,6 +68,11 @@ const MODULES: &[ModuleDesc] = &[
         category: ModuleCategory::Effect,
     },
     ModuleDesc {
+        id: "filter",
+        name: "Filter",
+        category: ModuleCategory::Effect,
+    },
+    ModuleDesc {
         id: "delay",
         name: "Delay",
         category: ModuleCategory::Effect,
@@ -72,6 +80,16 @@ const MODULES: &[ModuleDesc] = &[
     ModuleDesc {
         id: "reverb",
         name: "Reverb",
+        category: ModuleCategory::Effect,
+    },
+    ModuleDesc {
+        id: "chorus",
+        name: "Chorus",
+        category: ModuleCategory::Effect,
+    },
+    ModuleDesc {
+        id: "saturator",
+        name: "Saturator",
         category: ModuleCategory::Effect,
     },
     ModuleDesc {
@@ -98,8 +116,11 @@ pub fn create(module_id: &str) -> Option<Box<dyn AudioNode>> {
         "fm" => Some(boxed::<Fm>()),
         "drum_sampler" => Some(boxed::<DrumSampler>()),
         "gain" => Some(boxed::<Gain>()),
+        "filter" => Some(boxed::<Filter>()),
         "delay" => Some(boxed::<Delay>()),
         "reverb" => Some(boxed::<Reverb>()),
+        "chorus" => Some(boxed::<Chorus>()),
+        "saturator" => Some(boxed::<Saturator>()),
         "compressor" => Some(boxed::<Compressor>()),
         _ => None,
     }

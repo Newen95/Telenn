@@ -32,15 +32,50 @@ pub struct Biquad {
 
 impl Biquad {
     pub fn set_lowpass(&mut self, fc: f32, q: f32, sr: f32) {
-        let w0 = TAU * (fc / sr).clamp(1.0e-4, 0.49);
-        let cos_w0 = w0.cos();
-        let alpha = w0.sin() / (2.0 * q.max(0.1));
+        let (cos_w0, alpha) = Self::omega(fc, q, sr);
         let a0 = 1.0 + alpha;
         self.b1 = (1.0 - cos_w0) / a0;
         self.b0 = self.b1 / 2.0;
         self.b2 = self.b0;
         self.a1 = (-2.0 * cos_w0) / a0;
         self.a2 = (1.0 - alpha) / a0;
+    }
+
+    pub fn set_highpass(&mut self, fc: f32, q: f32, sr: f32) {
+        let (cos_w0, alpha) = Self::omega(fc, q, sr);
+        let a0 = 1.0 + alpha;
+        self.b1 = -(1.0 + cos_w0) / a0;
+        self.b0 = -self.b1 / 2.0;
+        self.b2 = self.b0;
+        self.a1 = (-2.0 * cos_w0) / a0;
+        self.a2 = (1.0 - alpha) / a0;
+    }
+
+    /// Constant-skirt bandpass (peak gain = Q).
+    pub fn set_bandpass(&mut self, fc: f32, q: f32, sr: f32) {
+        let (cos_w0, alpha) = Self::omega(fc, q, sr);
+        let a0 = 1.0 + alpha;
+        self.b0 = alpha / a0;
+        self.b1 = 0.0;
+        self.b2 = -self.b0;
+        self.a1 = (-2.0 * cos_w0) / a0;
+        self.a2 = (1.0 - alpha) / a0;
+    }
+
+    pub fn set_notch(&mut self, fc: f32, q: f32, sr: f32) {
+        let (cos_w0, alpha) = Self::omega(fc, q, sr);
+        let a0 = 1.0 + alpha;
+        self.b0 = 1.0 / a0;
+        self.b1 = (-2.0 * cos_w0) / a0;
+        self.b2 = self.b0;
+        self.a1 = self.b1;
+        self.a2 = (1.0 - alpha) / a0;
+    }
+
+    /// Shared RBJ intermediates: clamped normalized frequency → (cos ω₀, α).
+    fn omega(fc: f32, q: f32, sr: f32) -> (f32, f32) {
+        let w0 = TAU * (fc / sr).clamp(1.0e-4, 0.49);
+        (w0.cos(), w0.sin() / (2.0 * q.max(0.1)))
     }
 
     // RT-SAFE
@@ -248,6 +283,64 @@ impl Env {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Settled RMS of a unit sine at `freq` through a fresh copy of `bq`.
+    fn sine_rms_through(bq: Biquad, freq: f32, sr: f32) -> f32 {
+        let mut bq = bq;
+        let n = 9600;
+        let mut tail_energy = 0.0f32;
+        let tail_start = n / 2;
+        for i in 0..n {
+            let x = (TAU * freq * i as f32 / sr).sin();
+            let y = bq.process(x);
+            if i >= tail_start {
+                tail_energy += y * y;
+            }
+        }
+        (tail_energy / (n - tail_start) as f32).sqrt()
+    }
+
+    #[test]
+    fn biquad_types_shape_the_spectrum() {
+        let sr = 48_000.0;
+        const UNIT: f32 = 0.707; // RMS of a unit sine
+
+        let mut hp = Biquad::default();
+        hp.set_highpass(2000.0, 0.707, sr);
+        assert!(
+            sine_rms_through(hp, 100.0, sr) < 0.03,
+            "hp passed the low end"
+        );
+        assert!(sine_rms_through(hp, 10_000.0, sr) > 0.6, "hp lost the top");
+
+        let mut bp = Biquad::default();
+        bp.set_bandpass(1000.0, 2.0, sr);
+        let centre = sine_rms_through(bp, 1000.0, sr);
+        assert!(centre > 0.5 * UNIT, "bp lost its centre: {centre}");
+        assert!(
+            sine_rms_through(bp, 60.0, sr) < 0.2 * centre,
+            "bp passed the low skirt"
+        );
+        assert!(
+            sine_rms_through(bp, 12_000.0, sr) < 0.2 * centre,
+            "bp passed the high skirt"
+        );
+
+        let mut nt = Biquad::default();
+        nt.set_notch(1000.0, 4.0, sr);
+        assert!(
+            sine_rms_through(nt, 1000.0, sr) < 0.05,
+            "notch passed its centre"
+        );
+        assert!(
+            sine_rms_through(nt, 100.0, sr) > 0.6,
+            "notch lost the low end"
+        );
+        assert!(
+            sine_rms_through(nt, 8000.0, sr) > 0.6,
+            "notch lost the high end"
+        );
+    }
 
     #[test]
     fn delay_line_reads_back_what_was_written() {

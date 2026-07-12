@@ -7,6 +7,16 @@ import { theme, withAlpha } from "../../styles/theme";
 import { laneToY, tickToX, xToTick, yToLane, type Viewport } from "./viewport";
 
 /** A generic rectangle on the grid: a clip (timeline) or a note (piano roll). */
+/** Fading outline of a note an external edit removed: drawn where the note
+ *  was, dissolving over the flash window ("something was here"). */
+export interface GhostMark {
+  startTick: number;
+  lenTick: number;
+  lane: number;
+  /** 1 → 0 over the flash window; 0 = gone. */
+  intensity: number;
+}
+
 export interface Block {
   startTick: number;
   lenTick: number;
@@ -86,6 +96,7 @@ const PLAYHEAD_HALO = "rgba(232, 163, 76, 0.25)";
 const SELECTED = theme.color.text;
 const LANDING = theme.color.accentBright; // where a dragged thing will land
 const FLASH = theme.color.sigMod; // externally-edited notes pulse in signal amber
+const REMOVED_GHOST = theme.color.text3; // fading silhouette of a removed note
 const GHOST_FILL = "rgba(232, 228, 220, 0.35)";
 const GHOST_ROW = "rgba(232, 228, 220, 0.14)"; // a whole row held during a reorder
 // A block under the running playhead reads as lit by warm yellow light — the
@@ -120,6 +131,8 @@ export function draw(
   gutterDrag?: { from: number; to: number } | null,
   /** Transport running: blocks under the playhead light up as they sound. */
   playing?: boolean,
+  /** Dissolving outlines of notes an external edit removed. */
+  ghosts?: GhostMark[],
 ): void {
   ctx.fillStyle = BG;
   ctx.fillRect(0, 0, w, h);
@@ -203,6 +216,26 @@ export function draw(
       ctx.globalAlpha = a;
       ctx.fillStyle = FLASH;
       ctx.fillRect(x, y + 1, rw, vp.laneHeight - 2);
+      ctx.restore();
+    }
+  }
+
+  // Ghosts of externally removed notes: the note's full silhouette, in muted
+  // warm gray, quietly fades out in place — an absence is invisible by itself,
+  // this makes it read. Deliberately NOT the amber of additions nor an alarm
+  // red, and no dashes (that's preset talk in the browser).
+  if (ghosts) {
+    for (const g of ghosts) {
+      if (g.intensity <= 0) continue;
+      const x = tickToX(vp, g.startTick);
+      const gw = Math.max(g.lenTick * vp.pxPerTick, 1.5);
+      if (x + gw < 0 || x > w) continue;
+      const y = laneToY(vp, g.lane);
+      if (y + vp.laneHeight < 0 || y > h) continue;
+      ctx.save();
+      ctx.globalAlpha = 0.7 * g.intensity;
+      ctx.fillStyle = REMOVED_GHOST;
+      ctx.fillRect(x, y + 1, gw, vp.laneHeight - 2);
       ctx.restore();
     }
   }

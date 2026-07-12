@@ -10,7 +10,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { useProjectStore } from "../../stores/project";
 import GridView, { type GutterSpec } from "../canvas/GridView.vue";
 import type { EditAdapter } from "../canvas/interactions";
-import type { Block, Grid } from "../canvas/renderer";
+import type { Block, GhostMark, Grid } from "../canvas/renderer";
 import { GUTTER_WIDTH, type TimeAxis } from "../canvas/timeAxis";
 import { usePreviewVoices } from "../canvas/previewVoices";
 import { projectHues, theme } from "../../styles/theme";
@@ -67,6 +67,17 @@ const grid = computed<Grid>(() => ({
   beatsPerBar: project.timeSignature[0],
   ticksPerBeat: (project.ppq * 4) / project.timeSignature[1],
 }));
+
+/** Dissolving outlines of this track's externally removed notes (polled each
+ *  frame by the grid — a plain function, the ghosts are non-reactive). */
+function ghostMarks(): GhostMark[] {
+  return project.noteGhosts(props.trackId, performance.now()).map((g) => ({
+    startTick: g.startTicks,
+    lenTick: g.lengthTicks,
+    lane: pitchToLane(g.pitch),
+    intensity: g.intensity,
+  }));
+}
 
 const ticksPerBeat = computed(() => (project.ppq * 4) / project.timeSignature[1]);
 
@@ -165,5 +176,6 @@ const initialScrollLane = computed(() => {
     :adapter="adapter"
     :gutter="gutter"
     :axis="axis"
+    :ghosts="ghostMarks"
   />
 </template>

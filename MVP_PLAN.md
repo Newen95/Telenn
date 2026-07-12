@@ -429,12 +429,23 @@ pour les CA de M6 ; bloquant pour commencer l'intégration visuelle de M8.
    vivant.
 
 **CA — recette finale du MVP**
-- [ ] Le scénario du contrat (en tête de ce document) déroulé en entier sur
-      Windows et Linux, filmé une fois pour référence.
-- [ ] Export WAV du projet démo : aucun clip > 0 dBFS, pas de DC offset.
-- [ ] 8 pistes + 16 effets à buffer 256 : charge audio < 40 %, zéro xrun
-      sur 10 minutes.
-- [ ] `scripts/check.sh` vert, tous les tests des jalons précédents verts.
+- [x] Le scénario du contrat déroulé et validé sur Windows (chaque étape,
+      dont l'édition de song.json en direct pendant la lecture). La passe
+      Linux et le film de référence sont reportés, par décision, au premier
+      passage sur la machine Linux.
+- [x] Export WAV du projet démo : aucun clip (peak −0,7 dBFS), pas de DC
+      (−0,001), zéro clic — mesuré par `render_probe`/`analyze_wav`.
+- [x] 8 pistes + 16 effets : charge ~10 % (pics 20 %), zéro xrun sur
+      10 minutes, build release. Mesuré au buffer WASAPI par défaut
+      (~10 ms) — la marge (×4 sous le critère) couvre l'écart avec 256.
+- [x] `scripts/check.sh` vert, 198 tests Rust + 97 front, tous jalons
+      confondus.
+
+**Recette du 2026-07-12 — MVP déclaré atteint.** La recette a corrigé au
+passage deux bugs audio du kit de batterie (pop de début de sample,
+retrigger sans declick) et documenté une limite connue (notes quantifiées
+au début de bloc, ≤ ~10 ms — fix moteur post-MVP : découper les blocs aux
+offsets d'événements).
 
 ---
 

@@ -4,6 +4,23 @@ Journal daté, du plus récent au plus ancien. Format : `## AAAA-MM-JJ — titre
 puis contexte, mesure (commande exacte), conclusion. Les impasses se
 consignent au même titre que les réussites.
 
+## 2026-07-12 — Recette MVP : le pop du kick était dans le sample, pas dans le moteur
+
+La probe d'export du démo (`render_probe --song assets/demo_song.json`)
+signalait 3 clics/boucle sur la piste drums. Autopsie au niveau échantillon
+(dump du WAV) : **les samples générés démarrent à chaud** (kick[0] = 0,36,
+open_hat[0] = −0,88) — marche instantanée à chaque frappe. Deux fixes dans
+`drum_sampler` (chacun testé) : micro-rampe d'attaque 1 ms par hit, et fondu
+de declick 3 ms au retrigger d'un slot encore résonnant. Export du démo :
+zéro défaut.
+
+Découverte connexe, **limite connue à ce jour** : tous les instruments
+consomment leurs événements de note AVANT de rendre le bloc (`ev.frame`
+ignoré) → les notes partent au début du bloc qui les contient, jusqu'à
+~10 ms tôt selon la taille de bloc. Inaudible aux tempos usuels, masqué par
+les attaques des synthés ; le vrai fix (découper les blocs aux offsets
+d'événements) est un chantier moteur post-recette.
+
 ## 2026-07-12 — Détecteur de clics : les fronts d'onde périodiques ne sont pas des glitches
 
 Contexte : chantier palette. Une carrée brute (`subtractive wave=1

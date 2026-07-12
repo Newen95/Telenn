@@ -122,6 +122,37 @@ export const useProjectStore = defineStore("project", () => {
   // Notes flashing after an external reload: note id → flash start (ms). Plain
   // (non-reactive) — the canvas polls it each frame via `noteFlash`/`anyFlash`.
   const flashStart = new Map<string, number>();
+  // Ghosts of notes an external reload REMOVED: their geometry is captured
+  // BEFORE the store reloads (afterwards the notes no longer exist), then the
+  // canvas draws a fading outline where each one was. Plain, like flashStart.
+  const ghosts: {
+    trackId: string;
+    pitch: number;
+    startTicks: number;
+    lengthTicks: number;
+    start: number;
+  }[] = [];
+
+  /** Capture the geometry of soon-to-vanish notes from the CURRENT view. */
+  function captureGhosts(removedIds: string[], now: number): void {
+    if (removedIds.length === 0) return;
+    const wanted = new Set(removedIds);
+    for (const track of tracks.value) {
+      for (const clip of track.clips) {
+        for (const note of clip.notes) {
+          if (wanted.has(note.id)) {
+            ghosts.push({
+              trackId: track.id,
+              pitch: note.pitch,
+              startTicks: note.startTicks,
+              lengthTicks: note.lengthTicks,
+              start: now,
+            });
+          }
+        }
+      }
+    }
+  }
   /** Latest external-edit error, if the changed file failed to parse. `seq`
    *  bumps on every occurrence, so saving the same broken file twice still
    *  notifies watchers (the text alone would compare equal). */
@@ -131,8 +162,10 @@ export const useProjectStore = defineStore("project", () => {
    *  flash the notes that changed; a parse error is surfaced, no reload. */
   async function init(): Promise<void> {
     await listen<ProjectDiff>("project_changed", async (e) => {
-      await load();
       const now = performance.now();
+      // Before the reload: the removed notes still exist here, ghost them.
+      captureGhosts(e.payload.removedNotes, now);
+      await load();
       for (const id of e.payload.addedNotes) flashStart.set(id, now);
       for (const id of e.payload.modifiedNotes) flashStart.set(id, now);
       lastError.value = null;
@@ -154,7 +187,26 @@ export const useProjectStore = defineStore("project", () => {
     for (const start of flashStart.values()) {
       if (now - start < FLASH_MS) return true;
     }
-    return false;
+    return ghosts.some((g) => now - g.start < FLASH_MS);
+  }
+
+  /** Fading outlines of externally removed notes on `trackId` at time `now`
+   *  (intensity 1 → 0); expired ghosts are purged as they are polled. */
+  function noteGhosts(
+    trackId: string,
+    now: number,
+  ): { pitch: number; startTicks: number; lengthTicks: number; intensity: number }[] {
+    for (let i = ghosts.length - 1; i >= 0; i--) {
+      if (flashIntensity(ghosts[i].start, now) === 0) ghosts.splice(i, 1);
+    }
+    return ghosts
+      .filter((g) => g.trackId === trackId)
+      .map((g) => ({
+        pitch: g.pitch,
+        startTicks: g.startTicks,
+        lengthTicks: g.lengthTicks,
+        intensity: flashIntensity(g.start, now),
+      }));
   }
 
   /** Apply `fn` to the note with `id`, wherever it lives (optimistic mirror). */
@@ -455,6 +507,7 @@ export const useProjectStore = defineStore("project", () => {
     init,
     noteFlash,
     anyFlash,
+    noteGhosts,
     load,
     addNote,
     moveNote,

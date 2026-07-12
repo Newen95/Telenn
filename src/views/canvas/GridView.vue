@@ -8,7 +8,7 @@ import { onMounted, ref, watch } from "vue";
 
 import { useProjectStore } from "../../stores/project";
 import { useTelemetryStore } from "../../stores/telemetry";
-import { draw, type Block, type Grid, type GutterStyle } from "./renderer";
+import { draw, type Block, type GhostMark, type Grid, type GutterStyle } from "./renderer";
 import { adaptiveSnap, GridInteractions, snapStepTicks, type EditAdapter } from "./interactions";
 import { useGridCanvas } from "./useGridCanvas";
 import { applyAxis, type TimeAxis } from "./timeAxis";
@@ -57,6 +57,8 @@ const props = defineProps<{
   /** View-level Delete handler, tried before block deletion (the timeline
    *  deletes the active track). Return true when the key was consumed. */
   onDeleteKey?: () => boolean;
+  /** Dissolving outlines of externally removed notes, polled each frame. */
+  ghosts?: () => GhostMark[];
 }>();
 
 const project = useProjectStore();
@@ -160,6 +162,7 @@ function frame(ctx: CanvasRenderingContext2D, w: number, h: number): void {
     props.activeLane,
     gutterReorder,
     telemetry.playing,
+    props.ghosts?.(),
   );
 }
 

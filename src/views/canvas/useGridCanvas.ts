@@ -24,6 +24,11 @@ export function useGridCanvas(
   let raf = 0;
   let observer: ResizeObserver | null = null;
 
+  // A frame that throws must never kill the loop: without the guard the next
+  // requestAnimationFrame is skipped and the canvas silently freezes forever
+  // (a hard-won lesson). The error is logged once per distinct message.
+  let lastError = "";
+
   function draw(): void {
     const el = canvas.value;
     if (!el) return;
@@ -31,7 +36,15 @@ export function useGridCanvas(
     if (!ctx) return;
     const dpr = window.devicePixelRatio || 1;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    drawFrame(ctx, el.width / dpr, el.height / dpr);
+    try {
+      drawFrame(ctx, el.width / dpr, el.height / dpr);
+    } catch (err) {
+      const msg = err instanceof Error ? `${err.message} ${err.stack ?? ""}` : String(err);
+      if (msg !== lastError) {
+        lastError = msg;
+        console.error("grid canvas frame failed:", err);
+      }
+    }
     dirty = false;
   }
 

@@ -51,6 +51,13 @@ struct Slot {
     step: f32,
     amp: f32,
     active: bool,
+    /// Retrigger declick: the value the cut playback held, faded to zero and
+    /// added to the fresh hit — a restart mid-ring would otherwise click.
+    fade: f32,
+    /// Attack micro-ramp (0..1): the generated samples can start hot
+    /// (kick[0] ≈ 0.36), so each hit fades in over ~1 ms — pop-free, still
+    /// punchy. Will also guard arbitrary user samples one day.
+    att: f32,
 }
 
 impl Slot {
@@ -63,21 +70,37 @@ impl Slot {
             step: 1.0,
             amp: 0.0,
             active: false,
+            fade: 0.0,
+            att: 1.0,
         }
     }
 
     fn trigger(&mut self, vel: u8) {
+        if self.active {
+            // Carry the ringing sample's current value into the declick fade
+            // (accumulating if a fade is already running) instead of cutting.
+            self.fade += sample_at(&self.sample, self.pos) * self.amp;
+        }
         self.pos = 0.0;
         self.amp = vel as f32 / 127.0;
+        self.att = 0.0;
         self.active = !self.sample.is_empty();
     }
 
-    // RT-SAFE
-    fn render(&mut self) -> f32 {
-        if !self.active {
-            return 0.0;
+    /// `fade_step`/`att_step` are the per-sample declick decrement and attack
+    /// increment (set from the sample rate by the module). // RT-SAFE
+    fn render(&mut self, fade_step: f32, att_step: f32) -> f32 {
+        let mut out = self.fade;
+        if self.fade > 0.0 {
+            self.fade = (self.fade - fade_step).max(0.0);
+        } else if self.fade < 0.0 {
+            self.fade = (self.fade + fade_step).min(0.0);
         }
-        let out = sample_at(&self.sample, self.pos) * self.amp;
+        if !self.active {
+            return out;
+        }
+        out += sample_at(&self.sample, self.pos) * self.amp * self.att;
+        self.att = (self.att + att_step).min(1.0);
         self.pos += self.step;
         if self.pos >= (self.sample.len() as f32) - 1.0 {
             self.active = false;
@@ -86,9 +109,18 @@ impl Slot {
     }
 }
 
+/// Retrigger declick length (seconds): full scale fades out in this time.
+const FADE_S: f32 = 0.003;
+/// Attack micro-ramp length (seconds): kills the sample-start pop.
+const ATTACK_S: f32 = 0.001;
+
 pub struct DrumSampler {
     slots: [Slot; 8],
     level: LinearRamp,
+    /// Per-sample declick decrement (`1 / (FADE_S · sr)`).
+    fade_step: f32,
+    /// Per-sample attack increment (`1 / (ATTACK_S · sr)`).
+    att_step: f32,
 }
 
 impl Default for DrumSampler {
@@ -96,6 +128,8 @@ impl Default for DrumSampler {
         Self {
             slots: std::array::from_fn(|i| Slot::new(KIT[i].0, KIT[i].1)),
             level: LinearRamp::new(1.0, 10.0, 48_000.0),
+            fade_step: 1.0 / (FADE_S * 48_000.0),
+            att_step: 1.0 / (ATTACK_S * 48_000.0),
         }
     }
 }
@@ -124,7 +158,7 @@ impl AudioNode for DrumSampler {
             let level = self.level.tick();
             let mut sum = 0.0;
             for s in &mut self.slots {
-                sum += s.render();
+                sum += s.render(self.fade_step, self.att_step);
             }
             *slot = sum * level;
         }
@@ -160,7 +194,11 @@ impl AudioNode for DrumSampler {
             slot.sample = sample;
             slot.pos = 0.0;
             slot.active = false;
+            slot.fade = 0.0;
+            slot.att = 1.0;
         }
+        self.fade_step = 1.0 / (FADE_S * sample_rate);
+        self.att_step = 1.0 / (ATTACK_S * sample_rate);
         self.level = LinearRamp::new(default_real(P_LEVEL), 10.0, sample_rate);
     }
 }
@@ -250,6 +288,25 @@ mod tests {
         let mut buf = Vec::new();
         render(&mut s, &[hit(60, 110)], 4096, &mut buf); // no slot at pitch 60
         assert!(peak(&buf) < 1.0e-6, "unmapped pitch made sound");
+    }
+
+    #[test]
+    fn retrigger_mid_ring_is_click_free() {
+        // Regression (found by the MVP recette probe on the demo song): a hit
+        // on a still-ringing slot restarted the playhead cold, jumping from
+        // the current sample value to ~0 — an audible click on open hat and
+        // crash. The cut value now fades out over FADE_S instead.
+        use crate::analysis::levels;
+        let mut s = kit();
+        let mut whole = Vec::new();
+        let mut buf = Vec::new();
+        render(&mut s, &[hit(49, 110)], 4800, &mut buf); // crash, long ring
+        whole.extend_from_slice(&buf);
+        render(&mut s, &[hit(49, 90)], 9600, &mut buf); // retrigger mid-ring
+        whole.extend_from_slice(&buf);
+        assert!(whole.iter().all(|x| x.is_finite()));
+        let clicks = levels::detect_clicks(&whole, 48_000);
+        assert!(clicks.is_empty(), "retrigger clicked: {clicks:?}");
     }
 
     #[test]

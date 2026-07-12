@@ -26,10 +26,10 @@ export default {
   browser: {
     instruments: "Instruments",
     modules: "Effets",
-    presets: "Presets",
     search: "Rechercher…",
-    dropToSave: "Glissez un effet ici pour l'enregistrer",
+    dropToSave: "Glissez un effet ou un instrument ici pour l'enregistrer",
   },
+  prompt: { presetName: "Nom du preset" },
   chain: {
     prevTrack: "Piste précédente",
     nextTrack: "Piste suivante",

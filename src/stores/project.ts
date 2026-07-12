@@ -88,6 +88,13 @@ export interface Preset {
   params: Record<string, number>;
 }
 
+/** A saved chain preset — a named, reusable instrument: `nodes[0]` is the
+ * instrument, the rest its effects in order. No ids: fresh ones are minted
+ * when the chain is instantiated. */
+export interface ChainPreset {
+  nodes: Preset[];
+}
+
 export interface ProjectView {
   bpm: number;
   ppq: number;
@@ -400,6 +407,43 @@ export const useProjectStore = defineStore("project", () => {
     presetsVersion.value += 1;
   }
 
+  const listChainPresets = (): Promise<string[]> => invoke<string[]>("list_chain_presets");
+  const readChainPreset = (name: string): Promise<ChainPreset> =>
+    invoke<ChainPreset>("read_chain_preset", { name });
+
+  /** Save a track's whole chain (instrument + effects) as a named chain preset. */
+  async function saveChainPreset(name: string, trackId: string): Promise<void> {
+    await invoke("save_chain_preset", { name, trackId });
+    presetsVersion.value += 1;
+  }
+
+  /** Fresh-id node specs for a chain preset's nodes (the head is the instrument). */
+  function mintChainNodes(nodes: Preset[]): { id: string; module: string; params: Record<string, number> }[] {
+    return nodes.map((n, i) => ({
+      id: i === 0 ? freshId("ins") : freshNodeId(),
+      module: n.module,
+      params: n.params,
+    }));
+  }
+
+  /** Create a track whose whole chain comes from a chain preset (one atomic
+   *  edit: a single hot-swap and a single undo step). */
+  async function addTrackFromChain(name: string, nodes: Preset[]): Promise<void> {
+    await invoke("track_add_chain", {
+      trackId: freshId("trk"),
+      name,
+      color: unusedHue([...projectHues(tracks.value).values()]),
+      nodes: mintChainNodes(nodes),
+    });
+    await load();
+  }
+
+  /** Replace a track's whole chain from a chain preset (clips and mixer stay). */
+  async function setTrackChain(trackId: string, nodes: Preset[]): Promise<void> {
+    await invoke("track_set_chain", { trackId, nodes: mintChainNodes(nodes) });
+    await load();
+  }
+
   return {
     bpm,
     ppq,
@@ -437,5 +481,10 @@ export const useProjectStore = defineStore("project", () => {
     listPresets,
     readPreset,
     savePreset,
+    listChainPresets,
+    readChainPreset,
+    saveChainPreset,
+    addTrackFromChain,
+    setTrackChain,
   };
 });

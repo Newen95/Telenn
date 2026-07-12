@@ -96,8 +96,8 @@ Une seule notion de sélection de piste, globale, suivie par toutes les vues :
 |---------|------|-------|
 | **Cuivre** (accent) | l'interactif & le présent | playhead, notes en train de sonner, sélection, piste active, aperçu de drop, poignées, hover |
 | **Teal** (signal Audio) | l'audio qui circule | VU-cordes, fils de la chaîne |
-| **Violet** (signal Notes) | les données de notes | échine de la carte instrument, items instruments de la bibliothèque, (post-MVP : ports/câbles Notes) |
-| **Ambre** (signal Modulation) | la modulation | zone « déposer pour sauver un preset » ; réservé pour les anneaux/câbles de modulation (post-MVP) |
+| **Magenta** (signal Notes) | les données de notes | échine de la carte instrument, items instruments et presets de chaîne de la bibliothèque, (post-MVP : ports/câbles Notes) |
+| **Ambre** (signal Modulation) | la modulation | réservé pour les anneaux/câbles de modulation (post-MVP) |
 | **Teintes de piste** (palette de 8, sourdes) | l'identité d'une piste | voir règle ci-dessous |
 
 - **Cuivre vs teal, la nuance** : le teal dit « du signal circule ici » (les
@@ -152,7 +152,7 @@ plus elle flotte haut**. La lumière vient d'en haut. Tokens dans
 - Gutter clavier : touches crème/ardoise, étiquettes d'octave (C3, C4…) sur
   les do ; presser une touche la fait sonner (glissando au drag) — audition
   non destructive.
-- Notes violettes (signal Notes) ; **la note qui sonne s'allume cuivre**
+- Notes à la teinte de la piste ; **la note qui sonne s'allume cuivre**
   (fill lumineux + halo serré) pendant la lecture.
 - Les trois gestes reines (poser/étirer/déplacer avec écho audio) restent la
   référence de qualité.
@@ -168,15 +168,21 @@ compteur n/N.
   le halo suivent le niveau réel du nœud amont (télémétrie par nœud ; à fort
   niveau le fil vire vers le blanc chaud). Fil éteint = rien ne passe. Pas de
   fil après la dernière carte : le chemin s'arrête là.
-- **La carte instrument est une autre espèce** : échine violette (signal
-  Notes), flanc gauche arrondi, curseur pointeur et chevron « picker » — elle
-  ne se drague pas, elle se **remplace** (clic → menu). Les popovers ancrés
-  dans des conteneurs scrollables sont `position: fixed`, calés sur le rect
-  au moment du clic (sinon ils seraient rognés).
-- Clic sur une carte d'effet = sélection (cadre cuivre) + **les paramètres se
+- **La carte instrument est une autre espèce** : échine magenta (signal
+  Notes), flanc gauche arrondi. Elle se sélectionne et déplie ses paramètres
+  comme un effet ; seul son **chevron** ouvre le picker de remplacement
+  (moteur = remplace la tête, preset de chaîne = remplace toute la chaîne).
+  Elle ne se déplace jamais dans la chaîne ; la glisser vers la bibliothèque
+  sauve la chaîne entière en preset. Les popovers ancrés dans des conteneurs
+  scrollables sont `position: fixed`, calés sur le rect au moment du clic
+  (sinon ils seraient rognés).
+- Clic sur une carte = sélection (cadre cuivre) + **les paramètres se
   déplient sous l'en-tête** (nom — slider — valeur réelle), la carte grandit
   vers le bas sans bouger ses voisines. Suppr supprime (reconnexion
-  automatique), Ctrl+D duplique. La sélection suit le focus.
+  automatique), Ctrl+D duplique — inertes sur la carte instrument. La
+  sélection suit le focus.
+- **Un preset de chaîne qui survole la tête estompe les effets condamnés**
+  (opacité réduite) : la portée du remplacement se lit avant de lâcher.
 - Chaque carte porte son mini VU-corde (peak + RMS, télémétrie).
 
 ### Mixeur (panneau bas)
@@ -189,11 +195,16 @@ geste = une entrée d'undo. Double-clic = valeur par défaut. Clic sur un strip
 
 ### Bibliothèque
 
-Sections dépliables (instruments / effets / presets) avec compteurs + champ de
-recherche filtrant tout. Les items sont des objets saisissables (élévation
-`raised`, curseur grab) ; les instruments portent l'échine violette. La
-section presets est aussi une **cible de drop** : y déposer une carte d'effet
-sauve un preset (surbrillance ambre pendant le drag).
+**Deux familles miroir des types de signaux**, dépliables, avec compteurs +
+champ de recherche filtrant tout : **Instruments** (échine magenta — moteurs
+d'usine + presets de chaîne) et **Effets** (échine teal — modules d'usine +
+presets d'effet). Trait plein = usine, **pointillé = preset utilisateur** ;
+au survol d'un preset de chaîne, l'infobulle donne sa composition
+(`plucked → reverb`). Les items sont des objets saisissables (élévation
+`raised`, curseur grab). La bibliothèque entière est la **cible de drop de
+sauvegarde** : y déposer une carte d'effet ou la carte instrument (= chaîne
+entière) ouvre un champ de nommage ; pendant le drag, la famille de
+destination s'allume à sa couleur de signal.
 
 ## Gestes (cohérents dans timeline, piano roll ET graphe)
 

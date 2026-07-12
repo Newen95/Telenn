@@ -1,14 +1,14 @@
 <script setup lang="ts">
 // The ACTIVE track's chain, rendered in the DOM: the instrument head (click to
-// replace it), then its effects. The gaps between/around effects are the drop
-// targets, so an effect can be dragged within the chain (or to another track by
-// selecting it first). The header navigates between tracks; the overview of all
-// tracks is the mixer's job.
+// edit its params, chevron to replace it), then its effects. The gaps between/
+// around effects are the drop targets, so an effect can be dragged within the
+// chain (or to another track by selecting it first). The header navigates
+// between tracks; the overview of all tracks is the mixer's job.
 
 import { computed, nextTick, reactive, ref, watch, watchEffect } from "vue";
 import { useI18n } from "vue-i18n";
 
-import { useProjectStore, type ChainNodeView, type ModuleDesc, type ParamInfo } from "../../stores/project";
+import { useProjectStore, type ChainNodeView, type ModuleDesc, type ParamInfo, type Preset } from "../../stores/project";
 import { useTelemetryStore } from "../../stores/telemetry";
 import { useUiStore } from "../../stores/ui";
 import { projectHues } from "../../styles/theme";
@@ -51,14 +51,16 @@ function step(dir: number): void {
   ui.activeTrackId = project.tracks[next].id;
 }
 
-// Click the instrument card → picker replacing the track's instrument. The
-// menu is position: fixed, anchored under the card at click time: an absolute
-// popover would be clipped by the chain's own scroll containers.
+// Click the instrument card's chevron → picker replacing the track's
+// instrument. The menu is position: fixed, anchored under the card at click
+// time: an absolute popover would be clipped by the chain's own scroll
+// containers.
 const replacing = ref(false);
 const replaceAt = ref({ x: 0, y: 0 });
 
 function toggleReplace(e: MouseEvent): void {
-  const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+  const card = (e.currentTarget as HTMLElement).closest(".node") ?? (e.currentTarget as HTMLElement);
+  const rect = card.getBoundingClientRect();
   replaceAt.value = { x: rect.left, y: rect.bottom + 4 };
   replacing.value = !replacing.value;
 }
@@ -68,11 +70,19 @@ async function replaceInstrument(m: ModuleDesc): Promise<void> {
   if (track.value) await project.setTrackInstrument(track.value.id, m.id);
 }
 
-// True while an instrument module is being dragged from the browser: the drop
-// targets are then the chain heads and the new-track zone, which light up.
+/** Picking a chain preset replaces the whole chain (its effects included):
+ *  the preset IS the sound, keeping the old effects would betray it. */
+async function replaceChain(_name: string, nodes: Preset[]): Promise<void> {
+  replacing.value = false;
+  if (track.value) await project.setTrackChain(track.value.id, nodes);
+}
+
+// True while an instrument module or a chain preset is being dragged from the
+// browser: the drop targets are then the chain heads and the new-track zone,
+// which light up.
 const draggingInstrument = computed(() => {
   const s = drag.state.source;
-  return s?.kind === "module" && s.category === "instrument";
+  return (s?.kind === "module" && s.category === "instrument") || s?.kind === "chainPreset";
 });
 
 // Node selection: a selected node carries the focus, so Delete/Ctrl+D act on it
@@ -112,15 +122,15 @@ function ensureSpecs(module: string): void {
   }
 }
 
-// Fetch specs for every effect in a chain, plus whatever is being dragged (so the
-// ghost can render its knobs at the right size before the node exists).
+// Fetch specs for every chain node (instrument included), plus whatever is
+// being dragged (so the ghost can render its knobs at the right size before
+// the node exists).
 watchEffect(() => {
   for (const track of project.tracks) {
-    for (const node of track.chain) {
-      if (!node.isInstrument) ensureSpecs(node.module);
-    }
+    for (const node of track.chain) ensureSpecs(node.module);
   }
-  if (drag.state.source) ensureSpecs(drag.state.source.module);
+  const dragged = drag.state.source;
+  if (dragged && dragged.kind !== "chainPreset") ensureSpecs(dragged.module);
 });
 
 /** A param's value in a stored map (its value, else the module default). */
@@ -161,7 +171,8 @@ const ghost = computed<{ module: string; params: Record<string, number> } | null
     return { module: s.module, params: {} };
   }
   if (s.kind === "preset") return { module: s.module, params: s.params };
-  return { module: s.module, params: {} }; // a module from the browser
+  if (s.kind === "chainPreset") return { module: s.name, params: {} };
+  return { module: s.module, params: {} }; // a module from the browser, or a chain
 });
 
 // Pin a leaving card at its current spot before it goes `position: absolute`,
@@ -181,6 +192,12 @@ function lifting(nodeId: string): boolean {
   return s?.kind === "node" && s.nodeId === nodeId;
 }
 
+/** True while a chain preset hovers this track's head: the drop replaces the
+ *  WHOLE chain, so the doomed effects dim to announce the gesture's scope. */
+function chainReplaceHover(trackId: string): boolean {
+  return drag.state.source?.kind === "chainPreset" && isOver({ kind: "instrument", trackId });
+}
+
 /** True while this target is the one under the pointer (it lights up). */
 function isOver(target: DropTarget): boolean {
   const h = drag.state.hovered;
@@ -194,14 +211,16 @@ function isOver(target: DropTarget): boolean {
 
 // Pressing a node selects and focuses it right away (so Delete/Ctrl+D apply and the
 // params unfold). The drag only arms here: it starts once the pointer travels past
-// the threshold, so a plain click selects without moving the node.
+// the threshold, so a plain click selects without moving the node. The instrument
+// card arms a whole-chain drag whose only destination is the browser's save zone.
 function onNodePointerDown(e: PointerEvent, trackId: string, node: ChainNodeView, index: number): void {
-  if (node.isInstrument) return;
   e.preventDefault();
   sel.select(node.id);
   (e.currentTarget as HTMLElement).focus({ preventScroll: true });
   drag.arm(
-    { kind: "node", nodeId: node.id, module: node.module, fromTrack: trackId, fromIndex: index },
+    node.isInstrument
+      ? { kind: "chain", trackId, module: node.module }
+      : { kind: "node", nodeId: node.id, module: node.module, fromTrack: trackId, fromIndex: index },
     e.clientX,
     e.clientY,
   );
@@ -219,7 +238,9 @@ function onNodeBlur(e: FocusEvent, nodeId: string): void {
 
 // The handler lives on the focused node, so `focused` is true by construction; a
 // node in another context (text field, piano roll) never receives this event.
+// The instrument stays inert: a chain head cannot be deleted or duplicated.
 function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index: number): void {
+  if (node.isInstrument) return;
   const action = sel.action(e.key, { ctrl: e.ctrlKey, meta: e.metaKey }, true);
   if (action === "delete") {
     e.preventDefault();
@@ -256,6 +277,7 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
         tag="div"
         name="chain"
         class="chain"
+        :class="{ 'chain-replacing': chainReplaceHover(track.id) }"
         data-chain
         :data-track="track.id"
         :move-class="flip ? 'chain-move' : 'chain-move-off'"
@@ -303,18 +325,25 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
               over: node.isInstrument && isOver({ kind: 'instrument', trackId: track.id }),
             }"
             :data-instrument="node.isInstrument ? '' : undefined"
-            :tabindex="node.isInstrument ? undefined : 0"
-            :title="node.isInstrument ? t('chain.replaceInstrument') : undefined"
+            tabindex="0"
             @pointerdown="onNodePointerDown($event, track.id, node, i)"
-            @click="node.isInstrument && toggleReplace($event)"
             @keydown="onNodeKey($event, track.id, node, i)"
             @focusout="onNodeBlur($event, node.id)"
           >
             <div class="node-head">
               <span class="node-name">{{ node.module }}</span>
-              <!-- The instrument is a picker, not a draggable card: a select-like
-                   chevron says "click to change" (and, implicitly, "I don't move"). -->
-              <Icon v-if="node.isInstrument" class="swap-hint" name="chevron-down" :size="12" />
+              <!-- The instrument card selects like an effect; only its chevron
+                   opens the replace picker (a select-like "click to change"). -->
+              <button
+                v-if="node.isInstrument"
+                type="button"
+                class="swap-hint"
+                :title="t('chain.replaceInstrument')"
+                @pointerdown.stop
+                @click.stop="toggleReplace($event)"
+              >
+                <Icon name="chevron-down" :size="12" />
+              </button>
               <!-- Live VU from the audio thread (peak + RMS), mapped by flat index. -->
               <NodeMeter :index="node.flatIndex" :size="20" />
             </div>
@@ -324,7 +353,7 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
                  press anywhere in the params area tweaks values, never arms a card
                  drag. Drag streams the value live; release persists it. -->
             <div
-              v-if="!node.isInstrument && sel.selected === node.id"
+              v-if="sel.selected === node.id"
               class="node-params"
               @pointerdown.stop
             >
@@ -349,6 +378,7 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
             v-if="node.isInstrument && replacing"
             :style="{ position: 'fixed', left: `${replaceAt.x}px`, top: `${replaceAt.y}px` }"
             @pick="replaceInstrument"
+            @pick-chain="replaceChain"
             @close="replacing = false"
           />
         </div>
@@ -532,18 +562,23 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
 }
 
 /* The instrument: the chain's head, another kind of thing than an effect. A
-   thick Notes-violet spine and a rounder left flank give it its own silhouette;
-   the pointer cursor + chevron advertise "click to replace" (never a drag). */
+   thick Notes-magenta spine and a rounder left flank give it its own silhouette;
+   it selects like an effect, and only its chevron opens the replace picker. */
 .node.instrument {
   background: color-mix(in srgb, var(--sig-notes) 12%, var(--surface));
   border-color: color-mix(in srgb, var(--sig-notes) 45%, var(--border-strong));
   border-left: 3px solid var(--sig-notes);
   border-radius: 12px 6px 6px 12px;
-  cursor: pointer;
 }
 
 .swap-hint {
+  display: inline-flex;
+  align-items: center;
+  border: none;
+  background: none;
+  padding: 0 0.1rem;
   color: var(--text-3);
+  cursor: pointer;
   transition: color var(--t-fast);
 }
 
@@ -555,6 +590,13 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
 .node.instrument.swap-target {
   border-style: dashed;
   border-color: var(--accent);
+}
+
+/* A chain preset hovering the head replaces the WHOLE chain: the doomed
+   effects (and their wires) dim so the gesture's scope reads before the drop. */
+.chain-replacing .node:not(.instrument),
+.chain-replacing .gap {
+  opacity: 0.35;
 }
 
 .node.instrument.over {

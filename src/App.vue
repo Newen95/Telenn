@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, watch } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import { invoke } from "@tauri-apps/api/core";
 
@@ -12,6 +12,7 @@ import MixerPanel from "./views/mixer/MixerPanel.vue";
 import DevOverlay from "./views/dev/DevOverlay.vue";
 import SplitPane from "./ui/SplitPane.vue";
 import Icon from "./ui/Icon.vue";
+import NamePrompt from "./ui/NamePrompt.vue";
 import ToastHost from "./ui/ToastHost.vue";
 import { GUTTER_WIDTH, useTimeAxis } from "./views/canvas/timeAxis";
 import { useChainDrag, type DropIntent, type DropTarget } from "./views/chain/dragdrop";
@@ -96,7 +97,12 @@ const drag = useChainDrag();
 function targetUnder(x: number, y: number): DropTarget | null {
   const el = document.elementFromPoint(x, y);
   const source = drag.state.source;
-  if (source?.kind === "module" && source.category === "instrument") {
+  // A dragged chain's only meaning is the save-preset zone (resolved on drop).
+  if (source?.kind === "chain") return null;
+  const wantsHead =
+    (source?.kind === "module" && source.category === "instrument") ||
+    source?.kind === "chainPreset";
+  if (wantsHead) {
     if (el?.closest("[data-new-track]")) return { kind: "newTrack" };
     const head = el?.closest<HTMLElement>("[data-instrument]");
     const row = head?.closest<HTMLElement>("[data-chain]");
@@ -124,8 +130,13 @@ function executeIntent(intent: DropIntent): void {
   if (intent.kind === "move") void project.moveNode(intent.nodeId, intent.toTrack, intent.index);
   else if (intent.kind === "copy") void project.copyNode(intent.nodeId, intent.toTrack, intent.index);
   else if (intent.kind === "setInstrument") void project.setTrackInstrument(intent.trackId, intent.module);
-  else if (intent.kind === "addTrack") {
-    void project.addTrack(intent.module, intent.name).then(() => {
+  else if (intent.kind === "setChain") void project.setTrackChain(intent.trackId, intent.nodes);
+  else if (intent.kind === "addTrack" || intent.kind === "addTrackChain") {
+    const created =
+      intent.kind === "addTrack"
+        ? project.addTrack(intent.module, intent.name)
+        : project.addTrackFromChain(intent.name, intent.nodes);
+    void created.then(() => {
       // The freshly created track (appended last) becomes the active one.
       ui.activeTrackId = project.tracks[project.tracks.length - 1]?.id ?? ui.activeTrackId;
     });
@@ -141,6 +152,23 @@ function onDragMove(e: PointerEvent): void {
   drag.hover(targetUnder(e.clientX, e.clientY));
 }
 
+// A drop on the save-preset zone opens this naming popover at the drop point;
+// confirming runs the save (an effect node → preset, an instrument card → the
+// track's whole chain), closing forgets the drop.
+const pendingSave = ref<
+  | { x: number; y: number; initial: string; save: "node"; nodeId: string }
+  | { x: number; y: number; initial: string; save: "chain"; trackId: string }
+  | null
+>(null);
+
+function confirmSave(name: string): void {
+  const p = pendingSave.value;
+  pendingSave.value = null;
+  if (!p) return;
+  if (p.save === "node") void project.savePreset(name, p.nodeId);
+  else void project.saveChainPreset(name, p.trackId);
+}
+
 function onDragUp(e: PointerEvent): void {
   const source = drag.state.source;
   if (!source) {
@@ -148,11 +176,20 @@ function onDragUp(e: PointerEvent): void {
     return;
   }
   drag.setCopy(e.altKey);
-  // Dropping an effect node on the browser saves it as a preset.
+  // Dropping an effect node or an instrument card on the browser saves it as a
+  // (chain) preset — after the user names it.
   const overBrowser = document.elementFromPoint(e.clientX, e.clientY)?.closest("[data-save-preset]");
-  if (overBrowser && source.kind === "node") {
-    const name = `${source.module}-${Date.now().toString(36).slice(-4)}`;
-    void project.savePreset(name, source.nodeId);
+  if (overBrowser && (source.kind === "node" || source.kind === "chain")) {
+    pendingSave.value =
+      source.kind === "node"
+        ? { x: e.clientX, y: e.clientY, initial: source.module, save: "node", nodeId: source.nodeId }
+        : {
+            x: e.clientX,
+            y: e.clientY,
+            initial: project.tracks.find((tr) => tr.id === source.trackId)?.name || source.module,
+            save: "chain",
+            trackId: source.trackId,
+          };
     drag.cancel();
     return;
   }
@@ -358,6 +395,13 @@ onUnmounted(() => {
     </SplitPane>
 
     <DevOverlay v-if="ui.layout.devOpen" @close="ui.toggleDev()" />
+    <NamePrompt
+      v-if="pendingSave"
+      :initial="pendingSave.initial"
+      :style="{ position: 'fixed', left: `${pendingSave.x}px`, top: `${pendingSave.y}px` }"
+      @confirm="confirmSave"
+      @close="pendingSave = null"
+    />
     <ToastHost />
   </div>
 </template>

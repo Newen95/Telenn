@@ -17,7 +17,8 @@ export interface KeyMods {
 }
 
 export class ChainSelection {
-  /** Currently selected effect id, or `null`. The instrument is never selectable. */
+  /** Currently selected node id (instrument included), or `null`. Delete and
+   *  duplicate stay effect-only: the panel filters them out for the head. */
   selected: string | null = null;
 
   select(id: string | null): void {

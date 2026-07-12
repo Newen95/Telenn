@@ -93,4 +93,41 @@ describe("resolveDrop", () => {
       expect(resolveDrop(source, { kind: "newTrack" }, false)).toBeNull();
     }
   });
+
+  const berceuse: DragSource = {
+    kind: "chainPreset",
+    name: "berceuse",
+    nodes: [
+      { module: "plucked", params: { brightness: 0.35 } },
+      { module: "reverb", params: { mix: 0.55 } },
+    ],
+  };
+
+  it("creates a track carrying the whole chain when a chain preset lands on the new-track zone", () => {
+    expect(resolveDrop(berceuse, { kind: "newTrack" }, false)).toEqual({
+      kind: "addTrackChain",
+      name: "berceuse",
+      nodes: berceuse.kind === "chainPreset" ? berceuse.nodes : [],
+    });
+  });
+
+  it("replaces a track's whole chain when a chain preset lands on a chain head", () => {
+    const intent = resolveDrop(berceuse, { kind: "instrument", trackId: "lead" }, false);
+    expect(intent?.kind).toBe("setChain");
+    if (intent?.kind === "setChain") {
+      expect(intent.trackId).toBe("lead");
+      expect(intent.nodes).toHaveLength(2);
+    }
+  });
+
+  it("never lets a chain preset land in the effects region", () => {
+    expect(resolveDrop(berceuse, gap("lead", 1), false)).toBeNull();
+  });
+
+  it("a dragged chain (instrument card) resolves to nothing: its only meaning is the save zone", () => {
+    const chain: DragSource = { kind: "chain", trackId: "lead", module: "plucked" };
+    expect(resolveDrop(chain, gap("lead", 1), false)).toBeNull();
+    expect(resolveDrop(chain, { kind: "instrument", trackId: "bass" }, false)).toBeNull();
+    expect(resolveDrop(chain, { kind: "newTrack" }, false)).toBeNull();
+  });
 });

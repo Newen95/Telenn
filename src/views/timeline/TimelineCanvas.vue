@@ -8,7 +8,7 @@
 import { computed, ref } from "vue";
 import { useI18n } from "vue-i18n";
 
-import { useProjectStore, type ModuleDesc } from "../../stores/project";
+import { useProjectStore, type ModuleDesc, type Preset } from "../../stores/project";
 import { useUiStore } from "../../stores/ui";
 import { useChainDrag } from "../chain/dragdrop";
 import { projectHues, theme } from "../../styles/theme";
@@ -136,12 +136,12 @@ function deleteActiveTrack(): boolean {
   return true;
 }
 
-// Dropping an instrument anywhere on the timeline creates a track: the whole
-// view is the drop target, outlined copper while an instrument is dragged.
+// Dropping an instrument (or a chain preset) anywhere on the timeline creates
+// a track: the whole view is the drop target, outlined copper while dragged.
 const drag = useChainDrag();
 const draggingInstrument = computed(() => {
   const s = drag.state.source;
-  return s?.kind === "module" && s.category === "instrument";
+  return (s?.kind === "module" && s.category === "instrument") || s?.kind === "chainPreset";
 });
 const dropOver = computed(() => drag.state.hovered?.kind === "newTrack");
 
@@ -160,6 +160,17 @@ function toggleAdd(e: MouseEvent): void {
 async function addTrack(m: ModuleDesc): Promise<void> {
   adding.value = false;
   await project.addTrack(m.id, m.name);
+  selectNewTrack();
+}
+
+/** A chain preset pick creates a track carrying the whole saved chain. */
+async function addTrackChain(name: string, nodes: Preset[]): Promise<void> {
+  adding.value = false;
+  await project.addTrackFromChain(name, nodes);
+  selectNewTrack();
+}
+
+function selectNewTrack(): void {
   const last = project.tracks[project.tracks.length - 1];
   if (last) ui.activeTrackId = last.id;
   // The pick leaves the focus on the menu's remains: hand it to the grid so
@@ -199,6 +210,7 @@ async function addTrack(m: ModuleDesc): Promise<void> {
         v-if="adding"
         :style="{ position: 'fixed', left: `${addAt.x}px`, top: `${addAt.y}px` }"
         @pick="addTrack"
+        @pick-chain="addTrackChain"
         @close="adding = false"
       />
     </div>

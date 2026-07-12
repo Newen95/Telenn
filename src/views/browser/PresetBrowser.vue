@@ -1,15 +1,18 @@
 <script setup lang="ts">
-// Library browser: collapsible sections (instruments / effects / presets) with
-// a search field that filters all of them. Items are dragged from here into a
-// track's chain (insert), onto a chain head (replace instrument) or the
-// new-track zone. The presets section is also a drop target: dragging an
-// effect node onto it saves that node as a preset (handled by the App
-// controller, which owns the pointer plumbing; here we only mark the zone).
+// Library browser: two families mirroring the signal types, with a search
+// field filtering both. INSTRUMENTS (Notes magenta) = the raw engines plus the
+// saved chain presets (named instrument + effects, dashed); EFFETS (Audio
+// teal) = the effect modules plus the saved effect presets (dashed). Items
+// are dragged from here into a track's chain (insert), onto a chain head
+// (replace instrument / whole chain) or the new-track zone. The whole browser
+// is also the save drop zone: dragging an effect node or an instrument card
+// over it highlights the family it will land in (the App controller owns the
+// pointer plumbing; here we only mark the zone).
 
 import { computed, onMounted, reactive, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
 
-import { useProjectStore, type ModuleDesc } from "../../stores/project";
+import { useProjectStore, type ModuleDesc, type Preset } from "../../stores/project";
 import { useChainDrag } from "../chain/dragdrop";
 import Icon from "../../ui/Icon.vue";
 
@@ -19,6 +22,11 @@ interface NamedPreset {
   params: Record<string, number>;
 }
 
+interface NamedChainPreset {
+  name: string;
+  nodes: Preset[];
+}
+
 const { t } = useI18n();
 const project = useProjectStore();
 const drag = useChainDrag();
@@ -26,9 +34,10 @@ const drag = useChainDrag();
 const instruments = ref<ModuleDesc[]>([]);
 const effects = ref<ModuleDesc[]>([]);
 const presets = ref<NamedPreset[]>([]);
+const chainPresets = ref<NamedChainPreset[]>([]);
 
 const search = ref("");
-const open = reactive({ instruments: true, effects: true, presets: true });
+const open = reactive({ instruments: true, effects: true });
 
 const match = (name: string): boolean =>
   name.toLowerCase().includes(search.value.trim().toLowerCase());
@@ -36,6 +45,7 @@ const match = (name: string): boolean =>
 const shownInstruments = computed(() => instruments.value.filter((m) => match(m.name)));
 const shownEffects = computed(() => effects.value.filter((m) => match(m.name)));
 const shownPresets = computed(() => presets.value.filter((p) => match(p.name)));
+const shownChainPresets = computed(() => chainPresets.value.filter((p) => match(p.name)));
 
 async function reloadPresets(): Promise<void> {
   const names = await project.listPresets();
@@ -44,6 +54,13 @@ async function reloadPresets(): Promise<void> {
       const p = await project.readPreset(name);
       return { name, module: p.module, params: p.params };
     }),
+  );
+  const chainNames = await project.listChainPresets();
+  chainPresets.value = await Promise.all(
+    chainNames.map(async (name) => ({
+      name,
+      nodes: (await project.readChainPreset(name)).nodes,
+    })),
   );
 }
 
@@ -55,6 +72,15 @@ onMounted(async () => {
 });
 
 watch(() => project.presetsVersion, reloadPresets);
+
+// While a card is dragged towards the save zone, light up the family it will
+// join: an instrument card (whole chain) saves among the instruments, an
+// effect node among the effects.
+const savableChain = computed(() => drag.state.source?.kind === "chain");
+const savableFx = computed(() => drag.state.source?.kind === "node");
+
+/** "plucked → reverb" — a chain preset's composition, shown on hover. */
+const chainTitle = (p: NamedChainPreset): string => p.nodes.map((n) => n.module).join(" → ");
 
 function dragModule(e: PointerEvent, m: ModuleDesc): void {
   e.preventDefault();
@@ -69,10 +95,15 @@ function dragPreset(e: PointerEvent, p: NamedPreset): void {
   e.preventDefault();
   drag.arm({ kind: "preset", name: p.name, module: p.module, params: p.params }, e.clientX, e.clientY);
 }
+
+function dragChainPreset(e: PointerEvent, p: NamedChainPreset): void {
+  e.preventDefault();
+  drag.arm({ kind: "chainPreset", name: p.name, nodes: p.nodes }, e.clientX, e.clientY);
+}
 </script>
 
 <template>
-  <div class="browser">
+  <div class="browser" data-save-preset>
     <input
       v-model="search"
       class="search"
@@ -81,11 +112,11 @@ function dragPreset(e: PointerEvent, p: NamedPreset): void {
       spellcheck="false"
     />
 
-    <section class="group">
+    <section class="group" :class="{ 'savable-notes': savableChain }">
       <button type="button" class="group-head" @click="open.instruments = !open.instruments">
         <Icon name="chevron-down" :size="12" :class="{ closed: !open.instruments }" />
         <span class="group-title">{{ t("browser.instruments") }}</span>
-        <span class="count num">{{ shownInstruments.length }}</span>
+        <span class="count num">{{ shownInstruments.length + shownChainPresets.length }}</span>
       </button>
       <div v-if="open.instruments" class="items">
         <div
@@ -96,50 +127,48 @@ function dragPreset(e: PointerEvent, p: NamedPreset): void {
         >
           {{ m.name }}
         </div>
+        <!-- Saved chain presets: named, ready-made instrument + effects. -->
+        <div
+          v-for="p in shownChainPresets"
+          :key="p.name"
+          class="item instrument preset"
+          :title="chainTitle(p)"
+          @pointerdown="dragChainPreset($event, p)"
+        >
+          {{ p.name }}
+        </div>
       </div>
     </section>
 
-    <section class="group">
+    <section class="group" :class="{ 'savable-fx': savableFx }">
       <button type="button" class="group-head" @click="open.effects = !open.effects">
         <Icon name="chevron-down" :size="12" :class="{ closed: !open.effects }" />
         <span class="group-title">{{ t("browser.modules") }}</span>
-        <span class="count num">{{ shownEffects.length }}</span>
+        <span class="count num">{{ shownEffects.length + shownPresets.length }}</span>
       </button>
       <div v-if="open.effects" class="items">
         <div
           v-for="m in shownEffects"
           :key="m.id"
-          class="item"
+          class="item effect"
           @pointerdown="dragModule($event, m)"
         >
           {{ m.name }}
         </div>
-      </div>
-    </section>
-
-    <!-- Drop an effect node here to save it as a preset. -->
-    <section
-      class="group presets"
-      :class="{ savable: drag.state.source?.kind === 'node' }"
-      data-save-preset
-    >
-      <button type="button" class="group-head" @click="open.presets = !open.presets">
-        <Icon name="chevron-down" :size="12" :class="{ closed: !open.presets }" />
-        <span class="group-title">{{ t("browser.presets") }}</span>
-        <span class="count num">{{ shownPresets.length }}</span>
-      </button>
-      <div v-if="open.presets" class="items">
+        <!-- Saved effect presets: one module with its settings. -->
         <div
           v-for="p in shownPresets"
           :key="p.name"
-          class="item preset"
+          class="item effect preset"
+          :title="p.module"
           @pointerdown="dragPreset($event, p)"
         >
           {{ p.name }}
         </div>
-        <span v-if="presets.length === 0" class="empty">{{ t("browser.dropToSave") }}</span>
       </div>
     </section>
+
+    <span class="hint">{{ t("browser.dropToSave") }}</span>
   </div>
 </template>
 
@@ -238,28 +267,42 @@ function dragPreset(e: PointerEvent, p: NamedPreset): void {
   border-color: var(--accent);
 }
 
+/* Signal-typed spines: magenta = consumes Notes, teal = processes Audio. */
 .item.instrument {
   border-left: 2px solid var(--sig-notes);
 }
 
+.item.effect {
+  border-left: 2px solid var(--sig-audio);
+}
+
+/* Dashed = a user preset (a saved sound), solid = a factory module. */
 .item.preset {
   border-style: dashed;
 }
 
-.presets {
+/* Each family is a save drop target for its own kind of card; the tint says
+   which family the dragged card will join. */
+.group {
   border: 1px dashed transparent;
   border-radius: var(--radius-md);
   transition: border-color var(--t-fast), background-color var(--t-fast);
 }
 
-/* Highlighted while a node is being dragged: drop it here to save a preset. */
-.presets.savable {
-  border-color: var(--sig-mod);
-  background: rgba(217, 164, 65, 0.08);
+.group.savable-notes {
+  border-color: var(--sig-notes);
+  background: color-mix(in srgb, var(--sig-notes) 8%, transparent);
 }
 
-.empty {
-  font-size: 0.75rem;
+.group.savable-fx {
+  border-color: var(--sig-audio);
+  background: color-mix(in srgb, var(--sig-audio) 8%, transparent);
+}
+
+.hint {
+  margin-top: auto;
+  padding-top: 0.4rem;
+  font-size: 0.7rem;
   color: var(--text-3);
 }
 </style>

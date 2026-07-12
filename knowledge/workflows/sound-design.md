@@ -21,9 +21,18 @@ Lire `knowledge/INDEX.md` : un son proche existe peut-être dans `sounds/`
 | métallique, cloche, gong | inharmonicité > 10 cents (fm ratio NON entier) |
 | boîte à musique, mobile, celesta, jouet | ratio harmonique > 0.9 (fm ratio ENTIER, index < 1), attaque < 10 ms |
 | boisé, pincé | attaque < 20 ms, RT60 0,3–1 s, ratio harmonique > 0,8 |
-| soufflé, airy, bruité | flatness > −20 dB, ratio harmonique < 0,5 |
+| soufflé, airy, bruité | flatness > −20 dB, ratio harmonique < 0,5 (subtractive `noise` + cutoff) |
+| creux, clarinette, chiptune, jeu vidéo | harmoniques impaires seules : H2 ≤ H3 − 20 dB (subtractive `wave=1`, width 0.5) |
+| nasillard, pincé du bout | H2 fort (subtractive `wave=1`, width 0.15–0.3) |
+| doux, flûte, rond pur | harmoniques en 1/n² (subtractive `wave=2`) |
+| épais, large, nappe qui vit | battement de niveau lent (subtractive `osc2=1`, detune 5–20 ct) |
+| EP, cloche naturelle, pluck FM | centroïde qui DESCEND dans la note (fm `index_env` 0.6–1, `index_decay` 100–500 ms) |
+| gras, riche, cuivré FM | fm `feedback` 0.2–0.6 (spectre vers la saw) |
 | sec | RT60 < 0,3 s |
 | ample, spacieux | RT60 > 1,5 s (delay/reverb dans la chaîne) |
+| chaud, sale, saturé, agressif | crest qui baisse + harmoniques impaires (fx `saturator`, drive 6–30 dB) |
+| qui bouge, animé, flottant | niveau/timbre ondulant lent (fx `chorus`, mix 0.2–0.5) |
+| aminci, isolé, téléphone | bande sculptée (fx `filter` : type 1 hp / 2 bp / 3 notch) |
 
 Poser 2 à 4 cibles chiffrées ; le reste est libre.
 
@@ -50,10 +59,14 @@ fois. Leviers principaux :
 
 | Pour bouger… | Agir sur… |
 |---|---|
-| centroïde ↑/↓ | `cutoff` (subtractive), `index` (fm), `brightness` (plucked), `tone` (delay) |
+| centroïde ↑/↓ | `cutoff` (subtractive/filter), `index` (fm), `brightness` (plucked), `tone` (delay/saturator) |
 | attaque | `attack` (ms, subtractive/fm) — plucked/drums sont instantanés par nature |
 | RT60 | `release`, `decay` (plucked), `size` (reverb), `time`+`feedback` (delay) |
-| flatness ↑ (plus de souffle) | `index` (fm) ↑, résonance ↑ |
+| flatness ↑ (plus de souffle) | `noise` (subtractive), `index` (fm) ↑, résonance ↑ |
+| harmoniques paires/impaires | `wave`+`width` (subtractive) — carrée = impaires seules |
+| évolution du timbre dans la note | `index_env`+`index_decay` (fm) — le seul spectre « vivant » hors plucked |
+| densité/saleté | `feedback` (fm), `drive` (saturator) |
+| épaisseur/mouvement | `osc2`+`detune` (subtractive), `rate`+`depth` (chorus) |
 | niveau | `level` (dB) — viser un peak de probe entre −12 et −6 dBFS |
 
 **Critères d'arrêt** (tous requis) :
@@ -80,3 +93,9 @@ dans un registre, le noter dans la fiche (registre utile).
 2. Mettre à jour `knowledge/INDEX.md` (même commit).
 3. Statut « plausible » tant que l'utilisateur n'a pas écouté ; son verdict
    (validé / retouches) se date dans la fiche.
+4. Pour rendre le son disponible dans l'app (navigateur → Instruments, menu
+   « + piste »), écrire un **preset de chaîne** dans
+   `projects/<projet>/presets/chains/<nom>.json` :
+   `{ "nodes": [ { "module": …, "params": {…} }, … ] }` — `nodes[0]` =
+   instrument, la suite = effets, params normalisés. Données projet, non
+   versionnées.

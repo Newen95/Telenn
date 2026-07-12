@@ -4,6 +4,29 @@ Journal daté, du plus récent au plus ancien. Format : `## AAAA-MM-JJ — titre
 puis contexte, mesure (commande exacte), conclusion. Les impasses se
 consignent au même titre que les réussites.
 
+## 2026-07-12 — Détecteur de clics : les fronts d'onde périodiques ne sont pas des glitches
+
+Contexte : chantier palette. Une carrée brute (`subtractive wave=1
+cutoff=20000`) déclenchait 467 « clics », une FM feedback/index élevés
+pareil — le détecteur ne comparait chaque saut qu'à la MOYENNE des 25 ms
+suivantes, que le front raide d'une onde brillante dépasse toujours de ×12.
+Correctif dans `analysis/levels.rs` : un candidat doit aussi être un outlier
+(> 4×) du PLUS GRAND saut de chaque côté (fenêtres de 25 ms) — un front qui a
+des jumeaux est la forme d'onde, un glitch n'en a nulle part. Conséquences
+assumées : un train de glitches identiques espacés < 25 ms n'est plus signalé
+(ça se lit dans les autres métriques). Leçon générale (deuxième fois — cf.
+granularité du scan spectral) : **quand une mesure contredit la théorie,
+suspecter l'instrument de mesure** ; et pour tester du matériau brillant
+continu, la borne de delta adjacent est le bon outil, pas `detect_clicks`.
+
+## 2026-07-12 — Battement de deux oscillateurs : mesurer sur le fondamental isolé
+
+`subtractive osc2=1 detune=30ct` : le battement RMS pleine bande ne varie
+que de ×1,6 (chaque harmonique bat à sa propre vitesse n·Δf, l'ensemble ne
+creuse jamais ensemble). Filtrer juste au-dessus du fondamental
+(cutoff 300 Hz sur A3) → annulation quasi totale, ratio > ×2 net. Pour
+entendre/mesurer un détune : viser le fondamental.
+
 ## 2026-07-11 — Reverb plate Dattorro : nouveaux repères
 
 La reverb est passée de Freeverb à une plate Dattorro (modulée, +predelay).

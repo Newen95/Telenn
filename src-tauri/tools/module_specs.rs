@@ -29,19 +29,45 @@ const QUIRKS: &str = "\
   42 closed_hat, 45 low_tom, 46 open_hat, 49 crash, 50 hi_tom. Any other
   pitch is SILENT. Note-offs are ignored (one-shots); retrigger restarts the
   sample. `level` is the only param whose max exceeds 0 dB (+6).
+- **subtractive**: `wave` is a rounded selector — 0 saw, 1 pulse, 2 triangle.
+  `width` only shapes the pulse (0.5 = square, odd harmonics only; narrower
+  adds even harmonics; DC compensated internally). `noise` crossfades the
+  oscillator toward white noise BEFORE the filter (cutoff shapes the breath).
+  `osc2` mixes a second oscillator detuned by `detune` cents (normalized sum,
+  0 = bit-identical legacy voice); expect level beating — that is the point.
+  Switching `wave` on a sounding voice swaps the waveform instantly (can
+  click); the other new params glide.
 - **fm**: `ratio` = modulator/carrier frequency ratio — integer ratios give
   harmonic tones, non-integer give inharmonic/bell timbres. `index` =
   modulation depth (radians): more index, brighter and noisier spectrum.
+  `index_env` crossfades the index toward a per-voice envelope (amp attack,
+  own `index_decay`, sustain 0): at 1.0 the sustain is a PURE SINE by design
+  (bright pluck fading to purity — EP, natural bell). `feedback` (0..1 →
+  0..π rad, DX-style two-sample average) thickens the modulator toward a
+  saw-like spectrum; audible from ~0.2.
 - **plucked**: `brightness` below ~0.3 lets a DC offset build up in the
   loop (measured -0.013 at 0.1) and skews centroid readings — stay >= 0.3.
   `release` gates the string: for a freely ringing tine set it to the max
   (1000 ms) and let `decay` govern the ring length.
+- **filter**: `type` is a rounded selector — 0 lowpass, 1 highpass,
+  2 bandpass (constant skirt, peak gain ≈ Q), 3 notch. Cutoff/resonance
+  glide; a TYPE change swaps coefficients instantly and can click on a hot
+  signal — switch type on silence, or accept the edit as non-live.
+- **saturator**: `drive` raises the input into a tanh shaper (bounded ±1
+  before `level`), so loudness RISES with drive — trim with `level`. `tone`
+  is a post-shaper lowpass taming the added highs. Crest factor drops as
+  drive rises (a saturated sine squares up).
+- **chorus**: mono (two modulated taps around 15 ms, decorrelated LFOs) —
+  it thickens and animates but does not widen until the stereo seam lands.
+  Full `mix` on a steady tone audibly pumps at the LFO rate (comb movement):
+  0.2-0.5 is the musical zone.
 - **compressor**: `threshold` is declared `curve: linear` with unit dB ON
   PURPOSE — the gain computer consumes the dB number itself (normalize/
   denormalize stay a plain ramp over -60..0 dB), unlike `makeup`/`level`
   params (db curve → linear gain).
 - **delay**: `feedback` is capped at 0.9 by design so the loop always
-  decays; `time` is free-running milliseconds, NOT tempo-synced.
+  decays; `time` is free-running milliseconds unless `sync` > 0 (rounded
+  selector: off, 1/16, 1/8, 1/8., 1/4, 1/4., 1/2, 1/1 of a beat).
 - **Loop & export**: the loop length is the content end rounded UP to a
   whole bar; the metronome is monitoring-only and never rendered/exported.
 ";

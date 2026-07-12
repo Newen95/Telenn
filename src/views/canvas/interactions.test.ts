@@ -9,20 +9,26 @@ const TICKS_PER_BEAT = PPQ; // 4/4
 
 describe("adaptive snap", () => {
   it("picks a finer grid step the more we zoom in", () => {
-    // Three zoom levels → three distinct steps (sixteenth, beat, bar).
-    const zoomedIn = snapStepTicks(TICKS_PER_BEAT, 0.1); // 240 ticks (16th) is 24px
-    const medium = snapStepTicks(TICKS_PER_BEAT, 0.02); // beat (960) is 19px
+    // Three zoom levels → three distinct steps (32nd, eighth, bar).
+    const zoomedIn = snapStepTicks(TICKS_PER_BEAT, 0.1); // 120 ticks (32nd) is 12px
+    const medium = snapStepTicks(TICKS_PER_BEAT, 0.02); // eighth (480) is 9.6px
     const zoomedOut = snapStepTicks(TICKS_PER_BEAT, 0.004); // bar (3840) is 15px
 
-    expect(zoomedIn).toBe(TICKS_PER_BEAT / 4);
-    expect(medium).toBe(TICKS_PER_BEAT);
+    expect(zoomedIn).toBe(TICKS_PER_BEAT / 8);
+    expect(medium).toBe(TICKS_PER_BEAT / 2);
     expect(zoomedOut).toBe(TICKS_PER_BEAT * 4);
     expect(zoomedIn).toBeLessThan(medium);
     expect(medium).toBeLessThan(zoomedOut);
   });
 
+  it("reaches sixteenth notes at a drum-grid zoom (a beat ≈ 36px)", () => {
+    // The regression the drum patterns hit: 16ths (240 ticks) are 9px here —
+    // under the old 12px floor the grid stopped at eighths.
+    expect(snapStepTicks(TICKS_PER_BEAT, 0.0375)).toBe(TICKS_PER_BEAT / 4);
+  });
+
   it("snaps to the nearest step, and to whole ticks when free (Alt)", () => {
-    expect(adaptiveSnap(130, TICKS_PER_BEAT, 0.1, false)).toBe(240); // nearest 16th
+    expect(adaptiveSnap(130, TICKS_PER_BEAT, 0.1, false)).toBe(120); // nearest 32nd
     expect(adaptiveSnap(130.6, TICKS_PER_BEAT, 0.1, true)).toBe(131); // free → rounded
   });
 });
@@ -103,6 +109,22 @@ describe("gesture state machine", () => {
     expect(calls).toEqual(["move n1 240 0"]); // treated as a move, not a resize
   });
 
+  it("keeps a thin right-edge handle on short notes", () => {
+    // 100 ticks at 0.1 px/tick = 10px on screen: above the 6px move-only
+    // floor, so the right edge still resizes through its (thin, 3px) zone
+    // while the centre stays a move grab.
+    const short: Block = { startTick: 0, lenTick: 100, lane: 0, color: "#000", ref: "n2" };
+    const { adapter, calls } = recordingAdapter();
+    const fsm = makeFsm([short], adapter);
+    expect(fsm.cursorAt(9, 5)).toBe("ew-resize"); // 1px inside the right edge
+    expect(fsm.cursorAt(5, 5)).toBe("move"); // the centre stays a move grab
+    fsm.onPointerDown(9, 5);
+    fsm.onPointerMove(44, 5, { alt: false }); // drag the end to ~440 ticks
+    fsm.onPointerUp();
+    expect(calls.length).toBe(1);
+    expect(calls[0]).toMatch(/^resize n2 0 \d+$/);
+  });
+
   it("does not commit if the pointer never crossed the drag threshold", () => {
     const { adapter, calls } = recordingAdapter();
     const fsm = makeFsm([block], adapter);
@@ -127,9 +149,9 @@ describe("gesture state machine", () => {
   it("creates on double-click, floored to the start of the clicked subdivision", () => {
     const { adapter, calls } = recordingAdapter();
     const fsm = makeFsm([block], adapter);
-    // x=260 → tick 2600. Step is a 16th (240). Floor → 2400, not the nearest 2640.
+    // x=260 → tick 2600. Step is a 32nd (120). Floor → 2520, not the nearest 2640.
     fsm.onDoubleClick(260, 35); // lane 3
-    expect(calls).toEqual(["create 2400 3"]);
+    expect(calls).toEqual(["create 2520 3"]);
   });
 
   it("does not create when double-clicking on an existing block", () => {

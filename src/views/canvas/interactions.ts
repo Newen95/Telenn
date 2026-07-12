@@ -66,8 +66,10 @@ const RESIZE_EDGE_PX = 6;
 /** A resize zone never eats more than this fraction of the block's width, so a
  *  short note always keeps a draggable core (the remaining ~40%) at its centre. */
 const MAX_EDGE_FRACTION = 0.3;
-/** Below this on-screen width (px) a block is resize-disabled: move only. */
-const MIN_RESIZABLE_PX = 12;
+/** Below this on-screen width (px) a block is resize-disabled: move only.
+ *  Kept low so sixteenth notes at a drum-grid zoom (~9px) still offer their
+ *  (thin) right-edge handle — zoom in for comfort. */
+const MIN_RESIZABLE_PX = 6;
 /** Pointer travel, in CSS pixels, before a press becomes a drag. */
 const DRAG_THRESHOLD_PX = 3;
 
@@ -256,11 +258,13 @@ export class GridInteractions {
 /**
  * Finest grid step (in ticks) that is still at least `MIN_SNAP_PX` wide at the
  * current zoom, so snapping feels right from bar level (zoomed out) down to
- * sixteenths (zoomed in).
+ * thirty-seconds (zoomed right in). 8 px is enough for a deliberate click —
+ * a 12 px floor used to lock drum grids (16ths) out of comfortable zooms.
  */
 export function snapStepTicks(ticksPerBeat: number, pxPerTick: number): number {
-  const MIN_SNAP_PX = 12;
+  const MIN_SNAP_PX = 8;
   const candidates = [
+    ticksPerBeat / 8,
     ticksPerBeat / 4,
     ticksPerBeat / 2,
     ticksPerBeat,

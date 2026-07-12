@@ -77,6 +77,15 @@ pub struct Click {
 /// activity that raises that mean, while a genuine glitch is followed by a
 /// return to smooth or silent material. A jump is a click when it is large
 /// (> 0.5) and 6× the forward mean, or moderate (> 0.08) and 12× it.
+///
+/// A candidate must also be an outlier against the biggest jump on EACH side
+/// (25 ms windows, its own 1 ms excluded): bright periodic waveforms (raw
+/// square/pulse, high-feedback FM) have a steep front every period whose
+/// size dwarfs the period's mean — without this test every front (including
+/// the very first) reads as a click. A repeating front has twins on at least
+/// one side; a glitch has none anywhere. (Consequence: in a train of
+/// identical glitches closer than 25 ms apart nothing is flagged — accepted:
+/// that texture reads as waveform, and the defect shows up in other metrics.)
 /// Thresholds are heuristic, tuned for probe renders.
 pub fn detect_clicks(x: &[f32], sample_rate: u32) -> Vec<Click> {
     if x.len() < 2 || sample_rate == 0 {
@@ -109,6 +118,17 @@ pub fn detect_clicks(x: &[f32], sample_rate: u32) -> Vec<Click> {
         let is_click =
             (jump > 0.5 && jump > 6.0 * context) || (jump > 0.08 && jump > 12.0 * context);
         if !is_click {
+            continue;
+        }
+        // Neighbourhood test (candidates only, so the scans stay cheap): a
+        // front with a similar-sized twin on either side is the waveform.
+        let max_in = |lo: usize, hi: usize| d[lo..hi].iter().fold(0.0f32, |m, &v| m.max(v));
+        let back_lo = i.saturating_sub(long_window);
+        let back_hi = i.saturating_sub(merge_gap).max(back_lo);
+        let fwd_lo = (i + merge_gap).min(d.len());
+        let fwd_hi = (i + long_window).min(d.len()).max(fwd_lo);
+        let twin = max_in(back_lo, back_hi).max(max_in(fwd_lo, fwd_hi));
+        if jump <= 4.0 * twin {
             continue;
         }
         // Merge flags within 1 ms into a single event, keeping the biggest jump.

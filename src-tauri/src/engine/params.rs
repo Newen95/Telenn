@@ -4,7 +4,9 @@
 //! exponential glide for everything else (cutoff, resonance…). Both are
 //! RT-SAFE: no allocation, pure arithmetic.
 
-/// Constant-rate linear ramp toward a target. // RT-SAFE
+/// Constant-rate linear ramp toward a target. `Copy` so an effect can snapshot
+/// it and replay the same trajectory on every channel of a block. // RT-SAFE
+#[derive(Clone, Copy)]
 pub struct LinearRamp {
     current: f32,
     target: f32,
@@ -43,7 +45,9 @@ impl LinearRamp {
 }
 
 /// One-pole exponential smoother. `coef` is the per-sample retention factor
-/// (close to 1.0 = slow). Advanced a whole block at a time. // RT-SAFE
+/// (close to 1.0 = slow). Advanced a whole block at a time. `Copy` for the
+/// same per-channel replay idiom as [`LinearRamp`]. // RT-SAFE
+#[derive(Clone, Copy)]
 pub struct OnePole {
     current: f32,
     target: f32,

@@ -4,6 +4,18 @@ Journal daté, du plus récent au plus ancien. Format : `## AAAA-MM-JJ — titre
 puis contexte, mesure (commande exacte), conclusion. Les impasses se
 consignent au même titre que les réussites.
 
+## 2026-07-14 — Compresser un bus de drums : l'attaque décide si le crest monte ou descend
+
+Mix mareux-test, cible crest 11-13 dB. Compressor sur
+`drum_sampler` avec attack 5 ms + makeup +5 dB : le crest du mix est passé
+de 19.6 à **23.6 dB** — le transitoire du kick (< 1 ms) traverse la fenêtre
+d'attaque intact et le makeup le remonte, pendant que le corps se fait
+comprimer. Avec attack 0.5 ms le même étage fait 19.6 → 14.6. Deuxième
+piège : une fois le bus compressé, baisser la vélocité d'un élément (snare
+104 → 98) ne change quasi rien au pic — le makeup réabsorbe l'écart. Régler
+l'équilibre AVANT d'insérer la compression, et toujours re-mesurer le crest
+après tout changement de makeup/attack (`render_probe --song`).
+
 ## 2026-07-12 — Sons à longue résonance : mesurer les pitches UN PAR UN
 
 `render_probe --pitches 78,84,90` sur la berceuse (release 1 s, decay

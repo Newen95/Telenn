@@ -16,8 +16,50 @@ use crate::control::project::{
 };
 use crate::modules::registry;
 
-/// Reserved id of the implicit master node (see `project::to_graph`).
-const MASTER_ID: &str = "_master";
+/// Reserved id addressing the master bus: passed as a `track_id` it targets
+/// `Project::master_chain` (effects only, no instrument head); it can never be
+/// a node or track id.
+pub const MASTER_ID: &str = "_master";
+
+/// Which chain a node lives in: a track's, or the master bus's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChainRef {
+    Track(usize),
+    Master,
+}
+
+impl ChainRef {
+    /// First slot effects may occupy: tracks reserve index 0 for the
+    /// instrument head; the master chain has no head.
+    fn effects_floor(self) -> usize {
+        match self {
+            ChainRef::Track(_) => 1,
+            ChainRef::Master => 0,
+        }
+    }
+}
+
+/// Resolve a `track_id` argument to a chain reference (`_master` = master bus).
+fn chain_ref(project: &Project, track_id: &str) -> Result<ChainRef, GraphEditError> {
+    if track_id == MASTER_ID {
+        return Ok(ChainRef::Master);
+    }
+    Ok(ChainRef::Track(track_index(project, track_id)?))
+}
+
+fn chain_mut(project: &mut Project, r: ChainRef) -> &mut Vec<NodeSpec> {
+    match r {
+        ChainRef::Track(i) => &mut project.tracks[i].chain,
+        ChainRef::Master => &mut project.master_chain,
+    }
+}
+
+fn chain_of(project: &Project, r: ChainRef) -> &Vec<NodeSpec> {
+    match r {
+        ChainRef::Track(i) => &project.tracks[i].chain,
+        ChainRef::Master => &project.master_chain,
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum GraphEditError {
@@ -80,8 +122,8 @@ pub fn add_track(
     instrument_id: &str,
     color: Option<&str>,
 ) -> Result<(), GraphEditError> {
-    if instrument_id == MASTER_ID {
-        return Err(GraphEditError::ReservedId(instrument_id.to_string()));
+    if instrument_id == MASTER_ID || track_id == MASTER_ID {
+        return Err(GraphEditError::ReservedId(track_id.to_string()));
     }
     require_instrument(module)?;
     if project.tracks.iter().any(|t| t.id == track_id) {
@@ -244,9 +286,11 @@ pub fn insert_effect(
     insert_effect_at(project, track_id, module, node_id, params, usize::MAX)
 }
 
-/// Insert a new effect at `index` in a track's chain. `index` is clamped to the
-/// effects region `[1, len]` (1 = right after the instrument, `len` = end), so a
-/// new effect can never land on the instrument slot. `usize::MAX` means append.
+/// Insert a new effect at `index` in a track's chain — or the master bus's
+/// when `track_id` is [`MASTER_ID`]. `index` is clamped to the effects region
+/// (`[1, len]` on a track: never the instrument slot; `[0, len]` on the
+/// master, which has no head). `usize::MAX` means append. Master inserts are
+/// strictly effects; the graph compiler enforces it again.
 pub fn insert_effect_at(
     project: &mut Project,
     track_id: &str,
@@ -264,13 +308,14 @@ pub fn insert_effect_at(
     if id_exists(project, node_id) {
         return Err(GraphEditError::DuplicateId(node_id.to_string()));
     }
-    let track = project
-        .tracks
-        .iter_mut()
-        .find(|t| t.id == track_id)
-        .ok_or_else(|| GraphEditError::UnknownTrack(track_id.to_string()))?;
-    let pos = index.clamp(1, track.chain.len());
-    track.chain.insert(
+    let dst = chain_ref(project, track_id)?;
+    if dst == ChainRef::Master {
+        require_effect(module)?;
+    }
+    let floor = dst.effects_floor();
+    let chain = chain_mut(project, dst);
+    let pos = index.clamp(floor, chain.len());
+    chain.insert(
         pos,
         NodeSpec {
             id: node_id.to_string(),
@@ -283,59 +328,68 @@ pub fn insert_effect_at(
 
 /// Remove an effect by id. The instrument (chain head) cannot be removed.
 pub fn remove_node(project: &mut Project, node_id: &str) -> Result<(), GraphEditError> {
-    let (track_idx, chain_idx) = locate(project, node_id)?;
-    if chain_idx == 0 {
+    let (cref, chain_idx) = locate(project, node_id)?;
+    if matches!(cref, ChainRef::Track(_)) && chain_idx == 0 {
         return Err(GraphEditError::CannotEditInstrument(node_id.to_string()));
     }
-    project.tracks[track_idx].chain.remove(chain_idx);
+    chain_mut(project, cref).remove(chain_idx);
     Ok(())
 }
 
 /// Move an effect one step earlier (`dir < 0`) or later (`dir > 0`) in its
-/// chain. The instrument slot (index 0) is never entered or left.
+/// chain. On a track the instrument slot (index 0) is never entered or left;
+/// the master chain has no such slot.
 pub fn move_node(project: &mut Project, node_id: &str, dir: i32) -> Result<(), GraphEditError> {
-    let (track_idx, chain_idx) = locate(project, node_id)?;
-    if chain_idx == 0 {
+    let (cref, chain_idx) = locate(project, node_id)?;
+    if matches!(cref, ChainRef::Track(_)) && chain_idx == 0 {
         return Err(GraphEditError::CannotEditInstrument(node_id.to_string()));
     }
-    let chain = &mut project.tracks[track_idx].chain;
+    let floor = cref.effects_floor() as i32;
+    let chain = chain_mut(project, cref);
     let target = chain_idx as i32 + dir.signum();
-    // Stay within the effects region [1, len-1]; a no-op at the edges.
-    if target >= 1 && (target as usize) < chain.len() {
+    // Stay within the effects region; a no-op at the edges.
+    if target >= floor && (target as usize) < chain.len() {
         chain.swap(chain_idx, target as usize);
     }
     Ok(())
 }
 
-/// Move an effect to `index` in another (or the same) track's chain, **keeping its
-/// id** so the hot-swap adopts the same node instance — its internal state (e.g. a
-/// reverb tail) follows the move without a gap. The instrument (index 0) can never
-/// be moved, nor can a node land on a target's instrument slot.
+/// Move an effect to `index` in another (or the same) chain — a track's, or
+/// the master bus's when `to_track` is [`MASTER_ID`] — **keeping its id** so
+/// the hot-swap adopts the same node instance: its internal state (e.g. a
+/// reverb tail) follows the move without a gap. The instrument (index 0 of a
+/// track) can never be moved, nor can a node land on a target's instrument
+/// slot; only effects may land on the master.
 pub fn move_node_to(
     project: &mut Project,
     node_id: &str,
     to_track: &str,
     index: usize,
 ) -> Result<(), GraphEditError> {
-    let (src_track, src_chain) = locate(project, node_id)?;
-    if src_chain == 0 {
+    let (src, src_chain) = locate(project, node_id)?;
+    if matches!(src, ChainRef::Track(_)) && src_chain == 0 {
         return Err(GraphEditError::CannotEditInstrument(node_id.to_string()));
     }
-    let dst_track = track_index(project, to_track)?;
-    let spec = project.tracks[src_track].chain.remove(src_chain);
-    // Removing from the same track before the target shifts later slots left.
+    let dst = chain_ref(project, to_track)?;
+    if dst == ChainRef::Master {
+        require_effect(&chain_of(project, src)[src_chain].module)?;
+    }
+    let spec = chain_mut(project, src).remove(src_chain);
+    // Removing from the same chain before the target shifts later slots left.
     let mut pos = index;
-    if src_track == dst_track && src_chain < pos {
+    if src == dst && src_chain < pos {
         pos -= 1;
     }
-    let chain = &mut project.tracks[dst_track].chain;
-    let pos = pos.clamp(1, chain.len());
+    let floor = dst.effects_floor();
+    let chain = chain_mut(project, dst);
+    let pos = pos.clamp(floor, chain.len());
     chain.insert(pos, spec);
     Ok(())
 }
 
-/// Copy an effect into a track's chain at `index` under a **new** id (a fresh node
-/// instance with the same params). The instrument cannot be copied.
+/// Copy an effect into a chain at `index` under a **new** id (a fresh node
+/// instance with the same params) — `to_track` may be [`MASTER_ID`]. The
+/// instrument cannot be copied.
 pub fn copy_node(
     project: &mut Project,
     node_id: &str,
@@ -349,19 +403,23 @@ pub fn copy_node(
     if id_exists(project, new_id) {
         return Err(GraphEditError::DuplicateId(new_id.to_string()));
     }
-    let (src_track, src_chain) = locate(project, node_id)?;
-    if src_chain == 0 {
+    let (src, src_chain) = locate(project, node_id)?;
+    if matches!(src, ChainRef::Track(_)) && src_chain == 0 {
         return Err(GraphEditError::CannotEditInstrument(node_id.to_string()));
     }
-    let source = &project.tracks[src_track].chain[src_chain];
+    let source = &chain_of(project, src)[src_chain];
     let copy = NodeSpec {
         id: new_id.to_string(),
         module: source.module.clone(),
         params: source.params.clone(),
     };
-    let dst_track = track_index(project, to_track)?;
-    let chain = &mut project.tracks[dst_track].chain;
-    let pos = index.clamp(1, chain.len());
+    let dst = chain_ref(project, to_track)?;
+    if dst == ChainRef::Master {
+        require_effect(&copy.module)?;
+    }
+    let floor = dst.effects_floor();
+    let chain = chain_mut(project, dst);
+    let pos = index.clamp(floor, chain.len());
     chain.insert(pos, copy);
     Ok(())
 }
@@ -375,8 +433,8 @@ pub fn set_param(
     param: &str,
     value: f32,
 ) -> Result<(), GraphEditError> {
-    let (track_idx, chain_idx) = locate(project, node_id)?;
-    project.tracks[track_idx].chain[chain_idx]
+    let (cref, chain_idx) = locate(project, node_id)?;
+    chain_mut(project, cref)[chain_idx]
         .params
         .insert(param.to_string(), value);
     Ok(())
@@ -395,15 +453,19 @@ fn id_exists(project: &Project, node_id: &str) -> bool {
         .tracks
         .iter()
         .flat_map(|t| t.chain.iter())
+        .chain(project.master_chain.iter())
         .any(|n| n.id == node_id)
 }
 
-/// Find the `(track, chain)` indices of a node id.
-fn locate(project: &Project, node_id: &str) -> Result<(usize, usize), GraphEditError> {
+/// Find the chain (track or master) and slot of a node id.
+fn locate(project: &Project, node_id: &str) -> Result<(ChainRef, usize), GraphEditError> {
     for (ti, track) in project.tracks.iter().enumerate() {
         if let Some(ci) = track.chain.iter().position(|n| n.id == node_id) {
-            return Ok((ti, ci));
+            return Ok((ChainRef::Track(ti), ci));
         }
+    }
+    if let Some(ci) = project.master_chain.iter().position(|n| n.id == node_id) {
+        return Ok((ChainRef::Master, ci));
     }
     Err(GraphEditError::NodeNotFound(node_id.to_string()))
 }
@@ -665,6 +727,74 @@ mod tests {
         assert!(matches!(
             insert_effect(&mut p, "lead", "gain", "lead_synth", Default::default()),
             Err(GraphEditError::DuplicateId(_))
+        ));
+    }
+
+    #[test]
+    fn master_chain_accepts_effect_edits() {
+        let mut p = demo();
+        // Insert lands at [0, len] (no instrument head on the master).
+        insert_effect_at(
+            &mut p,
+            MASTER_ID,
+            "compressor",
+            "m_comp",
+            Default::default(),
+            0,
+        )
+        .unwrap();
+        insert_effect(&mut p, MASTER_ID, "gain", "m_gain", Default::default()).unwrap();
+        let ids: Vec<&str> = p.master_chain.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids, ["m_comp", "m_gain"]);
+
+        // Reorder, param write, remove — all by node id, like track effects.
+        move_node(&mut p, "m_gain", -1).unwrap();
+        assert_eq!(p.master_chain[0].id, "m_gain");
+        set_param(&mut p, "m_comp", "ratio", 0.6).unwrap();
+        assert_eq!(p.master_chain[1].params.get("ratio"), Some(&0.6));
+        remove_node(&mut p, "m_gain").unwrap();
+        assert_eq!(p.master_chain.len(), 1);
+
+        // The graph carries them (validated as effects at compile).
+        let (desc, _) = p.to_graph().unwrap();
+        assert_eq!(desc.master.len(), 1);
+    }
+
+    #[test]
+    fn master_chain_rejects_instruments_and_reserved_ids() {
+        let mut p = demo();
+        assert!(matches!(
+            insert_effect(&mut p, MASTER_ID, "plucked", "m_bad", Default::default()),
+            Err(GraphEditError::NotAnEffect(_))
+        ));
+        assert!(matches!(
+            add_track(&mut p, MASTER_ID, "Master", "fm", "x", None),
+            Err(GraphEditError::ReservedId(_))
+        ));
+        // A duplicate id across track and master namespaces is refused.
+        insert_effect(&mut p, MASTER_ID, "gain", "m_gain", Default::default()).unwrap();
+        assert!(matches!(
+            insert_effect(&mut p, "lead", "gain", "m_gain", Default::default()),
+            Err(GraphEditError::DuplicateId(_))
+        ));
+    }
+
+    #[test]
+    fn move_node_to_crosses_track_and_master() {
+        let mut p = demo();
+        insert_effect(&mut p, "lead", "reverb", "verb", Default::default()).unwrap();
+        // Track → master keeps the id (state adopted across the swap).
+        move_node_to(&mut p, "verb", MASTER_ID, 0).unwrap();
+        assert_eq!(ids(&p, 0), ["lead_synth"]);
+        assert_eq!(p.master_chain[0].id, "verb");
+        // Master → track: back after the instrument.
+        move_node_to(&mut p, "verb", "lead", 1).unwrap();
+        assert_eq!(ids(&p, 0), ["lead_synth", "verb"]);
+        assert!(p.master_chain.is_empty());
+        // The instrument still cannot go anywhere near the master.
+        assert!(matches!(
+            move_node_to(&mut p, "lead_synth", MASTER_ID, 0),
+            Err(GraphEditError::CannotEditInstrument(_))
         ));
     }
 

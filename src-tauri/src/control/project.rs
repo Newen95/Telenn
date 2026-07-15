@@ -47,6 +47,11 @@ pub struct Project {
     /// Master gain (dB) applied by the mixer stage after the track sum.
     #[serde(default)]
     pub master_gain_db: f32,
+    /// Effects-only chain on the master bus, processed after the track sum and
+    /// before the master gain. `skip_serializing_if` keeps every existing
+    /// `song.json` byte-stable while the chain is empty (no watcher echo).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub master_chain: Vec<NodeSpec>,
     pub tracks: Vec<Track>,
 }
 
@@ -138,6 +143,9 @@ pub struct ProjectView {
     pub time_signature: [u32; 2],
     /// Master gain (dB) applied by the mixer stage.
     pub master_gain_db: f32,
+    /// Effects-only master bus chain, for the chain panel (flat indices
+    /// continue after the last track effect, mirroring `to_graph` pass 3).
+    pub master_chain: Vec<ChainNodeView>,
     pub tracks: Vec<TrackView>,
 }
 
@@ -368,14 +376,16 @@ impl Project {
     }
 
     /// Build a graph description from the track chains. Returns the graph and
-    /// the note-routing index. There is no master node: each chain tail stays
-    /// mono and the mixer stage reads the tails with the per-track settings
-    /// carried on the description.
+    /// the note-routing index. The mixer stage reads the chain tails with the
+    /// per-track settings carried on the description; the master chain rides
+    /// along as unconnected nodes listed in `GraphDesc::master`, run by the
+    /// engine on the mixed bus (see `CompiledGraph::process_master`).
     ///
     /// Layout is **instruments first** (indices `0..T-1`), then every track's
-    /// effects. Keeping instrument indices independent of the effect chains
-    /// means a live effect edit never shifts an instrument index, so the
-    /// playing schedule and held notes stay valid across a hot-swap.
+    /// effects, then the master chain. Keeping instrument indices independent
+    /// of the effect chains means a live effect edit never shifts an
+    /// instrument index, so the playing schedule and held notes stay valid
+    /// across a hot-swap.
     pub fn to_graph(&self) -> Result<(GraphDesc, GraphIndex), ProjectError> {
         for track in &self.tracks {
             if track.chain.is_empty() {
@@ -412,6 +422,15 @@ impl Project {
             }
         }
 
+        // Pass 3: the master chain, appended last (unconnected — the engine
+        // feeds it the mixed bus, not a graph edge).
+        let mut master: Vec<NodeIdx> = Vec::with_capacity(self.master_chain.len());
+        for spec in &self.master_chain {
+            let idx = nodes.len();
+            nodes.push(self.node_desc(spec)?);
+            master.push(idx);
+        }
+
         Ok((
             GraphDesc {
                 nodes,
@@ -419,6 +438,7 @@ impl Project {
                 tails,
                 track_mix: self.tracks.iter().map(|t| t.mixer).collect(),
                 master_gain_db: self.master_gain_db,
+                master,
             },
             index,
         ))
@@ -490,11 +510,27 @@ impl Project {
                 clips,
             });
         }
+        let master_chain = self
+            .master_chain
+            .iter()
+            .map(|node| {
+                let idx = next_effect;
+                next_effect += 1;
+                ChainNodeView {
+                    id: node.id.clone(),
+                    module: node.module.clone(),
+                    is_instrument: false,
+                    flat_index: idx,
+                    params: node.params.clone(),
+                }
+            })
+            .collect();
         Ok(ProjectView {
             bpm: self.bpm,
             ppq: PPQ,
             time_signature: self.time_signature,
             master_gain_db: self.master_gain_db,
+            master_chain,
             tracks,
         })
     }
@@ -713,6 +749,26 @@ mod tests {
         let written = p.to_json().unwrap();
         let reparsed: Project = serde_json::from_str(&written).unwrap();
         assert_eq!(written, reparsed.to_json().unwrap());
+    }
+
+    #[test]
+    fn empty_master_chain_never_reaches_the_file() {
+        // Legacy projects must stay byte-stable: an empty master chain is
+        // skipped on write, and a populated one round-trips.
+        let p: Project = serde_json::from_str(TWO_NOTES).unwrap();
+        assert!(!p.to_json().unwrap().contains("master_chain"));
+
+        let mut with_master = p;
+        with_master.master_chain.push(NodeSpec {
+            id: "m_gain".into(),
+            module: "gain".into(),
+            params: BTreeMap::new(),
+        });
+        let written = with_master.to_json().unwrap();
+        assert!(written.contains("master_chain"));
+        let back: Project = serde_json::from_str(&written).unwrap();
+        assert_eq!(back.master_chain.len(), 1);
+        assert_eq!(written, back.to_json().unwrap());
     }
 
     #[test]

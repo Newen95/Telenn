@@ -8,7 +8,7 @@
 import { computed, nextTick, reactive, ref, watch, watchEffect } from "vue";
 import { useI18n } from "vue-i18n";
 
-import { useProjectStore, type ChainNodeView, type ModuleDesc, type ParamInfo, type Preset } from "../../stores/project";
+import { MASTER_ID, useProjectStore, type ChainNodeView, type ModuleDesc, type ParamInfo, type Preset } from "../../stores/project";
 import { useTelemetryStore } from "../../stores/telemetry";
 import { useUiStore } from "../../stores/ui";
 import { projectHues } from "../../styles/theme";
@@ -33,22 +33,34 @@ function wireLevel(chain: ChainNodeView[], index: number): number {
   return Math.min(1, Math.sqrt(telemetry.meterAt(node.flatIndex).peak));
 }
 
-// The displayed track: the active one, falling back to the first so the panel
-// never goes blank when a selection points at a removed track.
+// The displayed chain: the active track's, falling back to the first so the
+// panel never goes blank — or the master bus's (a headless, effects-only
+// chain) when the master strip is the selection.
+const isMaster = computed(() => ui.activeTrackId === MASTER_ID);
 const activeIndex = computed(() => {
   const i = project.tracks.findIndex((tr) => tr.id === ui.activeTrackId);
   return i >= 0 ? i : 0;
 });
-const track = computed(() => project.tracks[activeIndex.value]);
+const track = computed(() => (isMaster.value ? undefined : project.tracks[activeIndex.value]));
+/** The id chain edits address: a track id, or the reserved master target. */
+const chainTargetId = computed(() => (isMaster.value ? MASTER_ID : (track.value?.id ?? "")));
+const displayChain = computed<ChainNodeView[] | undefined>(() =>
+  isMaster.value ? project.masterChain : track.value?.chain,
+);
+const displayName = computed(() =>
+  isMaster.value ? t("meter.master") : track.value ? track.value.name || track.value.id : "",
+);
 
 /** Collision-free display hue per track id (explicit colors first). */
 const hues = computed(() => projectHues(project.tracks));
+const displayHue = computed(() => (isMaster.value ? undefined : hues.value.get(chainTargetId.value)));
 
+// The header cycles tracks then the master bus, one loop.
 function step(dir: number): void {
-  const n = project.tracks.length;
-  if (n === 0) return;
-  const next = (activeIndex.value + dir + n) % n;
-  ui.activeTrackId = project.tracks[next].id;
+  const order = [...project.tracks.map((tr) => tr.id), MASTER_ID];
+  if (order.length === 0) return;
+  const cur = isMaster.value ? order.length - 1 : activeIndex.value;
+  ui.activeTrackId = order[(cur + dir + order.length) % order.length];
 }
 
 // Click the instrument card's chevron → picker replacing the track's
@@ -122,13 +134,14 @@ function ensureSpecs(module: string): void {
   }
 }
 
-// Fetch specs for every chain node (instrument included), plus whatever is
-// being dragged (so the ghost can render its knobs at the right size before
-// the node exists).
+// Fetch specs for every chain node (instrument included, master chain too),
+// plus whatever is being dragged (so the ghost can render its knobs at the
+// right size before the node exists).
 watchEffect(() => {
   for (const track of project.tracks) {
     for (const node of track.chain) ensureSpecs(node.module);
   }
+  for (const node of project.masterChain) ensureSpecs(node.module);
   const dragged = drag.state.source;
   if (dragged && dragged.kind !== "chainPreset") ensureSpecs(dragged.module);
 });
@@ -164,8 +177,8 @@ const ghost = computed<{ module: string; params: Record<string, number> } | null
   const s = drag.state.source;
   if (!s) return null;
   if (s.kind === "node") {
-    for (const track of project.tracks) {
-      const node = track.chain.find((n) => n.id === s.nodeId);
+    for (const chain of [...project.tracks.map((tr) => tr.chain), project.masterChain]) {
+      const node = chain.find((n) => n.id === s.nodeId);
       if (node) return { module: node.module, params: node.params };
     }
     return { module: s.module, params: {} };
@@ -257,18 +270,20 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
 
 <template>
   <div class="chain-panel" :class="{ dragging: !!drag.state.source }">
-    <template v-if="track">
+    <template v-if="displayChain">
       <header class="chain-head">
         <button type="button" class="nav" :title="t('chain.prevTrack')" @click="step(-1)">
           <Icon name="chevron-left" :size="13" />
         </button>
-        <span class="chain-track-name" :style="{ borderColor: hues.get(track.id) }">
-          {{ track.name || track.id }}
+        <span class="chain-track-name" :class="{ master: isMaster }" :style="{ borderColor: displayHue }">
+          {{ displayName }}
         </span>
         <button type="button" class="nav" :title="t('chain.nextTrack')" @click="step(1)">
           <Icon name="chevron-right" :size="13" />
         </button>
-        <span class="track-count num">{{ activeIndex + 1 }}/{{ project.tracks.length }}</span>
+        <span class="track-count num">
+          {{ isMaster ? project.tracks.length + 1 : activeIndex + 1 }}/{{ project.tracks.length + 1 }}
+        </span>
       </header>
       <div class="chain-row">
       <!-- TransitionGroup so a removed effect's neighbours slide into place. Each
@@ -277,32 +292,33 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
         tag="div"
         name="chain"
         class="chain"
-        :class="{ 'chain-replacing': chainReplaceHover(track.id) }"
+        :class="{ 'chain-replacing': chainReplaceHover(chainTargetId) }"
         data-chain
-        :data-track="track.id"
+        :data-track="chainTargetId"
         :move-class="flip ? 'chain-move' : 'chain-move-off'"
         @before-leave="onBeforeLeave"
       >
         <div
-          v-for="(node, i) in track.chain"
+          v-for="(node, i) in displayChain"
           :key="node.id"
           class="chain-item"
           :class="{ lifted: lifting(node.id) }"
         >
-          <!-- A drop gap precedes every effect (none before the instrument). -->
+          <!-- A drop gap precedes every effect (none before the instrument;
+               the headless master chain has one before every node). -->
           <span
             v-if="!node.isInstrument"
             class="gap"
-            :class="{ over: isOver({ kind: 'gap', trackId: track.id, index: i }) }"
-            :style="{ '--sig': wireLevel(track.chain, i - 1) }"
+            :class="{ over: isOver({ kind: 'gap', trackId: chainTargetId, index: i }) }"
+            :style="{ '--sig': wireLevel(displayChain, i - 1) }"
             data-gap
-            :data-track="track.id"
+            :data-track="chainTargetId"
             :data-index="i"
           ></span>
           <!-- In-place drop preview: the dragged effect already sitting where it
                will land — release = exactly this. -->
           <div
-            v-if="ghost && isOver({ kind: 'gap', trackId: track.id, index: i })"
+            v-if="ghost && isOver({ kind: 'gap', trackId: chainTargetId, index: i })"
             class="node preview"
           >
             <div class="node-head">
@@ -313,7 +329,7 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
           </div>
           <!-- The preview's outgoing wire: the ghost is plugged in, not floating. -->
           <span
-            v-if="ghost && isOver({ kind: 'gap', trackId: track.id, index: i })"
+            v-if="ghost && isOver({ kind: 'gap', trackId: chainTargetId, index: i })"
             class="ghost-wire"
           ></span>
           <div
@@ -322,12 +338,12 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
               instrument: node.isInstrument,
               selected: sel.selected === node.id,
               'swap-target': node.isInstrument && draggingInstrument,
-              over: node.isInstrument && isOver({ kind: 'instrument', trackId: track.id }),
+              over: node.isInstrument && isOver({ kind: 'instrument', trackId: chainTargetId }),
             }"
             :data-instrument="node.isInstrument ? '' : undefined"
             tabindex="0"
-            @pointerdown="onNodePointerDown($event, track.id, node, i)"
-            @keydown="onNodeKey($event, track.id, node, i)"
+            @pointerdown="onNodePointerDown($event, chainTargetId, node, i)"
+            @keydown="onNodeKey($event, chainTargetId, node, i)"
             @focusout="onNodeBlur($event, node.id)"
           >
             <div class="node-head">
@@ -386,14 +402,14 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
         <div key="trailing" class="chain-item">
           <span
             class="gap end"
-            :class="{ over: isOver({ kind: 'gap', trackId: track.id, index: track.chain.length }) }"
-            :style="{ '--sig': wireLevel(track.chain, track.chain.length - 1) }"
+            :class="{ over: isOver({ kind: 'gap', trackId: chainTargetId, index: displayChain.length }) }"
+            :style="{ '--sig': wireLevel(displayChain, displayChain.length - 1) }"
             data-gap
-            :data-track="track.id"
-            :data-index="track.chain.length"
+            :data-track="chainTargetId"
+            :data-index="displayChain.length"
           ></span>
           <div
-            v-if="ghost && isOver({ kind: 'gap', trackId: track.id, index: track.chain.length })"
+            v-if="ghost && isOver({ kind: 'gap', trackId: chainTargetId, index: displayChain.length })"
             class="node preview"
           >
             <div class="node-head">
@@ -403,6 +419,10 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
           </div>
         </div>
       </TransitionGroup>
+      <!-- A blank master chain still reads as a destination. -->
+      <span v-if="isMaster && displayChain.length === 0" class="master-hint">
+        {{ t("chain.masterEmpty") }}
+      </span>
       </div>
     </template>
     <div v-else class="empty-state">{{ t("empty.chain") }}</div>
@@ -461,6 +481,20 @@ function onNodeKey(e: KeyboardEvent, trackId: string, node: ChainNodeView, index
   letter-spacing: 0.04em;
   border-bottom: 3px solid transparent; /* colored per track inline */
   border-radius: 0 0 3px 3px; /* rounds the underline's ends */
+}
+
+/* The master bus header: no track hue, a plain accent underline instead. */
+.chain-track-name.master {
+  border-color: var(--accent);
+}
+
+/* Invitation shown while the master chain is empty (still a drop target). */
+.master-hint {
+  align-self: center;
+  padding: 0 0.6rem;
+  font-size: 0.72rem;
+  color: var(--text-3);
+  white-space: nowrap;
 }
 
 .nav {

@@ -8,7 +8,7 @@
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import { useI18n } from "vue-i18n";
 
-import { useProjectStore, type TrackView } from "../../stores/project";
+import { MASTER_ID, useProjectStore, type TrackView } from "../../stores/project";
 import { useTelemetryStore } from "../../stores/telemetry";
 import { useUiStore } from "../../stores/ui";
 import { projectHues } from "../../styles/theme";
@@ -115,7 +115,12 @@ onUnmounted(() => cancelAnimationFrame(raf));
       <span class="value num">{{ formatPan(track.mixer.pan) }}</span>
     </div>
 
-    <div class="strip master">
+    <!-- Clicking the master strip opens the master bus chain in the panel. -->
+    <div
+      class="strip master"
+      :class="{ active: ui.activeTrackId === MASTER_ID }"
+      @pointerdown="ui.activeTrackId = MASTER_ID"
+    >
       <span class="strip-name">{{ t("meter.master") }}</span>
       <div class="fader-row">
         <input

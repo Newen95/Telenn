@@ -97,9 +97,12 @@ pub struct RtState {
     declick: [Declick; 2],
     /// Generated click on the beat grid — monitoring only, never exported.
     metronome: Metronome,
-    /// Interleaved stereo mix scratch (graph + fading graph) before the device
-    /// fan-out. Pre-allocated.
+    /// Interleaved stereo mix scratch (post master chain and gain) before the
+    /// device fan-out. Pre-allocated.
     mix: Vec<f32>,
+    /// Planar stereo bus (`[L, R]`): track sum + fading tails, processed by
+    /// the master chain before `apply_master` interleaves it. Pre-allocated.
+    bus: Vec<f32>,
     /// The playing sequence. A `Box` so a hot reload swaps pointers (no
     /// allocation on the audio thread); the displaced box is returned through
     /// `garbage` to be dropped off the real-time thread.
@@ -136,6 +139,7 @@ impl RtState {
             declick: [Declick::new(sample_rate), Declick::new(sample_rate)],
             metronome: Metronome::new(sample_rate),
             mix: vec![0.0; MAX_BLOCK * 2],
+            bus: vec![0.0; MAX_BLOCK * 2],
             schedule: Box::new(schedule),
             cursor: SequencerCursor::new(),
             playing: false,
@@ -314,24 +318,26 @@ impl RtState {
                 });
             }
 
+            let samples_per_beat = self.schedule.samples_per_beat as f32;
             self.graph
-                .process_block(self.sample_rate, n, self.schedule.samples_per_beat as f32);
-            // The mixer stage: mono track tails → interleaved stereo, with
-            // per-track gain/pan and the master gain applied inside.
-            self.mixer.mix(&self.graph, n, &mut self.mix);
+                .process_block(self.sample_rate, n, samples_per_beat);
+            // Track sum into the planar bus (per-track gain/pan, NO master
+            // gain yet — the master chain sees the raw sum).
+            self.mixer
+                .mix_tracks(&self.graph, n, &mut self.bus[..n * 2]);
 
             // Add the fading graph's tails (removed effects), panned with the
-            // current strip gains and faded out. Collect it once silent or once
-            // its fade window elapses.
+            // current strip gains and faded out, onto the same pre-master bus.
+            // Collect it once silent or once its fade window elapses.
             let mut collect = false;
             if let Some(fading) = self.fading.as_mut() {
                 // Same tempo as the live graph: a removed synced delay's tail
                 // must not glide back to its ms fallback while fading out.
-                fading.process_block(self.sample_rate, n, self.schedule.samples_per_beat as f32);
+                fading.process_block(self.sample_rate, n, samples_per_beat);
                 fading.clear_notes();
-                let energy = self
-                    .mixer
-                    .add_faded(fading, n, &mut self.fade, &mut self.mix);
+                let energy =
+                    self.mixer
+                        .add_faded(fading, n, &mut self.fade, &mut self.bus[..n * 2]);
                 if self.fade.value() <= 1.0e-4 || energy < FADE_EPS {
                     collect = true;
                 }
@@ -341,6 +347,17 @@ impl RtState {
                     discard(&mut self.garbage, Garbage::Graph(done));
                 }
             }
+
+            // Master chain over the bus (live graph's instances; a fading
+            // graph never runs its own), then the master gain — the final
+            // trim — while interleaving into the mix scratch.
+            self.graph.process_master(
+                &mut self.bus[..n * 2],
+                self.sample_rate,
+                n,
+                samples_per_beat,
+            );
+            self.mixer.apply_master(&self.bus, n, &mut self.mix);
 
             // Metronome, monitoring only: added to the real-time mix while the
             // transport plays. The offline render never runs this path, so an
@@ -426,7 +443,7 @@ pub fn render_offline_via_rtstate(
         crate::modules::registry::create,
         sample_rate as f32,
         MAX_BLOCK,
-        1,
+        crate::engine::CHANNELS,
     )
     .expect("compile");
     let schedule = project.to_schedule(sample_rate, &index).expect("schedule");
@@ -859,6 +876,7 @@ mod tests {
             tails: vec![0],
             track_mix: vec![],
             master_gain_db: 0.0,
+            master: vec![],
         };
         let graph = compile(&silence, test_support::create, 48_000.0, MAX_BLOCK, 1).unwrap();
         let schedule = Schedule {
@@ -968,10 +986,68 @@ mod tests {
             crate::modules::registry::create,
             48_000.0,
             MAX_BLOCK,
-            1,
+            crate::engine::CHANNELS,
         )
         .unwrap();
         Box::new(graph)
+    }
+
+    /// The demo plus a master compressor: the graph a master-chain insert
+    /// swaps in. Track topology identical, so every node adopts by id.
+    fn demo_with_master_comp() -> Box<CompiledGraph> {
+        let mut project = crate::control::demo_project().expect("demo parses");
+        project
+            .master_chain
+            .push(crate::control::project::NodeSpec {
+                id: "master_fx".into(),
+                module: "compressor".into(),
+                params: Default::default(),
+            });
+        let (desc, _index) = project.to_graph().unwrap();
+        let graph = crate::engine::graph::compile(
+            &desc,
+            crate::modules::registry::create,
+            48_000.0,
+            MAX_BLOCK,
+            crate::engine::CHANNELS,
+        )
+        .unwrap();
+        Box::new(graph)
+    }
+
+    #[test]
+    fn master_chain_swap_does_not_allocate_and_keeps_sounding() {
+        // Swapping in a graph that carries a master-chain node must stay
+        // allocation-free (process_master only memcpys into pre-allocated
+        // buffers) and the signal must keep flowing through the new stage.
+        let (mut rt, mut garbage) = demo_rt();
+        let mut out = vec![0.0f32; 256 * 2];
+        rt.handle(ControlMsg::NoteOn {
+            node: 1,
+            pitch: 48,
+            vel: 100,
+        });
+        rt.process(&mut out, 2);
+        let new_graph = demo_with_master_comp();
+
+        VIOLATIONS.store(0, Ordering::SeqCst);
+        DENY.with(|d| d.set(true));
+        rt.handle(ControlMsg::SwapGraph(new_graph));
+        rt.process(&mut out, 2);
+        rt.process(&mut out, 2);
+        DENY.with(|d| d.set(false));
+
+        assert_eq!(
+            VIOLATIONS.load(Ordering::SeqCst),
+            0,
+            "the master-chain swap allocated or freed on the audio thread"
+        );
+        assert!(
+            garbage.pop().is_ok(),
+            "old graph was not returned to garbage"
+        );
+        let peak = out.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        assert!(peak > 0.01, "signal lost through the master chain");
     }
 
     #[test]
@@ -1079,6 +1155,7 @@ mod tests {
             tails: vec![0],
             track_mix: vec![],
             master_gain_db: 0.0,
+            master: vec![],
         };
         let graph_a = compile(&tail, test_support::create, 48_000.0, MAX_BLOCK, 1).unwrap();
         let (prod, _cons) = rtrb::RingBuffer::<Garbage>::new(8);
@@ -1104,6 +1181,7 @@ mod tests {
             tails: vec![0],
             track_mix: vec![],
             master_gain_db: 0.0,
+            master: vec![],
         };
         let graph_b = compile(&silence, test_support::create, 48_000.0, MAX_BLOCK, 1).unwrap();
         rt.handle(ControlMsg::SwapGraph(Box::new(graph_b)));

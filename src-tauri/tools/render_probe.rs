@@ -321,6 +321,7 @@ fn build_probe_project(spec: &ProbeSpec) -> Result<(Project, Vec<String>), Strin
         bpm: spec.bpm,
         time_signature: [4, 4],
         master_gain_db: 0.0,
+        master_chain: vec![],
         tracks: vec![Track {
             id: "probe".into(),
             name: "probe".into(),

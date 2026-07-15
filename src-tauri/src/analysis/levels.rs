@@ -179,6 +179,27 @@ pub fn stereo_correlation(l: &[f32], r: &[f32]) -> f32 {
     (dot / denom) as f32
 }
 
+/// Stereo width as the side/mid RMS ratio: 0 = pure mono, 1 = side as loud
+/// as mid (very wide), >1 = mostly out-of-phase content.
+pub fn side_mid_ratio(l: &[f32], r: &[f32]) -> f32 {
+    let n = l.len().min(r.len());
+    if n == 0 {
+        return 0.0;
+    }
+    let mut mid = 0.0f64;
+    let mut side = 0.0f64;
+    for (a, b) in l[..n].iter().zip(&r[..n]) {
+        let m = 0.5 * (a + b) as f64;
+        let s = 0.5 * (a - b) as f64;
+        mid += m * m;
+        side += s * s;
+    }
+    if mid == 0.0 {
+        return if side > 0.0 { f32::INFINITY } else { 0.0 };
+    }
+    (side / mid).sqrt() as f32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

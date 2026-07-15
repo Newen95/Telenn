@@ -1,8 +1,9 @@
 //! Chorus effect: two modulated fractional-delay taps (decorrelated sine
 //! LFOs) mixed with the dry signal — the "movement" of the palette.
 //!
-//! Mono for the MVP: the two detuned taps still thicken and animate any
-//! source (the stereo spread will come with the post-MVP channel seam).
+//! Stereo: one line fed the input fold, tap 0 routed left and tap 1 right —
+//! the spread the two detuned taps were built for. The mono fold of the
+//! stereo wet is exactly the legacy mono wet (mono-compatible by design).
 //! All DSP is hand-written; `process` is RT-SAFE (the delay line is sized in
 //! `prepare`, reads are clamped inside it).
 
@@ -94,20 +95,32 @@ impl AudioNode for Chorus {
 
         // RT-SAFE: fractional reads are clamped inside the DelayLine; the
         // line was sized in `prepare` for base + max depth + margin.
-        let (input, output) = io.in_out(0, 0);
-        for (out, &x) in output.iter_mut().zip(input) {
-            let mut wet = 0.0;
-            for phase in &mut self.lfo_phase {
+        //
+        // Stereo: ONE line fed the input fold, the two decorrelated taps
+        // routed left/right. The mono fold of that stereo wet is exactly the
+        // legacy mono wet (0.5·(t0+t1)), so mono compatibility is preserved
+        // by construction.
+        let stereo = io.channels() > 1;
+        for i in 0..frames {
+            let l = io.input_ch(0, 0)[i];
+            let r = if stereo { io.input_ch(0, 1)[i] } else { l };
+            let x = 0.5 * (l + r);
+            let mut wet = [0.0f32; 2];
+            for (w, phase) in wet.iter_mut().zip(&mut self.lfo_phase) {
                 *phase += inc;
                 if *phase >= 1.0 {
                     *phase -= 1.0;
                 }
-                wet += self.line.read(base + (TAU * *phase).sin() * depth);
+                *w = self.line.read(base + (TAU * *phase).sin() * depth);
             }
-            wet *= 0.5;
             self.line.write(x);
             let mix = self.mix.tick();
-            *out = x * (1.0 - mix) + wet * mix;
+            if stereo {
+                io.output_ch(0, 0)[i] = l * (1.0 - mix) + wet[0] * mix;
+                io.output_ch(0, 1)[i] = r * (1.0 - mix) + wet[1] * mix;
+            } else {
+                io.output_ch(0, 0)[i] = l * (1.0 - mix) + 0.5 * (wet[0] + wet[1]) * mix;
+            }
         }
     }
 
@@ -184,7 +197,7 @@ mod tests {
             channels: 1,
             samples_per_beat: 0.0,
         };
-        let mut io = NodeIo::new(&[], input, out, input.len());
+        let mut io = NodeIo::new(&[], input, out, input.len(), 1);
         c.process(&ctx, &mut io);
     }
 
@@ -205,6 +218,48 @@ mod tests {
         for (o, x) in out.iter().zip(&input) {
             assert!((o - x).abs() < 1.0e-6, "mix 0 is not dry: {o} vs {x}");
         }
+    }
+
+    #[test]
+    fn stereo_wet_decorrelates_and_folds_to_mono() {
+        // Same dual-mono content through a mono and a stereo run: the stereo
+        // wet must differ between channels (tap 0 → L, tap 1 → R) while its
+        // fold reproduces the legacy mono wet to f32 rounding.
+        let input = sine(220.0, 4800);
+        let frames = input.len();
+
+        let mut mono_fx = fx();
+        set_real(&mut mono_fx, P_MIX, 1.0);
+        let mut mono_out = Vec::new();
+        render(&mut mono_fx, &input, &mut mono_out);
+
+        let mut st = fx();
+        set_real(&mut st, P_MIX, 1.0);
+        let mut stereo_in = input.clone();
+        stereo_in.extend_from_slice(&input);
+        let mut stereo_out = vec![0.0f32; frames * 2];
+        let ctx = ProcessCtx {
+            sample_rate: SR,
+            frames,
+            channels: 2,
+            samples_per_beat: 0.0,
+        };
+        let mut io = NodeIo::new(&[], &stereo_in, &mut stereo_out, frames, 2);
+        st.process(&ctx, &mut io);
+
+        let (l, r) = stereo_out.split_at(frames);
+        assert!(
+            l.iter().zip(r).any(|(a, b)| (a - b).abs() > 1.0e-4),
+            "stereo wet did not decorrelate"
+        );
+        let mut max_err = 0.0f32;
+        for i in 0..frames {
+            max_err = max_err.max((0.5 * (l[i] + r[i]) - mono_out[i]).abs());
+        }
+        assert!(
+            max_err < 1.0e-6,
+            "stereo fold != legacy mono wet: {max_err}"
+        );
     }
 
     #[test]

@@ -59,7 +59,8 @@ pub struct Filter {
     type_idx: usize,
     cutoff: OnePole,
     resonance: OnePole,
-    biquad: Biquad,
+    /// One biquad per channel: shared coefficients, per-channel state.
+    biquads: [Biquad; crate::engine::CHANNELS],
 }
 
 impl Default for Filter {
@@ -70,7 +71,7 @@ impl Default for Filter {
             type_idx: TYPE_LOWPASS,
             cutoff: OnePole::new(1000.0, 0.99),
             resonance: OnePole::new(0.7, 0.99),
-            biquad: Biquad::default(),
+            biquads: Default::default(),
         }
     }
 }
@@ -83,17 +84,22 @@ impl AudioNode for Filter {
         // a type change swaps coefficient sets — see the module_specs quirk.
         let fc = self.cutoff.advance(frames);
         let q = self.resonance.advance(frames);
-        match self.type_idx {
-            TYPE_HIGHPASS => self.biquad.set_highpass(fc, q, sr),
-            TYPE_BANDPASS => self.biquad.set_bandpass(fc, q, sr),
-            TYPE_NOTCH => self.biquad.set_notch(fc, q, sr),
-            _ => self.biquad.set_lowpass(fc, q, sr),
+        for biquad in &mut self.biquads {
+            match self.type_idx {
+                TYPE_HIGHPASS => biquad.set_highpass(fc, q, sr),
+                TYPE_BANDPASS => biquad.set_bandpass(fc, q, sr),
+                TYPE_NOTCH => biquad.set_notch(fc, q, sr),
+                _ => biquad.set_lowpass(fc, q, sr),
+            }
         }
 
-        // RT-SAFE
-        let (input, output) = io.in_out(0, 0);
-        for (out, &x) in output.iter_mut().zip(input) {
-            *out = self.biquad.process(x);
+        // RT-SAFE: no per-sample smoother in the loop, so channels can be
+        // processed one after the other on their own biquad state.
+        for ch in 0..io.channels().min(self.biquads.len()) {
+            let (input, output) = io.in_out_ch(0, 0, ch);
+            for (out, &x) in output.iter_mut().zip(input) {
+                *out = self.biquads[ch].process(x);
+            }
         }
     }
 
@@ -130,7 +136,7 @@ impl AudioNode for Filter {
         self.type_idx = default_real(P_TYPE).round() as usize;
         self.cutoff = OnePole::new(default_real(P_CUTOFF), coef);
         self.resonance = OnePole::new(default_real(P_RESONANCE), coef);
-        self.biquad = Biquad::default();
+        self.biquads = Default::default();
     }
 }
 
@@ -165,7 +171,7 @@ mod tests {
             channels: 1,
             samples_per_beat: 0.0,
         };
-        let mut io = NodeIo::new(&[], input, out, input.len());
+        let mut io = NodeIo::new(&[], input, out, input.len(), 1);
         f.process(&ctx, &mut io);
     }
 

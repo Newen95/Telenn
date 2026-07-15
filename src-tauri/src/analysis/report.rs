@@ -240,6 +240,192 @@ pub fn defects(mix: &MixReport, tone: Option<&ToneReport>) -> Vec<Defect> {
     out
 }
 
+/// One file's side of a reference comparison: the global, whole-file metrics
+/// that make two mixes comparable regardless of length or content.
+#[derive(Debug, Serialize)]
+pub struct FileMetrics {
+    pub peak_dbfs: f32,
+    pub crest_db: f32,
+    pub integrated_lufs: Option<f32>,
+    pub short_term_max_lufs: Option<f32>,
+    /// Seven-band spectral balance (dB rel total), `None` for silence.
+    pub bands: Option<Vec<super::bands::BandEnergy>>,
+    pub correlation: f32,
+    /// Side/mid RMS ratio (0 = mono).
+    pub width: f32,
+    pub tempo_bpm: Option<f32>,
+    pub onset_density: f32,
+}
+
+/// Measure the comparison metrics of one file.
+pub fn file_metrics(signal: &Signal) -> FileMetrics {
+    let stats_l = channel_stats(&signal.left);
+    let stats_r = channel_stats(&signal.right);
+    let mono = signal.mono();
+    let loud = super::loudness::measure(&signal.left, &signal.right, signal.sample_rate);
+    let rhythm = super::rhythm::analyze(&mono, signal.sample_rate);
+    let peak = stats_l.peak.max(stats_r.peak);
+    let rms = ((stats_l.rms * stats_l.rms + stats_r.rms * stats_r.rms) / 2.0).sqrt();
+    FileMetrics {
+        peak_dbfs: dbfs(peak),
+        crest_db: if rms > 0.0 {
+            20.0 * (peak / rms).log10()
+        } else {
+            0.0
+        },
+        integrated_lufs: loud.integrated_lufs,
+        short_term_max_lufs: loud.short_term_max_lufs,
+        bands: super::bands::band_balance(&mono, signal.sample_rate),
+        correlation: stereo_correlation(&signal.left, &signal.right),
+        width: super::levels::side_mid_ratio(&signal.left, &signal.right),
+        tempo_bpm: rhythm.tempo_bpm,
+        onset_density: rhythm.onset_density,
+    }
+}
+
+/// Deviation thresholds beyond which a metric is flagged in the verdict.
+const LU_TOL: f32 = 1.0;
+const BAND_TOL_DB: f32 = 3.0;
+const CORR_TOL: f32 = 0.3;
+const TEMPO_TOL_BPM: f32 = 3.0;
+const DENSITY_TOL_REL: f32 = 0.30;
+
+/// A render measured against a reference file: both sides' metrics plus the
+/// flagged deviations (each one line, ready to print).
+#[derive(Debug, Serialize)]
+pub struct MatchReport {
+    pub render: FileMetrics,
+    pub reference: FileMetrics,
+    pub flags: Vec<String>,
+}
+
+pub fn match_report(render: &Signal, reference: &Signal) -> MatchReport {
+    let a = file_metrics(render);
+    let b = file_metrics(reference);
+    let mut flags = Vec::new();
+
+    if let (Some(x), Some(y)) = (a.integrated_lufs, b.integrated_lufs) {
+        if (x - y).abs() > LU_TOL {
+            flags.push(format!(
+                "loudness: {:+.1} LU vs reference (render {x:.1}, ref {y:.1})",
+                x - y
+            ));
+        }
+    }
+    if let (Some(ab), Some(bb)) = (&a.bands, &b.bands) {
+        for (ba, bb) in ab.iter().zip(bb) {
+            let d = ba.db_rel - bb.db_rel;
+            if d.abs() > BAND_TOL_DB {
+                flags.push(format!(
+                    "{}: {d:+.1} dB vs reference (render {:.1}, ref {:.1})",
+                    ba.name, ba.db_rel, bb.db_rel
+                ));
+            }
+        }
+    }
+    if (a.correlation - b.correlation).abs() > CORR_TOL {
+        flags.push(format!(
+            "stereo: correlation {:.2} vs reference {:.2}",
+            a.correlation, b.correlation
+        ));
+    }
+    if let (Some(x), Some(y)) = (a.tempo_bpm, b.tempo_bpm) {
+        if (x - y).abs() > TEMPO_TOL_BPM {
+            flags.push(format!("tempo: render {x:.1} BPM vs reference {y:.1} BPM"));
+        }
+    }
+    if b.onset_density > 0.0 {
+        let rel = (a.onset_density - b.onset_density) / b.onset_density;
+        if rel.abs() > DENSITY_TOL_REL {
+            flags.push(format!(
+                "rhythm: {:.1} onsets/s vs reference {:.1} ({:+.0} %)",
+                a.onset_density,
+                b.onset_density,
+                rel * 100.0
+            ));
+        }
+    }
+
+    MatchReport {
+        render: a,
+        reference: b,
+        flags,
+    }
+}
+
+impl fmt::Display for MatchReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let opt = |v: Option<f32>| match v {
+            Some(v) => format!("{v:7.1}"),
+            None => "      —".into(),
+        };
+        let (a, b) = (&self.render, &self.reference);
+        writeln!(f, "== loudness ==")?;
+        writeln!(
+            f,
+            "integrated  render {} LUFS   ref {} LUFS",
+            opt(a.integrated_lufs),
+            opt(b.integrated_lufs)
+        )?;
+        writeln!(
+            f,
+            "short-term  render {} LUFS   ref {} LUFS",
+            opt(a.short_term_max_lufs),
+            opt(b.short_term_max_lufs)
+        )?;
+        writeln!(f, "== dynamics ==")?;
+        writeln!(
+            f,
+            "peak        render {:7.2} dBFS   ref {:7.2} dBFS",
+            a.peak_dbfs, b.peak_dbfs
+        )?;
+        writeln!(
+            f,
+            "crest       render {:5.1} dB      ref {:5.1} dB",
+            a.crest_db, b.crest_db
+        )?;
+        writeln!(f, "== spectral balance (dB rel total) ==")?;
+        if let (Some(ab), Some(bb)) = (&a.bands, &b.bands) {
+            for (ba, bbx) in ab.iter().zip(bb) {
+                writeln!(
+                    f,
+                    "{:<11} render {:6.1}   ref {:6.1}   Δ {:+5.1}",
+                    ba.name,
+                    ba.db_rel,
+                    bbx.db_rel,
+                    ba.db_rel - bbx.db_rel
+                )?;
+            }
+        } else {
+            writeln!(f, "(one side is silent or too short)")?;
+        }
+        writeln!(f, "== stereo ==")?;
+        writeln!(
+            f,
+            "correlation render {:5.2}   ref {:5.2}",
+            a.correlation, b.correlation
+        )?;
+        writeln!(
+            f,
+            "width       render {:5.2}   ref {:5.2}",
+            a.width, b.width
+        )?;
+        writeln!(f, "== rhythm ==")?;
+        writeln!(
+            f,
+            "tempo       render {} BPM   ref {} BPM",
+            opt(a.tempo_bpm),
+            opt(b.tempo_bpm)
+        )?;
+        writeln!(
+            f,
+            "onsets/s    render {:5.1}   ref {:5.1}",
+            a.onset_density, b.onset_density
+        )?;
+        Ok(())
+    }
+}
+
 /// Linear amplitude → dBFS (floored at −120 dB for silence).
 pub fn dbfs(v: f32) -> f32 {
     if v > 0.0 {

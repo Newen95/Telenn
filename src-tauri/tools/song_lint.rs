@@ -159,6 +159,19 @@ fn lint(project: &Project, findings: &mut Vec<Finding>) {
                 ));
             }
         }
+    }
+    // Master-chain nodes share the global node-id namespace.
+    for node in &project.master_chain {
+        if !node.id.is_empty() && !node_ids.insert(&node.id) {
+            findings.push(error(
+                "dup-node-id",
+                format!("master node '{}'", node.id),
+                "duplicate chain node id".into(),
+            ));
+        }
+    }
+    for track in &project.tracks {
+        let t_loc = format!("track '{}'", track.id);
         for clip in &track.clips {
             if clip.id.is_empty() {
                 findings.push(warn(
@@ -185,6 +198,52 @@ fn lint(project: &Project, findings: &mut Vec<Finding>) {
                         "dup-note-id",
                         format!("{t_loc} clip '{}' note '{}'", clip.id, note.id),
                         "duplicate id (clips and notes share one namespace)".into(),
+                    ));
+                }
+            }
+        }
+    }
+
+    // Master chain: effects only (no instrument head, no chain-order rule),
+    // same param validation as track nodes.
+    for node in &project.master_chain {
+        let n_loc = format!("master node '{}'", node.id);
+        let Some(desc) = registry::list().iter().find(|d| d.id == node.module) else {
+            continue; // unknown module already surfaced by to_graph
+        };
+        if desc.category == ModuleCategory::Instrument {
+            findings.push(error(
+                "master-chain",
+                n_loc.clone(),
+                format!(
+                    "instrument '{}' on the master bus (effects only)",
+                    node.module
+                ),
+            ));
+        }
+        if let Some(instance) = registry::create(&node.module) {
+            let valid: Vec<&str> = instance.params().iter().map(|p| p.name).collect();
+            for (name, &value) in &node.params {
+                if !valid.contains(&name.as_str()) {
+                    findings.push(error(
+                        "unknown-param",
+                        n_loc.clone(),
+                        format!(
+                            "param '{name}' unknown for '{}' (silently dropped by the \
+                             loader); valid: {}",
+                            node.module,
+                            valid.join(", ")
+                        ),
+                    ));
+                }
+                if !(0.0..=1.0).contains(&value) {
+                    findings.push(error(
+                        "param-range",
+                        n_loc.clone(),
+                        format!(
+                            "param '{name}' = {value}: song.json stores NORMALIZED 0..1 \
+                             values (real ranges are in `module_specs`)"
+                        ),
                     ));
                 }
             }
@@ -383,6 +442,14 @@ fn print_summary(project: &Project) {
             track.id,
             modules.join(" -> ")
         );
+    }
+    if !project.master_chain.is_empty() {
+        let modules: Vec<&str> = project
+            .master_chain
+            .iter()
+            .map(|n| n.module.as_str())
+            .collect();
+        println!("master      [{}]", modules.join(" -> "));
     }
     let bars = content_end.div_ceil(tpbar);
     let seconds = (bars * tpbar) as f64 / tpbeat as f64 * 60.0 / project.bpm as f64;

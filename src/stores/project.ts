@@ -100,14 +100,19 @@ export interface ProjectView {
   ppq: number;
   timeSignature: [number, number];
   masterGainDb: number;
+  masterChain: ChainNodeView[];
   tracks: TrackView[];
 }
+
+/** Reserved chain target addressing the master bus (backend `graph_edit`). */
+export const MASTER_ID = "_master";
 
 export const useProjectStore = defineStore("project", () => {
   const bpm = ref(120);
   const ppq = ref(960);
   const timeSignature = ref<[number, number]>([4, 4]);
   const masterGainDb = ref(0);
+  const masterChain = ref<ChainNodeView[]>([]);
   const tracks = ref<TrackView[]>([]);
 
   async function load(): Promise<void> {
@@ -116,6 +121,7 @@ export const useProjectStore = defineStore("project", () => {
     ppq.value = view.ppq;
     timeSignature.value = view.timeSignature;
     masterGainDb.value = view.masterGainDb ?? 0;
+    masterChain.value = view.masterChain ?? [];
     tracks.value = view.tracks;
   }
 
@@ -336,26 +342,38 @@ export const useProjectStore = defineStore("project", () => {
     await load();
   }
 
-  /** Optimistically place `node` in `trackId`'s chain at the backend's index
-   *  rule (effects region only, clamped), so a drop lands in its final layout
-   *  on the very frame of the release — no post-reload catch-up movement. */
-  function spliceIntoChain(trackId: string, index: number, node: ChainNodeView): void {
-    const track = tracks.value.find((t) => t.id === trackId);
-    if (!track) return;
-    const pos = Math.min(Math.max(index, 1), track.chain.length);
-    track.chain.splice(pos, 0, node);
+  /** The chain a target id addresses: a track's, or the master bus's. */
+  function chainOf(targetId: string): ChainNodeView[] | undefined {
+    if (targetId === MASTER_ID) return masterChain.value;
+    return tracks.value.find((t) => t.id === targetId)?.chain;
+  }
+
+  /** Optimistically place `node` in a chain at the backend's index rule
+   *  (effects region only, clamped — the master chain has no instrument
+   *  head), so a drop lands in its final layout on the very frame of the
+   *  release — no post-reload catch-up movement. */
+  function spliceIntoChain(targetId: string, index: number, node: ChainNodeView): void {
+    const chain = chainOf(targetId);
+    if (!chain) return;
+    const floor = targetId === MASTER_ID ? 0 : 1;
+    const pos = Math.min(Math.max(index, floor), chain.length);
+    chain.splice(pos, 0, node);
   }
 
   /** Move an effect to a chain at `index`, keeping its id (its tail follows). */
   async function moveNode(id: string, toTrack: string, index: number): Promise<void> {
     // Mirror of the backend's move: remove first, shift the target left when
     // the removal happened before it in the same chain.
-    const src = tracks.value.find((t) => t.chain.some((n) => n.id === id));
-    if (src) {
-      const from = src.chain.findIndex((n) => n.id === id);
-      if (from > 0) {
-        const [node] = src.chain.splice(from, 1);
-        spliceIntoChain(toTrack, src.id === toTrack && from < index ? index - 1 : index, node);
+    const srcId =
+      tracks.value.find((t) => t.chain.some((n) => n.id === id))?.id ??
+      (masterChain.value.some((n) => n.id === id) ? MASTER_ID : undefined);
+    const srcChain = srcId !== undefined ? chainOf(srcId) : undefined;
+    if (srcId !== undefined && srcChain) {
+      const from = srcChain.findIndex((n) => n.id === id);
+      // Never lift a track's instrument head (the backend refuses it too).
+      if (from >= (srcId === MASTER_ID ? 0 : 1)) {
+        const [node] = srcChain.splice(from, 1);
+        spliceIntoChain(toTrack, srcId === toTrack && from < index ? index - 1 : index, node);
       }
     }
     await invoke("node_move_to", { id, toTrack, index });
@@ -365,7 +383,9 @@ export const useProjectStore = defineStore("project", () => {
   /** Copy an effect into a chain at `index` under a fresh id. */
   async function copyNode(id: string, toTrack: string, index: number): Promise<void> {
     const newId = freshNodeId();
-    const original = tracks.value.flatMap((t) => t.chain).find((n) => n.id === id);
+    const original = [...tracks.value.flatMap((t) => t.chain), ...masterChain.value].find(
+      (n) => n.id === id,
+    );
     if (original) {
       spliceIntoChain(toTrack, index, { ...original, id: newId, flatIndex: -1 });
     }
@@ -394,8 +414,8 @@ export const useProjectStore = defineStore("project", () => {
 
   /** Optimistically write a node's param in the local mirror (keeps knobs live). */
   function patchNodeParam(nodeId: string, param: string, value: number): void {
-    for (const track of tracks.value) {
-      const node = track.chain.find((n) => n.id === nodeId);
+    for (const chain of [...tracks.value.map((t) => t.chain), masterChain.value]) {
+      const node = chain.find((n) => n.id === nodeId);
       if (node) {
         node.params = { ...node.params, [param]: value };
         return;
@@ -501,6 +521,7 @@ export const useProjectStore = defineStore("project", () => {
     ppq,
     timeSignature,
     masterGainDb,
+    masterChain,
     tracks,
     presetsVersion,
     lastError,

@@ -18,3 +18,7 @@ pub use stream::{AudioEngine, EngineError};
 /// Largest block the engine pre-allocates for. Device callbacks are expected to
 /// stay well under this; larger blocks are processed in chunks.
 pub const MAX_BLOCK: usize = 4096;
+
+/// Channels per audio port in the production graph. Every module processes
+/// `ctx.channels` channels; unit tests and probes may still compile mono.
+pub const CHANNELS: usize = 2;

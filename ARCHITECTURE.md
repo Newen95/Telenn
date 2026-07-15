@@ -140,6 +140,30 @@ destination changent.
 - Un **file watcher** surveille le projet ; toute modification externe (ex. par
   Claude Code) est rechargée à chaud avec diff visuel dans l'UI.
 - Les presets d'instruments sont des JSON séparés référencés par chemin.
+- `master_chain` (optionnel, omis quand vide) : chaîne d'effets du bus master,
+  mêmes `NodeSpec` que les chaînes de piste mais **sans instrument de tête**
+  (effets seulement, validé par le compilateur de graphe et `song_lint`).
+  Adressée dans les commandes d'édition par l'id réservé `_master`.
+
+## Étage mixer & bus master (stéréo)
+
+Le graphe traite `CHANNELS = 2` canaux par port (layout channel-major par
+port, offsets calés sur les `frames` du bloc courant). Les instruments
+écrivent le canal 0 puis le dupliquent (`spread_output`) ; les effets tiennent
+un état de signal par canal ; chorus et reverb décorrèlent gauche/droite avec
+un repli mono égal au wet mono d'origine (compatibilité mono par
+construction). Le compresseur détecte sur `max(|L|,|R|)` (liaison stéréo).
+
+Chemin du signal, identique en temps réel et à l'export :
+
+```
+pistes → mix_tracks (gains/pans par piste, bus planaire [L,R], SANS gain master)
+      → [RT] add_faded (queues de l'ancien graphe pendant un hot-swap)
+      → process_master (la master_chain traite le bus, nœuds ordinaires du
+        graphe exclus de la marche topologique — adoptés par id au swap)
+      → apply_master (gain master = trim final, entrelacement)
+      → [RT] métronome (jamais pompé par un limiteur master) → declick
+```
 
 ## Spécifications précises
 

@@ -1,10 +1,10 @@
-//! Reverb effect: mono Dattorro plate (Jon Dattorro, "Effect Design Part 1:
+//! Reverb effect: stereo Dattorro plate (Jon Dattorro, "Effect Design Part 1:
 //! Reverberator and Other Filters", JAES 1997) — predelay, input diffusion,
 //! and a modulated figure-of-eight tank. Denser and smoother than the old
 //! Freeverb topology, with the tank allpasses gently modulated so the tail
-//! never locks into metallic resonances. Mono by design for the MVP (the
-//! mixer pans it with its track); the tap tables already exist in left/right
-//! pairs for the day the channel seam opens.
+//! never locks into metallic resonances. The tank is fed the input fold and
+//! the paired L/R tap tables decorrelate the wet field; the mono fold of the
+//! stereo wet is exactly the legacy mono wet (mono-compatible by design).
 //!
 //! `size` sets the tank decay (tail length), `damp` low-passes inside the
 //! tank (darker tail), `predelay` separates the dry attack from the wet
@@ -285,8 +285,15 @@ impl AudioNode for Reverb {
         self.a.ap2.g = g2;
         self.b.ap2.g = g2;
 
-        let (input, output) = io.in_out(0, 0);
-        for (out, &x) in output.iter_mut().zip(input) {
+        // Stereo: the tank is fed the input fold and the L/R tap tables
+        // finally part ways (they were built as pairs for this day). The mono
+        // fold of the stereo wet is exactly the legacy wet 0.5·(yl+yr), so
+        // mono compatibility is preserved by construction.
+        let stereo = io.channels() > 1;
+        for i in 0..frames {
+            let l = io.input_ch(0, 0)[i];
+            let r = if stereo { io.input_ch(0, 1)[i] } else { l };
+            let x = 0.5 * (l + r);
             let mix = self.mix.tick();
 
             let pd = self.predelay_len.advance(1).max(1.0);
@@ -306,9 +313,14 @@ impl AudioNode for Reverb {
 
             let yl = Self::read_taps(&self.a, &self.b, &self.taps_l);
             let yr = Self::read_taps(&self.b, &self.a, &self.taps_r);
-            let wet = 0.5 * (yl + yr) * WET_GAIN;
 
-            *out = x * (1.0 - mix) + wet * mix;
+            if stereo {
+                io.output_ch(0, 0)[i] = l * (1.0 - mix) + yl * WET_GAIN * mix;
+                io.output_ch(0, 1)[i] = r * (1.0 - mix) + yr * WET_GAIN * mix;
+            } else {
+                let wet = 0.5 * (yl + yr) * WET_GAIN;
+                io.output_ch(0, 0)[i] = l * (1.0 - mix) + wet * mix;
+            }
         }
     }
 
@@ -403,7 +415,7 @@ mod tests {
             channels: 1,
             samples_per_beat: 0.0,
         };
-        let mut io = NodeIo::new(&[], input, out, frames);
+        let mut io = NodeIo::new(&[], input, out, frames, 1);
         r.process(&ctx, &mut io);
     }
 
@@ -422,6 +434,54 @@ mod tests {
         let mut out = Vec::new();
         render(r, &input, &mut out);
         out
+    }
+
+    #[test]
+    fn stereo_wet_decorrelates_and_folds_to_mono() {
+        // Same dual-mono impulse through a mono and a stereo run: yl/yr must
+        // differ (the L/R tap tables finally part ways) while their fold
+        // reproduces the legacy mono wet to f32 rounding.
+        let secs = 2.0;
+        let n = (secs * SR) as usize;
+        let mut input = vec![0.0; n];
+        input[0] = 1.0;
+
+        let mut mono_fx = fx();
+        mono_fx.set_param(P_MIX, 1.0);
+        let mut mono_out = Vec::new();
+        render(&mut mono_fx, &input, &mut mono_out);
+
+        let mut st = fx();
+        st.set_param(P_MIX, 1.0);
+        let mut stereo_in = input.clone();
+        stereo_in.extend_from_slice(&input);
+        let mut stereo_out = vec![0.0f32; n * 2];
+        let ctx = ProcessCtx {
+            sample_rate: SR,
+            frames: n,
+            channels: 2,
+            samples_per_beat: 0.0,
+        };
+        let mut io = NodeIo::new(&[], &stereo_in, &mut stereo_out, n, 2);
+        st.process(&ctx, &mut io);
+
+        let (l, r) = stereo_out.split_at(n);
+        assert!(
+            l.iter().zip(r).any(|(a, b)| (a - b).abs() > 1.0e-4),
+            "stereo wet did not decorrelate"
+        );
+        let mut max_err = 0.0f32;
+        for i in 0..n {
+            max_err = max_err.max((0.5 * (l[i] + r[i]) - mono_out[i]).abs());
+        }
+        assert!(
+            max_err < 1.0e-6,
+            "stereo fold != legacy mono wet: {max_err}"
+        );
+
+        use crate::analysis::levels::stereo_correlation;
+        let corr = stereo_correlation(l, r);
+        assert!(corr < 0.999, "wet correlation still {corr}");
     }
 
     #[test]

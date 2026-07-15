@@ -16,7 +16,7 @@ import NamePrompt from "./ui/NamePrompt.vue";
 import ToastHost from "./ui/ToastHost.vue";
 import { GUTTER_WIDTH, useTimeAxis } from "./views/canvas/timeAxis";
 import { useChainDrag, type DropIntent, type DropTarget } from "./views/chain/dragdrop";
-import { useProjectStore } from "./stores/project";
+import { MASTER_ID, useProjectStore } from "./stores/project";
 import { useTelemetryStore } from "./stores/telemetry";
 import { useToastStore } from "./stores/toasts";
 import { useUiStore } from "./stores/ui";
@@ -35,6 +35,7 @@ ui.init(); // restore the saved zone layout before first paint
 const timeAxis = useTimeAxis();
 
 const activeTrackName = computed(() => {
+  if (ui.activeTrackId === MASTER_ID) return t("meter.master");
   const track = project.tracks.find((tr) => tr.id === ui.activeTrackId);
   return track ? track.name || track.id : "";
 });
@@ -43,11 +44,13 @@ const activeTrackName = computed(() => {
  *  reads as "this track", the same color language as timeline/chain/mixer. */
 const activeTrackHue = computed(() => projectHues(project.tracks).get(ui.activeTrackId));
 
-// The active track always points at a real track: default to the first, and
-// fall back when the selected one disappears (removal, external reload).
+// The active track always points at a real track — or the master bus, a valid
+// chain target with no track entry. Default to the first track, and fall back
+// when the selected one disappears (removal, external reload).
 watch(
   () => project.tracks,
   (tracks) => {
+    if (ui.activeTrackId === MASTER_ID) return;
     if (!tracks.some((tr) => tr.id === ui.activeTrackId)) {
       ui.activeTrackId = tracks[0]?.id ?? "";
     }

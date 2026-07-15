@@ -34,6 +34,7 @@ export default {
     prevTrack: "Previous track",
     nextTrack: "Next track",
     replaceInstrument: "Change instrument",
+    masterEmpty: "Drop an effect here — it processes the whole mix",
   },
   timeline: { addTrack: "Add a track" },
   empty: {

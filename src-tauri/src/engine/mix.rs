@@ -1,11 +1,15 @@
-//! The mixer stage: the single place where the mono track signals become stereo.
+//! The mixer stage: where the per-track chain tails become the device signal.
 //!
-//! Upstream of this — instruments, effects, chains — everything is strictly
-//! mono; downstream, the device fan-out is already N-channel. The `Mixer` reads
-//! each track's chain-tail buffer from the compiled graph, applies per-track
-//! gain (dB) and constant-power pan (-3 dB at centre), sums into an interleaved
-//! stereo accumulator, then applies the master gain. Every level is smoothed by
-//! a per-sample `LinearRamp` (anti-zipper); everything is pre-allocated, so the
+//! Staged flow: [`Mixer::mix_tracks`] reads each track's chain-tail L/R
+//! buffers from the compiled graph (a mono-compiled graph transparently
+//! serves channel 0 to both sides), applies per-track gain (dB) and
+//! constant-power pan (-3 dB at centre — a balance law on stereo content) and
+//! sums into a PLANAR stereo bus (`[L(frames), R(frames)]`). The engine then
+//! runs the master chain on that bus (`CompiledGraph::process_master`) and
+//! [`Mixer::apply_master`] applies the master gain last (the fader is the
+//! final trim) while interleaving for the device. [`Mixer::mix`] composes the
+//! three stages for the offline render. Every level is smoothed by a
+//! per-sample `LinearRamp` (anti-zipper); everything is pre-allocated, so the
 //! whole stage is RT-SAFE after construction.
 
 use serde::{Deserialize, Serialize};
@@ -64,9 +68,11 @@ struct Strip {
 pub struct Mixer {
     strips: Vec<Strip>,
     master: LinearRamp,
-    /// Track count of the last `mix` call, so a fading graph's tails can tell
-    /// whether they still align with the live layout.
+    /// Track count of the last `mix_tracks` call, so a fading graph's tails
+    /// can tell whether they still align with the live layout.
     last_tracks: usize,
+    /// Planar bus scratch for the composed [`Self::mix`] (offline render).
+    bus: Vec<f32>,
 }
 
 impl Mixer {
@@ -87,6 +93,7 @@ impl Mixer {
             strips,
             master: LinearRamp::new(db_to_gain(master_db), RAMP_MS, sample_rate),
             last_tracks: 0,
+            bus: vec![0.0; crate::engine::MAX_BLOCK * 2],
         }
     }
 
@@ -115,63 +122,97 @@ impl Mixer {
         self.master.set_target(db_to_gain(db));
     }
 
-    /// Mix the graph's track tails into `out` (interleaved stereo, `frames * 2`
-    /// samples), overwriting it: per-track gain+pan ramps tick per sample, then
-    /// the master ramp scales the sum. // RT-SAFE
-    pub fn mix(&mut self, graph: &CompiledGraph, frames: usize, out: &mut [f32]) {
-        let out = &mut out[..frames * 2];
-        out.fill(0.0);
+    /// Sum the graph's track tails into `bus` (planar `[L(frames), R(frames)]`),
+    /// overwriting it: per-track gain+pan ramps tick per frame. No master gain
+    /// here — the master chain processes the bus first. // RT-SAFE
+    pub fn mix_tracks(&mut self, graph: &CompiledGraph, frames: usize, bus: &mut [f32]) {
+        let (l_bus, rest) = bus.split_at_mut(frames);
+        let r_bus = &mut rest[..frames];
+        l_bus.fill(0.0);
+        r_bus.fill(0.0);
         let tails = graph.track_tails();
         self.last_tracks = tails.len().min(MAX_TRACKS);
         for (strip, &node) in self.strips.iter_mut().zip(tails) {
-            let buf = &graph.node_output(node)[..frames];
-            for (frame, &x) in out.chunks_exact_mut(2).zip(buf) {
-                frame[0] += x * strip.left.tick();
-                frame[1] += x * strip.right.tick();
+            let l_in = &graph.node_output_ch(node, 0)[..frames];
+            let r_in = &graph.node_output_ch(node, 1)[..frames];
+            for i in 0..frames {
+                l_bus[i] += l_in[i] * strip.left.tick();
+                r_bus[i] += r_in[i] * strip.right.tick();
             }
-        }
-        for frame in out.chunks_exact_mut(2) {
-            let m = self.master.tick();
-            frame[0] *= m;
-            frame[1] *= m;
         }
     }
 
+    /// Apply the master gain ramp to the planar bus and interleave it into
+    /// `out` (`frames * 2` samples). The last stage: the master fader is a
+    /// final trim, after the master chain. // RT-SAFE
+    pub fn apply_master(&mut self, bus: &[f32], frames: usize, out: &mut [f32]) {
+        let out = &mut out[..frames * 2];
+        for (i, frame) in out.chunks_exact_mut(2).enumerate() {
+            let m = self.master.tick();
+            frame[0] = bus[i] * m;
+            frame[1] = bus[frames + i] * m;
+        }
+    }
+
+    /// The composed stage for the offline render: track sum → master chain →
+    /// master gain, interleaved into `out`. // RT-SAFE
+    #[allow(clippy::too_many_arguments)]
+    pub fn mix(
+        &mut self,
+        graph: &mut CompiledGraph,
+        sample_rate: f32,
+        samples_per_beat: f32,
+        frames: usize,
+        out: &mut [f32],
+    ) {
+        let mut bus = std::mem::take(&mut self.bus);
+        self.mix_tracks(graph, frames, &mut bus[..frames * 2]);
+        graph.process_master(
+            &mut bus[..frames * 2],
+            sample_rate,
+            frames,
+            samples_per_beat,
+        );
+        self.apply_master(&bus, frames, out);
+        self.bus = bus;
+    }
+
     /// Add a fading graph's tails (removed effects ringing out after a swap) on
-    /// top of an already-mixed block. The live `mix` pass owns the ramp ticking,
-    /// so this uses the *current* (frozen) strip and master values; if the
-    /// fading layout no longer matches the live track count, the tails fall back
-    /// to centre. `fade` ticks once per frame. Returns the energy added, so the
-    /// caller can collect the graph once it falls silent. // RT-SAFE
+    /// top of an already-summed planar bus, BEFORE the master chain and gain
+    /// (both belong to the live graph). The live `mix_tracks` pass owns the
+    /// ramp ticking, so this uses the *current* (frozen) strip values; if the
+    /// fading layout no longer matches the live track count, the tails fall
+    /// back to centre. `fade` ticks once per frame. Returns the energy added,
+    /// so the caller can collect the graph once it falls silent. // RT-SAFE
     pub fn add_faded(
         &self,
         graph: &CompiledGraph,
         frames: usize,
         fade: &mut LinearRamp,
-        out: &mut [f32],
+        bus: &mut [f32],
     ) -> f32 {
         let tails = graph.track_tails();
         let count = tails.len().min(MAX_TRACKS);
         let aligned = count == self.last_tracks;
-        let master = self.master.value();
         let mut energy = 0.0f32;
-        for (i, frame) in out[..frames * 2].chunks_exact_mut(2).enumerate() {
-            let g = fade.tick() * master;
+        for i in 0..frames {
+            let g = fade.tick();
             let mut l = 0.0f32;
             let mut r = 0.0f32;
             for (t, &node) in tails.iter().enumerate().take(count) {
-                let x = graph.node_output(node)[i];
+                let xl = graph.node_output_ch(node, 0)[i];
+                let xr = graph.node_output_ch(node, 1)[i];
                 let (gl, gr) = if aligned {
                     (self.strips[t].left.value(), self.strips[t].right.value())
                 } else {
                     (CENTER, CENTER)
                 };
-                l += x * gl;
-                r += x * gr;
+                l += xl * gl;
+                r += xr * gr;
             }
             let (l, r) = (l * g, r * g);
-            frame[0] += l;
-            frame[1] += r;
+            bus[i] += l;
+            bus[frames + i] += r;
             energy += l * l + r * r;
         }
         energy
@@ -196,6 +237,7 @@ mod tests {
             tails: vec![0],
             track_mix: vec![track_mix],
             master_gain_db: master_db,
+            master: vec![],
         };
         compile(&desc, test_support::create, 48_000.0, 64, 1).expect("compiles")
     }
@@ -205,7 +247,7 @@ mod tests {
         let mut mixer = Mixer::new(48_000.0, graph.track_mix(), graph.master_gain_db());
         graph.process_block(48_000.0, 64, 0.0);
         let mut out = vec![0.0f32; 64 * 2];
-        mixer.mix(&graph, 64, &mut out);
+        mixer.mix(&mut graph, 48_000.0, 0.0, 64, &mut out);
         out
     }
 
@@ -268,7 +310,7 @@ mod tests {
         let mut mixer = Mixer::new(48_000.0, graph.track_mix(), graph.master_gain_db());
         graph.process_block(48_000.0, 64, 0.0);
         let mut out = vec![0.0f32; 64 * 2];
-        mixer.mix(&graph, 64, &mut out);
+        mixer.mix(&mut graph, 48_000.0, 0.0, 64, &mut out);
 
         // Retarget hard left: the left channel must move smoothly, not jump.
         mixer.retarget(
@@ -281,7 +323,7 @@ mod tests {
         let mut whole = Vec::new();
         for _ in 0..20 {
             graph.process_block(48_000.0, 64, 0.0);
-            mixer.mix(&graph, 64, &mut out);
+            mixer.mix(&mut graph, 48_000.0, 0.0, 64, &mut out);
             whole.extend(out.iter().step_by(2).copied()); // left channel
         }
         let max_delta = whole

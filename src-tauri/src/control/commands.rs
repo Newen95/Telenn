@@ -68,7 +68,7 @@ fn swap_to(
         registry::create,
         engine.sample_rate() as f32,
         MAX_BLOCK,
-        1,
+        crate::engine::CHANNELS,
     )
     .map_err(|e| e.to_string())?;
     if !engine.send(ControlMsg::SwapGraph(Box::new(graph))) {

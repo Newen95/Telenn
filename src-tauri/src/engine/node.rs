@@ -110,22 +110,23 @@ pub struct ProcessCtx {
     pub samples_per_beat: f32,
     pub sample_rate: f32,
     pub frames: usize,
-    /// Channels per port. Fixed to 1 today (the graph is mono upstream of the
-    /// mixer stage); a future stereo module reads this. Buffer layout within a
+    /// Channels per port (the engine compiles at [`crate::engine::CHANNELS`];
+    /// offline probes and unit tests may compile mono). Buffer layout within a
     /// port is channel-major: `[p0c0.., p0c1.., p1c0..]`.
     pub channels: usize,
 }
 
 /// The buffers and note events a node reads/writes for one block. Audio buffers
-/// are flat, port-major (`port * frames`), so the node never sees a slice of
-/// slices. The accessors below are mono (= channel 0 with the channel-major
-/// layout documented on [`ProcessCtx::channels`]); per-channel indexing arrives
-/// with the first stereo module (post-MVP). // RT-SAFE
+/// are flat, channel-major within port-major (`[p0c0.., p0c1.., p1c0..]`), so
+/// the node never sees a slice of slices. Channel offsets are packed with the
+/// CURRENT block's `frames` (not `max_block`): channel `c` of port `p` starts
+/// at `(p * channels + c) * frames`. The mono accessors return channel 0. // RT-SAFE
 pub struct NodeIo<'a> {
     notes: &'a [NoteEvent],
     inputs: &'a [f32],
     output: &'a mut [f32],
     frames: usize,
+    channels: usize,
 }
 
 impl<'a> NodeIo<'a> {
@@ -134,12 +135,14 @@ impl<'a> NodeIo<'a> {
         inputs: &'a [f32],
         output: &'a mut [f32],
         frames: usize,
+        channels: usize,
     ) -> Self {
         Self {
             notes,
             inputs,
             output,
             frames,
+            channels,
         }
     }
 
@@ -151,27 +154,62 @@ impl<'a> NodeIo<'a> {
         self.frames
     }
 
-    /// Read-only audio input buffer for `port`.
+    pub fn channels(&self) -> usize {
+        self.channels
+    }
+
+    /// Read-only channel-0 input buffer for `port`.
     pub fn input(&self, port: usize) -> &[f32] {
-        let start = port * self.frames;
+        self.input_ch(port, 0)
+    }
+
+    /// Writable channel-0 output buffer for `port`.
+    pub fn output(&mut self, port: usize) -> &mut [f32] {
+        self.output_ch(port, 0)
+    }
+
+    /// Read-only input buffer for one channel of `port`.
+    pub fn input_ch(&self, port: usize, ch: usize) -> &[f32] {
+        let start = (port * self.channels + ch) * self.frames;
         &self.inputs[start..start + self.frames]
     }
 
-    /// Writable audio output buffer for `port`.
-    pub fn output(&mut self, port: usize) -> &mut [f32] {
-        let start = port * self.frames;
+    /// Writable output buffer for one channel of `port`.
+    pub fn output_ch(&mut self, port: usize, ch: usize) -> &mut [f32] {
+        let start = (port * self.channels + ch) * self.frames;
         &mut self.output[start..start + self.frames]
     }
 
-    /// Borrow an input (read) and an output (write) at once. They are distinct
-    /// buffers, so an effect can map one to the other in a single pass. // RT-SAFE
+    /// Borrow channel 0 of an input (read) and an output (write) at once. They
+    /// are distinct buffers, so an effect can map one to the other in a single
+    /// pass. // RT-SAFE
     pub fn in_out(&mut self, in_port: usize, out_port: usize) -> (&[f32], &mut [f32]) {
-        let is = in_port * self.frames;
-        let os = out_port * self.frames;
+        self.in_out_ch(in_port, out_port, 0)
+    }
+
+    /// Borrow one channel of an input and an output at once. // RT-SAFE
+    pub fn in_out_ch(
+        &mut self,
+        in_port: usize,
+        out_port: usize,
+        ch: usize,
+    ) -> (&[f32], &mut [f32]) {
+        let is = (in_port * self.channels + ch) * self.frames;
+        let os = (out_port * self.channels + ch) * self.frames;
         (
             &self.inputs[is..is + self.frames],
             &mut self.output[os..os + self.frames],
         )
+    }
+
+    /// Copy channel 0 of `port` into every other channel. Mono sources call
+    /// this once at the end of `process` to fill a stereo port. // RT-SAFE
+    pub fn spread_output(&mut self, port: usize) {
+        let base = port * self.channels * self.frames;
+        for ch in 1..self.channels {
+            let dst = base + ch * self.frames;
+            self.output.copy_within(base..base + self.frames, dst);
+        }
     }
 }
 

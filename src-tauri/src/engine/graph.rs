@@ -40,15 +40,15 @@ pub struct Connection {
 
 /// Serializable graph description (the future shape of `song.json` chains).
 ///
-/// The graph has no master/output node: each track's chain tail stays mono and
-/// the mixer stage (`engine::mix`) reads those buffers to produce the stereo
+/// The graph has no master/output node: the mixer stage (`engine::mix`) reads
+/// each track's chain-tail buffers (one per channel) to produce the interleaved
 /// device signal, applying the per-track and master settings carried here.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GraphDesc {
     pub nodes: Vec<NodeDesc>,
     pub connections: Vec<Connection>,
-    /// The last node of each track's chain, in track order — the mono signals
-    /// the mixer stage consumes.
+    /// The last node of each track's chain, in track order — the signals the
+    /// mixer stage consumes.
     #[serde(default)]
     pub tails: Vec<NodeIdx>,
     /// Per-track mixer settings, aligned with `tails`.
@@ -57,6 +57,12 @@ pub struct GraphDesc {
     /// Master gain (dB) the mixer applies after the track sum.
     #[serde(default)]
     pub master_gain_db: f32,
+    /// Master bus chain: node indices run IN THIS ORDER on the mixed bus by
+    /// [`CompiledGraph::process_master`], after the track sum and before the
+    /// master gain. These nodes carry no connections and are excluded from the
+    /// topological walk of `process_block`.
+    #[serde(default)]
+    pub master: Vec<NodeIdx>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -73,6 +79,8 @@ pub enum GraphError {
     Cycle,
     #[error("track tail node out of range")]
     TailOutOfRange,
+    #[error("master chain node is not a 1-in/1-out audio effect")]
+    MasterNotEffect,
 }
 
 /// Compiled graph, owned by the audio thread.
@@ -101,7 +109,13 @@ pub struct CompiledGraph {
     tails: Vec<NodeIdx>,
     track_mix: Vec<TrackMix>,
     master_gain_db: f32,
-    /// Channels per port (the channel-agnostic seam; fixed to 1 today).
+    /// Master chain node indices, in bus order (see `process_master`).
+    master: Vec<NodeIdx>,
+    /// Per-node flag: true = master-chain node, skipped by the topological
+    /// walk and metered by `process_master` instead.
+    master_set: Vec<bool>,
+    /// Channels per port (the engine compiles at [`crate::engine::CHANNELS`];
+    /// tests and probes may compile mono).
     channels: usize,
     last_frames: usize,
 }
@@ -171,8 +185,8 @@ impl CompiledGraph {
         &self.node_ids
     }
 
-    /// The last node of each track's chain, in track order — the mono signals
-    /// the mixer stage reads through [`Self::node_output`].
+    /// The last node of each track's chain, in track order — the signals the
+    /// mixer stage reads through [`Self::node_output_ch`].
     pub fn track_tails(&self) -> &[NodeIdx] {
         &self.tails
     }
@@ -187,11 +201,20 @@ impl CompiledGraph {
         self.master_gain_db
     }
 
-    /// A node's mono (channel 0) output buffer for the last processed block.
-    /// // RT-SAFE
+    /// A node's channel-0 output buffer for the last processed block. // RT-SAFE
     pub fn node_output(&self, node: NodeIdx) -> &[f32] {
+        self.node_output_ch(node, 0)
+    }
+
+    /// One channel of a node's port-0 output for the last processed block.
+    /// `ch` is clamped to the compiled channel count, so a mono-compiled graph
+    /// transparently serves channel 0 to every reader (the mixer can always ask
+    /// for L and R, including from a fading pre-stereo graph). // RT-SAFE
+    pub fn node_output_ch(&self, node: NodeIdx, ch: usize) -> &[f32] {
         let pos = self.node_to_pos[node];
-        &self.outputs[pos][..self.last_frames]
+        let ch = ch.min(self.channels - 1);
+        let start = ch * self.last_frames;
+        &self.outputs[pos][start..start + self.last_frames]
     }
 
     /// Per-node post-process meters (peak + RMS of port 0) for the last block,
@@ -208,10 +231,19 @@ impl CompiledGraph {
         self.last_frames = frames;
         for pos in 0..self.order.len() {
             let node = self.order[pos];
+            // Master-chain nodes are fed the mixed bus by `process_master`,
+            // never by the walk — running them here too would double-process
+            // their state (delay lines, envelope followers).
+            if self.master_set[node] {
+                continue;
+            }
 
             // Gather this node's inputs by summing the connected source buffers
-            // into the reused scratch (disjoint fields, no allocation).
-            let in_len = self.in_counts[node] * frames;
+            // into the reused scratch (disjoint fields, no allocation). A port's
+            // channels are contiguous under the channel-major layout, so one
+            // copy per connection moves the whole port block.
+            let port_len = self.channels * frames;
+            let in_len = self.in_counts[node] * port_len;
             for v in &mut self.in_scratch[..in_len] {
                 *v = 0.0;
             }
@@ -220,10 +252,10 @@ impl CompiledGraph {
                     continue;
                 }
                 let src_pos = self.node_to_pos[c.src_node];
-                let src_off = c.src_port * frames;
-                let src = &self.outputs[src_pos][src_off..src_off + frames];
-                let dst_off = c.dst_port * frames;
-                let dst = &mut self.in_scratch[dst_off..dst_off + frames];
+                let src_off = c.src_port * port_len;
+                let src = &self.outputs[src_pos][src_off..src_off + port_len];
+                let dst_off = c.dst_port * port_len;
+                let dst = &mut self.in_scratch[dst_off..dst_off + port_len];
                 for (d, s) in dst.iter_mut().zip(src) {
                     *d += *s;
                 }
@@ -231,7 +263,7 @@ impl CompiledGraph {
 
             // Process: sources are in the left split, this node's output is the
             // first element of the right split.
-            let out_len = self.out_counts[node] * frames;
+            let out_len = self.out_counts[node] * port_len;
             let (_left, right) = self.outputs.split_at_mut(pos);
             let out_buf = &mut right[0][..out_len];
             let ctx = ProcessCtx {
@@ -245,38 +277,109 @@ impl CompiledGraph {
                 &self.in_scratch[..in_len],
                 out_buf,
                 frames,
+                self.channels,
             );
             self.nodes[node].process(&ctx, &mut io);
         }
 
-        // Meter every node's port-0 output (peak + RMS) post-process. A node
-        // with no audio output keeps a zero meter. // RT-SAFE
+        // Meter every node's port-0 output (peak + RMS across all channels)
+        // post-process. A node with no audio output keeps a zero meter;
+        // master-chain nodes are metered by `process_master`. // RT-SAFE
         for node in 0..self.nodes.len() {
+            if self.master_set[node] {
+                continue;
+            }
             if self.out_counts[node] == 0 {
                 self.meters[node] = Meter::default();
                 continue;
             }
-            let buf = &self.outputs[self.node_to_pos[node]][..frames];
+            let len = self.channels * frames;
+            let buf = &self.outputs[self.node_to_pos[node]][..len];
             let mut peak = 0.0f32;
             let mut sum_sq = 0.0f32;
             for &s in buf {
                 peak = peak.max(s.abs());
                 sum_sq += s * s;
             }
-            let rms = if frames > 0 {
-                (sum_sq / frames as f32).sqrt()
+            let rms = if len > 0 {
+                (sum_sq / len as f32).sqrt()
             } else {
                 0.0
             };
             self.meters[node] = Meter { peak, rms };
         }
     }
+
+    /// Run the master chain over the mixed bus, in place. `bus` is planar
+    /// channel-major (`[L(frames), R(frames)]`) — the same layout as a node
+    /// port, so each node processes it like any chain block. Node k reads the
+    /// previous node's output (the bus for k = 0) staged through `in_scratch`;
+    /// the final output is copied back into `bus`. Master nodes are metered
+    /// here (the `process_block` loops skip them). Requires a stereo compile:
+    /// on a mono-compiled graph (isolated module probes) the chain is skipped.
+    /// // RT-SAFE
+    pub fn process_master(
+        &mut self,
+        bus: &mut [f32],
+        sample_rate: f32,
+        frames: usize,
+        samples_per_beat: f32,
+    ) {
+        if self.master.is_empty() || self.channels < 2 {
+            return;
+        }
+        let port_len = self.channels * frames;
+        for k in 0..self.master.len() {
+            let node = self.master[k];
+            // Stage the input: the bus for the first node, the previous
+            // node's output after. Copying breaks any aliasing with the
+            // node's own output buffer.
+            if k == 0 {
+                self.in_scratch[..port_len].copy_from_slice(&bus[..port_len]);
+            } else {
+                let prev_pos = self.node_to_pos[self.master[k - 1]];
+                let src = &self.outputs[prev_pos][..port_len];
+                self.in_scratch[..port_len].copy_from_slice(src);
+            }
+            let pos = self.node_to_pos[node];
+            let out_buf = &mut self.outputs[pos][..port_len];
+            let ctx = ProcessCtx {
+                samples_per_beat,
+                sample_rate,
+                frames,
+                channels: self.channels,
+            };
+            let mut io = crate::engine::node::NodeIo::new(
+                &self.node_notes[node],
+                &self.in_scratch[..port_len],
+                out_buf,
+                frames,
+                self.channels,
+            );
+            self.nodes[node].process(&ctx, &mut io);
+
+            // Meter the node here (skipped by process_block's loop).
+            let buf = &self.outputs[pos][..port_len];
+            let mut peak = 0.0f32;
+            let mut sum_sq = 0.0f32;
+            for &s in buf {
+                peak = peak.max(s.abs());
+                sum_sq += s * s;
+            }
+            self.meters[node] = Meter {
+                peak,
+                rms: (sum_sq / port_len as f32).sqrt(),
+            };
+        }
+        let last_pos = self.node_to_pos[self.master[self.master.len() - 1]];
+        bus[..port_len].copy_from_slice(&self.outputs[last_pos][..port_len]);
+    }
 }
 
 /// Compile a description into an RT-ready graph. `create` maps a module id to a
-/// fresh node (the registry). `channels` is the channel-agnostic seam: buffers
-/// are sized for it, but the engine passes 1 everywhere today (the graph is mono
-/// upstream of the mixer stage). Runs entirely off the audio thread.
+/// fresh node (the registry). `channels` is the per-port channel count: the
+/// engine passes [`crate::engine::CHANNELS`]; unit tests and probes may compile
+/// mono. Runs entirely off the audio thread.
 pub fn compile(
     desc: &GraphDesc,
     create: impl Fn(&str) -> Option<Box<dyn AudioNode>>,
@@ -288,6 +391,9 @@ pub fn compile(
     let channels = channels.max(1);
     if desc.tails.iter().any(|&t| t >= n) {
         return Err(GraphError::TailOutOfRange);
+    }
+    if desc.master.iter().any(|&m| m >= n) {
+        return Err(GraphError::MasterNotEffect);
     }
 
     // Instantiate, prepare and inspect every node.
@@ -310,6 +416,20 @@ pub fn compile(
             node.set_param(*id, *value);
         }
         nodes.push(node);
+    }
+
+    // Master-chain nodes must be plain audio effects (one audio in, one audio
+    // out): they are fed the mixed bus, not graph edges.
+    let mut master_set = vec![false; n];
+    for &m in &desc.master {
+        let effect_shape = in_counts[m] == 1
+            && out_counts[m] == 1
+            && in_kinds[m][0] == SignalKind::Audio
+            && out_kinds[m][0] == SignalKind::Audio;
+        if !effect_shape || master_set[m] {
+            return Err(GraphError::MasterNotEffect);
+        }
+        master_set[m] = true;
     }
 
     // Validate connections: bounds, then port signal-type compatibility.
@@ -383,6 +503,8 @@ pub fn compile(
         tails: desc.tails.clone(),
         track_mix: desc.track_mix.clone(),
         master_gain_db: desc.master_gain_db,
+        master: desc.master.clone(),
+        master_set,
         channels,
         last_frames: 0,
     })
@@ -400,6 +522,7 @@ mod tests {
             for s in io.output(0).iter_mut() {
                 *s = self.0;
             }
+            io.spread_output(0);
         }
         fn ports(&self) -> PortSpec {
             PortSpec {
@@ -422,9 +545,11 @@ mod tests {
     impl AudioNode for HalfNode {
         fn process(&mut self, _ctx: &ProcessCtx, io: &mut NodeIo) {
             let frames = io.frames();
-            for i in 0..frames {
-                let x = io.input(0)[i];
-                io.output(0)[i] = x * 0.5;
+            for ch in 0..io.channels() {
+                for i in 0..frames {
+                    let x = io.input_ch(0, ch)[i];
+                    io.output_ch(0, ch)[i] = x * 0.5;
+                }
             }
         }
         fn ports(&self) -> PortSpec {
@@ -499,6 +624,7 @@ mod tests {
             tails: vec![1],
             track_mix: vec![],
             master_gain_db: 0.0,
+            master: vec![],
         };
         let mut g = compile(&desc, create, 48_000.0, 64, 1).expect("compiles");
         g.process_block(48_000.0, 32, 0.0);
@@ -531,6 +657,7 @@ mod tests {
             tails: vec![1],
             track_mix: vec![],
             master_gain_db: 0.0,
+            master: vec![],
         };
         let mut g = compile(&desc, create, 48_000.0, 64, 1).expect("compiles");
         g.process_block(48_000.0, 32, 0.0);
@@ -568,6 +695,7 @@ mod tests {
             tails: vec![0],
             track_mix: vec![],
             master_gain_db: 0.0,
+            master: vec![],
         };
         let g = compile(&desc, create, 48_000.0, 64, 1).expect("compiles");
         // node 1 (const) must come before node 0 (half) in the order.
@@ -589,6 +717,7 @@ mod tests {
             tails: vec![0],
             track_mix: vec![],
             master_gain_db: 0.0,
+            master: vec![],
         };
         // Ring the tail (struck to 1.0 by prepare) well down.
         let mut a = compile(&desc, test_support::create, 48_000.0, 64, 1).expect("compiles");
@@ -607,6 +736,210 @@ mod tests {
             b.node_output(0)[0] <= decayed,
             "live state was not moved into the new graph: {}",
             b.node_output(0)[0]
+        );
+    }
+
+    #[test]
+    fn processing_is_block_size_independent() {
+        // Channel offsets inside a port are packed with the CURRENT block's
+        // frame count, so a stride mistake only shows once two runs process
+        // the same signal through different (non-power-of-two) block sizes.
+        use crate::engine::swap::test_support;
+        let desc = GraphDesc {
+            nodes: vec![
+                NodeDesc {
+                    id: "t".into(),
+                    module_id: "tail".into(),
+                    params: vec![],
+                },
+                NodeDesc {
+                    id: "fx".into(),
+                    module_id: "filter".into(),
+                    params: vec![],
+                },
+            ],
+            connections: vec![Connection {
+                src_node: 0,
+                src_port: 0,
+                dst_node: 1,
+                dst_port: 0,
+            }],
+            tails: vec![1],
+            track_mix: vec![],
+            master_gain_db: 0.0,
+            master: vec![],
+        };
+        let total = 480 * 8;
+        let run = |block: usize| {
+            let mut g = compile(&desc, test_support::create, 48_000.0, 4096, 2).expect("compiles");
+            let mut left = Vec::new();
+            let mut right = Vec::new();
+            let mut done = 0usize;
+            while done < total {
+                let frames = block.min(total - done);
+                g.process_block(48_000.0, frames, 0.0);
+                left.extend_from_slice(g.node_output_ch(1, 0));
+                right.extend_from_slice(g.node_output_ch(1, 1));
+                done += frames;
+            }
+            (left, right)
+        };
+        let (l64, r64) = run(64);
+        let (l480, r480) = run(480);
+        assert_eq!(l64, l480, "left channel diverged across block sizes");
+        assert_eq!(r64, r480, "right channel diverged across block sizes");
+        assert_eq!(l64, r64, "dual-mono invariant broken");
+        assert!(l64.iter().any(|&s| s != 0.0), "silent run proves nothing");
+    }
+
+    #[test]
+    fn every_module_fills_all_channels() {
+        // Registry sweep: compiled stereo, every instrument (fed a note) and
+        // every effect (fed DC) must fill channel 1 — a freshly allocated
+        // buffer means a stale channel would stay exactly zero.
+        use crate::engine::node::{NoteEvent, NoteKind};
+        use crate::engine::swap::test_support;
+        use crate::modules::registry::{self, ModuleCategory};
+        for desc in registry::list() {
+            let is_instrument = desc.category == ModuleCategory::Instrument;
+            let (nodes, connections, target) = if is_instrument {
+                (
+                    vec![NodeDesc {
+                        id: "m".into(),
+                        module_id: desc.id.into(),
+                        params: vec![],
+                    }],
+                    vec![],
+                    0,
+                )
+            } else {
+                (
+                    vec![
+                        NodeDesc {
+                            id: "src".into(),
+                            module_id: "dc".into(),
+                            params: vec![],
+                        },
+                        NodeDesc {
+                            id: "m".into(),
+                            module_id: desc.id.into(),
+                            params: vec![],
+                        },
+                    ],
+                    vec![Connection {
+                        src_node: 0,
+                        src_port: 0,
+                        dst_node: 1,
+                        dst_port: 0,
+                    }],
+                    1,
+                )
+            };
+            let graph_desc = GraphDesc {
+                nodes,
+                connections,
+                tails: vec![target],
+                track_mix: vec![],
+                master_gain_db: 0.0,
+                master: vec![],
+            };
+            let mut g =
+                compile(&graph_desc, test_support::create, 48_000.0, 256, 2).expect("compiles");
+            if is_instrument {
+                g.push_note(
+                    target,
+                    NoteEvent {
+                        frame: 0,
+                        kind: NoteKind::On {
+                            pitch: 36,
+                            vel: 100,
+                        },
+                    },
+                );
+            }
+            // Chorus and reverb decorrelate on purpose; everything else must
+            // stay sample-identical across channels on identical inputs.
+            let decorrelates = matches!(desc.id, "chorus" | "reverb");
+            let mut energy = [0.0f32; 2];
+            for _ in 0..16 {
+                g.process_block(48_000.0, 256, 0.0);
+                g.clear_notes();
+                let (c0, c1) = (g.node_output_ch(target, 0), g.node_output_ch(target, 1));
+                if !decorrelates {
+                    assert_eq!(c0, c1, "'{}' channels differ", desc.id);
+                }
+                energy[0] += c0.iter().map(|s| s.abs()).sum::<f32>();
+                energy[1] += c1.iter().map(|s| s.abs()).sum::<f32>();
+            }
+            assert!(energy[0] > 0.0, "'{}' left channel 0 silent", desc.id);
+            assert!(energy[1] > 0.0, "'{}' left channel 1 silent", desc.id);
+        }
+    }
+
+    #[test]
+    fn master_chain_rejects_non_effect_nodes() {
+        // A source (no audio input) cannot sit on the master bus.
+        let desc = GraphDesc {
+            nodes: vec![NodeDesc {
+                id: "src".into(),
+                module_id: "const".into(),
+                params: vec![],
+            }],
+            connections: vec![],
+            tails: vec![0],
+            track_mix: vec![],
+            master_gain_db: 0.0,
+            master: vec![0],
+        };
+        assert!(matches!(
+            compile(&desc, create, 48_000.0, 64, 2),
+            Err(GraphError::MasterNotEffect)
+        ));
+    }
+
+    #[test]
+    fn master_nodes_run_on_the_bus_not_in_the_walk() {
+        // dc track + a half effect on the master list: the walk must leave the
+        // master node untouched (its buffer stays zero) and process_master
+        // must run it over the bus, halving it and metering it.
+        let desc = GraphDesc {
+            nodes: vec![
+                NodeDesc {
+                    id: "src".into(),
+                    module_id: "const".into(),
+                    params: vec![],
+                },
+                NodeDesc {
+                    id: "mfx".into(),
+                    module_id: "half".into(),
+                    params: vec![],
+                },
+            ],
+            connections: vec![],
+            tails: vec![0],
+            track_mix: vec![],
+            master_gain_db: 0.0,
+            master: vec![1],
+        };
+        let frames = 32;
+        let mut g = compile(&desc, create, 48_000.0, 64, 2).expect("compiles");
+        g.process_block(48_000.0, frames, 0.0);
+        assert!(
+            g.node_output_ch(1, 0).iter().all(|&s| s == 0.0),
+            "the walk processed a master node"
+        );
+
+        let mut bus = vec![1.0f32; frames * 2];
+        g.process_master(&mut bus, 48_000.0, frames, 0.0);
+        assert!(
+            bus.iter().all(|&s| (s - 0.5).abs() < 1e-6),
+            "master chain did not process the bus"
+        );
+        let meter = &g.meters()[1];
+        assert!(
+            (meter.peak - 0.5).abs() < 1e-6,
+            "master node not metered: {}",
+            meter.peak
         );
     }
 
@@ -634,6 +967,7 @@ mod tests {
             tails: vec![0],
             track_mix: vec![],
             master_gain_db: 0.0,
+            master: vec![],
         };
         assert!(matches!(
             compile(&desc, create, 48_000.0, 64, 1),

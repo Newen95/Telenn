@@ -98,6 +98,7 @@ pub mod test_support {
                 *s = self.z;
                 self.z *= self.decay;
             }
+            io.spread_output(0);
         }
         fn ports(&self) -> PortSpec {
             PortSpec {
@@ -124,6 +125,7 @@ pub mod test_support {
     impl AudioNode for Silence {
         fn process(&mut self, _ctx: &ProcessCtx, io: &mut NodeIo) {
             io.output(0).fill(0.0);
+            io.spread_output(0);
         }
         fn ports(&self) -> PortSpec {
             PortSpec {
@@ -148,6 +150,7 @@ pub mod test_support {
     impl AudioNode for Dc {
         fn process(&mut self, _ctx: &ProcessCtx, io: &mut NodeIo) {
             io.output(0).fill(1.0);
+            io.spread_output(0);
         }
         fn ports(&self) -> PortSpec {
             PortSpec {

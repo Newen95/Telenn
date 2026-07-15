@@ -4,6 +4,15 @@
 //! output, a single smoothed `gain` parameter. Use it as the canonical example
 //! of how to implement [`AudioNode`]: declare ports and params, smooth every
 //! parameter, and keep `process` allocation-free.
+//!
+//! Channel contract: a node processes `ctx.channels` channels per port
+//! (channel-major buffers; `io.input_ch`/`io.output_ch`/`io.in_out_ch`).
+//! Instruments synthesize channel 0 and call `io.spread_output(0)`. Effects
+//! keep per-channel signal state (one biquad/delay line per channel) and
+//! replay snapshotted param ramps per channel so every channel sees the same
+//! per-frame trajectory — never tick a shared ramp once per channel-sample.
+//! A detector that should react to the whole image (compressor) is the one
+//! deliberate exception: one follower fed by the channel maximum.
 
 use crate::engine::node::{
     AudioNode, NodeIo, ParamCurve, ParamId, ParamSpec, Port, PortSpec, ProcessCtx, SignalKind,
@@ -41,9 +50,16 @@ impl Default for Gain {
 
 impl AudioNode for Gain {
     fn process(&mut self, _ctx: &ProcessCtx, io: &mut NodeIo) {
-        let (input, output) = io.in_out(0, 0);
-        for (out, &x) in output.iter_mut().zip(input) {
-            *out = x * self.gain.tick();
+        // RT-SAFE: replay the same ramp trajectory on every channel.
+        let gain_start = self.gain;
+        for ch in 0..io.channels() {
+            if ch > 0 {
+                self.gain = gain_start;
+            }
+            let (input, output) = io.in_out_ch(0, 0, ch);
+            for (out, &x) in output.iter_mut().zip(input) {
+                *out = x * self.gain.tick();
+            }
         }
     }
 

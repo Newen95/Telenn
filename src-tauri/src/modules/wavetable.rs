@@ -293,6 +293,7 @@ impl AudioNode for Wavetable {
         if self.tables.is_empty() {
             let out = io.output(0);
             out.fill(0.0); // unprepared: silent, never a panic
+            io.spread_output(0);
             return;
         }
 
@@ -337,6 +338,7 @@ impl AudioNode for Wavetable {
             }
             *slot = sum * level;
         }
+        io.spread_output(0);
     }
 
     fn ports(&self) -> PortSpec {
@@ -463,7 +465,7 @@ mod tests {
             channels: 1,
             samples_per_beat: 0.0,
         };
-        let mut io = NodeIo::new(notes, &[], out, frames);
+        let mut io = NodeIo::new(notes, &[], out, frames, 1);
         s.process(&ctx, &mut io);
     }
 

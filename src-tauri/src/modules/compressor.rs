@@ -118,9 +118,18 @@ impl Default for Compressor {
 
 impl AudioNode for Compressor {
     fn process(&mut self, _ctx: &ProcessCtx, io: &mut NodeIo) {
-        let (input, output) = io.in_out(0, 0);
-        for (out, &x) in output.iter_mut().zip(input) {
-            let env = self.follower.tick(x);
+        let frames = io.frames();
+        let channels = io.channels();
+
+        // Linked detection: ONE follower fed the channel maximum, so the
+        // stereo image never shifts (per-channel gains would); the resulting
+        // gain applies to every channel of the frame. // RT-SAFE
+        for i in 0..frames {
+            let mut level = 0.0f32;
+            for ch in 0..channels {
+                level = level.max(io.input_ch(0, ch)[i].abs());
+            }
+            let env = self.follower.tick(level);
             let level_db = 20.0 * env.max(LEVEL_FLOOR).log10();
             let over = level_db - self.threshold_db;
             // Soft knee: hard-knee segments outside ±knee/2 of the threshold,
@@ -136,7 +145,10 @@ impl AudioNode for Compressor {
                 (1.0 / self.ratio - 1.0) * (over + half) * (over + half) / (2.0 * self.knee_db)
             };
             let gain = 10.0f32.powf(reduction_db / 20.0) * self.makeup.tick();
-            *out = x * gain;
+            for ch in 0..channels {
+                let x = io.input_ch(0, ch)[i];
+                io.output_ch(0, ch)[i] = x * gain;
+            }
         }
     }
 
@@ -219,7 +231,7 @@ mod tests {
             channels: 1,
             samples_per_beat: 0.0,
         };
-        let mut io = NodeIo::new(&[], input, out, frames);
+        let mut io = NodeIo::new(&[], input, out, frames, 1);
         c.process(&ctx, &mut io);
     }
 

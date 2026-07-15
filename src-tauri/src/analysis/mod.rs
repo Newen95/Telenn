@@ -5,12 +5,15 @@
 //! `engine/`. Consumers: the verification CLIs under `tools/` and sound
 //! non-regression tests asserting spectral properties.
 
+pub mod bands;
 pub mod envelope;
 pub mod fft;
 pub mod levels;
+pub mod loudness;
 pub mod pitch;
 pub mod png;
 pub mod report;
+pub mod rhythm;
 pub mod spectral;
 pub mod spectrogram;
 

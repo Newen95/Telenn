@@ -118,7 +118,13 @@ pub fn build_engine_init(project: Project) -> Result<(EngineInit, GraphIndex), E
     let (desc, index) = project.to_graph()?;
     let index_for_engine = index.clone();
     let init: EngineInit = Box::new(move |sample_rate, max_block| {
-        let graph = compile(&desc, registry::create, sample_rate, max_block, 1)?;
+        let graph = compile(
+            &desc,
+            registry::create,
+            sample_rate,
+            max_block,
+            crate::engine::CHANNELS,
+        )?;
         let schedule = project.to_schedule(sample_rate as u32, &index)?;
         Ok((graph, schedule))
     });

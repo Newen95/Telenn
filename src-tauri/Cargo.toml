@@ -34,6 +34,10 @@ path = "tools/song_lint.rs"
 name = "module_specs"
 path = "tools/module_specs.rs"
 
+[[bin]]
+name = "reference_match"
+path = "tools/reference_match.rs"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

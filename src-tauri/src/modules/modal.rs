@@ -339,6 +339,7 @@ impl AudioNode for Modal {
             }
             *slot = sum * level;
         }
+        io.spread_output(0);
         // Free rung-out voices once per block (cheaper than per sample).
         for v in &mut self.voices {
             if v.active && v.faded() {
@@ -441,7 +442,7 @@ mod tests {
             channels: 1,
             samples_per_beat: 0.0,
         };
-        let mut io = NodeIo::new(notes, &[], out, frames);
+        let mut io = NodeIo::new(notes, &[], out, frames, 1);
         s.process(&ctx, &mut io);
     }
 

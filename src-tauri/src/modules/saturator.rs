@@ -67,7 +67,8 @@ pub struct Saturator {
     tone: OnePole,
     mix: LinearRamp,
     level: LinearRamp,
-    lp: Biquad,
+    /// One post-shaper low-pass per channel: shared coefficients, own state.
+    lps: [Biquad; crate::engine::CHANNELS],
 }
 
 impl Default for Saturator {
@@ -79,7 +80,7 @@ impl Default for Saturator {
             tone: OnePole::new(8000.0, 0.99),
             mix: LinearRamp::new(1.0, RAMP_MS, 48_000.0),
             level: LinearRamp::new(1.0, RAMP_MS, 48_000.0),
-            lp: Biquad::default(),
+            lps: Default::default(),
         }
     }
 }
@@ -90,14 +91,26 @@ impl AudioNode for Saturator {
         let sr = self.sample_rate;
         let gain = 10.0f32.powf(self.drive_db.advance(frames) / 20.0);
         let tone = self.tone.advance(frames);
-        self.lp.set_lowpass(tone, 0.707, sr);
+        for lp in &mut self.lps {
+            lp.set_lowpass(tone, 0.707, sr);
+        }
 
-        // RT-SAFE
-        let (input, output) = io.in_out(0, 0);
-        for (out, &x) in output.iter_mut().zip(input) {
-            let wet = self.lp.process((x * gain).tanh());
-            let mix = self.mix.tick();
-            *out = (x * (1.0 - mix) + wet * mix) * self.level.tick();
+        // RT-SAFE: the mix/level ramps are snapshotted and replayed so every
+        // channel sees the same per-frame trajectory (never tick a shared ramp
+        // once per channel-sample).
+        let mix_start = self.mix;
+        let level_start = self.level;
+        for ch in 0..io.channels().min(self.lps.len()) {
+            if ch > 0 {
+                self.mix = mix_start;
+                self.level = level_start;
+            }
+            let (input, output) = io.in_out_ch(0, 0, ch);
+            for (out, &x) in output.iter_mut().zip(input) {
+                let wet = self.lps[ch].process((x * gain).tanh());
+                let mix = self.mix.tick();
+                *out = (x * (1.0 - mix) + wet * mix) * self.level.tick();
+            }
         }
     }
 
@@ -136,7 +149,7 @@ impl AudioNode for Saturator {
         self.tone = OnePole::new(default_real(P_TONE), coef);
         self.mix = LinearRamp::new(default_real(P_MIX), RAMP_MS, sample_rate);
         self.level = LinearRamp::new(default_real(P_LEVEL), RAMP_MS, sample_rate);
-        self.lp = Biquad::default();
+        self.lps = Default::default();
     }
 }
 
@@ -171,7 +184,7 @@ mod tests {
             channels: 1,
             samples_per_beat: 0.0,
         };
-        let mut io = NodeIo::new(&[], input, out, input.len());
+        let mut io = NodeIo::new(&[], input, out, input.len(), 1);
         s.process(&ctx, &mut io);
     }
 

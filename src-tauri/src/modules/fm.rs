@@ -328,6 +328,7 @@ impl AudioNode for Fm {
             }
             *slot = sum * level;
         }
+        io.spread_output(0);
     }
 
     fn ports(&self) -> PortSpec {
@@ -423,7 +424,7 @@ mod tests {
             channels: 1,
             samples_per_beat: 0.0,
         };
-        let mut io = NodeIo::new(notes, &[], out, frames);
+        let mut io = NodeIo::new(notes, &[], out, frames, 1);
         s.process(&ctx, &mut io);
     }
 

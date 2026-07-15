@@ -86,9 +86,10 @@ const PARAMS: [ParamSpec; 5] = [
 
 pub struct Delay {
     sample_rate: f32,
-    line: DelayLine,
-    /// Low-pass inside the feedback loop (repeats get darker each pass).
-    filter: Biquad,
+    /// One line per channel: identical timing, per-channel content.
+    lines: [DelayLine; crate::engine::CHANNELS],
+    /// Low-pass inside each feedback loop (repeats get darker each pass).
+    filters: [Biquad; crate::engine::CHANNELS],
     /// Active delay time in samples, glided per sample.
     time: OnePole,
     /// The ms knob's target in samples, kept apart so ms and sync never fight.
@@ -107,8 +108,8 @@ impl Default for Delay {
         // Real state is rebuilt in `prepare` once the sample rate is known.
         Self {
             sample_rate: 48_000.0,
-            line: DelayLine::default(),
-            filter: Biquad::default(),
+            lines: Default::default(),
+            filters: Default::default(),
             time: OnePole::new(default_real(P_TIME) / 1000.0 * 48_000.0, 0.999),
             time_ms_samples: default_real(P_TIME) / 1000.0 * 48_000.0,
             sync_idx: 0,
@@ -124,7 +125,9 @@ impl AudioNode for Delay {
     fn process(&mut self, ctx: &ProcessCtx, io: &mut NodeIo) {
         let frames = io.frames();
         let cutoff = self.tone.advance(frames);
-        self.filter.set_lowpass(cutoff, 0.707, self.sample_rate);
+        for filter in &mut self.filters {
+            filter.set_lowpass(cutoff, 0.707, self.sample_rate);
+        }
 
         // RT-SAFE: pick the time target once per block — synced when a
         // division is set and the host has a tempo, ms knob otherwise (old
@@ -137,14 +140,26 @@ impl AudioNode for Delay {
         };
         self.time.set_target(target);
 
-        let (input, output) = io.in_out(0, 0);
-        for (out, &x) in output.iter_mut().zip(input) {
-            let t = self.time.advance(1);
-            let fb = self.feedback.tick();
-            let mix = self.mix.tick();
-            let wet = self.line.read(t);
-            self.line.write(x + self.filter.process(wet) * fb);
-            *out = x * (1.0 - mix) + wet * mix;
+        // Snapshot the smoothers and replay them per channel, so both lines
+        // follow the exact same time/feedback/mix trajectory. // RT-SAFE
+        let time_start = self.time;
+        let fb_start = self.feedback;
+        let mix_start = self.mix;
+        for ch in 0..io.channels().min(self.lines.len()) {
+            if ch > 0 {
+                self.time = time_start;
+                self.feedback = fb_start;
+                self.mix = mix_start;
+            }
+            let (input, output) = io.in_out_ch(0, 0, ch);
+            for (out, &x) in output.iter_mut().zip(input) {
+                let t = self.time.advance(1);
+                let fb = self.feedback.tick();
+                let mix = self.mix.tick();
+                let wet = self.lines[ch].read(t);
+                self.lines[ch].write(x + self.filters[ch].process(wet) * fb);
+                *out = x * (1.0 - mix) + wet * mix;
+            }
         }
     }
 
@@ -181,9 +196,11 @@ impl AudioNode for Delay {
     fn prepare(&mut self, sample_rate: f32, _max_block: usize) {
         self.sample_rate = sample_rate;
         let line_len = (MAX_TIME_MS / 1000.0 * sample_rate).ceil() as usize + 2;
-        self.line.prepare(line_len);
+        for line in &mut self.lines {
+            line.prepare(line_len);
+        }
         self.max_delay_samples = (line_len - 2) as f32;
-        self.filter = Biquad::default();
+        self.filters = Default::default();
         let time_coef = (-1.0 / (TIME_SMOOTH_S * sample_rate)).exp();
         let tone_coef = (-1.0 / (TONE_SMOOTH_S * sample_rate)).exp();
         self.time = OnePole::new(default_real(P_TIME) / 1000.0 * sample_rate, time_coef);
@@ -226,7 +243,7 @@ mod tests {
             channels: 1,
             samples_per_beat,
         };
-        let mut io = NodeIo::new(&[], input, out, frames);
+        let mut io = NodeIo::new(&[], input, out, frames, 1);
         d.process(&ctx, &mut io);
     }
 

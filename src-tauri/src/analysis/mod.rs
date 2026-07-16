@@ -7,6 +7,7 @@
 
 pub mod bands;
 pub mod chroma;
+pub mod composition;
 pub mod envelope;
 pub mod fft;
 pub mod levels;

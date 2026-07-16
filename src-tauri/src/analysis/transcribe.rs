@@ -16,7 +16,7 @@
 
 use std::fmt;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::analysis::chroma::{
     best_chord, chroma_frames, chroma_time_s, estimate_key, mean_chroma, Key, NAMES,
@@ -94,7 +94,7 @@ impl Default for Options {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Grid {
     pub bpm: f32,
     /// Absolute seconds of bar 1 beat 1.
@@ -106,7 +106,7 @@ pub struct Grid {
     pub offset_overridden: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BassNote {
     pub pitch: u8,
     /// `"C#2"` — the pitch as a name, for human eyes.
@@ -123,7 +123,7 @@ pub struct BassNote {
     pub quant_error_ticks: i64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DrumHit {
     /// `"kick"`, `"snare"` or `"hat"`.
     pub class: String,
@@ -134,7 +134,7 @@ pub struct DrumHit {
     pub quant_error_ticks: i64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MeasureChord {
     pub bar: u32,
     /// Best triad, or `"N.C."` for a silent measure.
@@ -144,7 +144,7 @@ pub struct MeasureChord {
     pub alt_confidence: f32,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Transcription {
     /// Filled by the caller (the library never sees the path).
     pub source: String,
@@ -157,6 +157,14 @@ pub struct Transcription {
     pub bass: Vec<BassNote>,
     pub drums: Vec<DrumHit>,
     pub chords: Vec<MeasureChord>,
+}
+
+impl Transcription {
+    /// Load a transcription JSON produced by the `transcribe` CLI.
+    pub fn load(path: impl AsRef<std::path::Path>) -> Result<Self, AnalysisError> {
+        let text = std::fs::read_to_string(&path).map_err(|e| AnalysisError::Io(e.to_string()))?;
+        serde_json::from_str(&text).map_err(|e| AnalysisError::BadInput(e.to_string()))
+    }
 }
 
 /// Transcribe a mono signal. Fails when no tempo can be inferred and none
@@ -1149,5 +1157,76 @@ mod tests {
             subdivision: 7,
         };
         assert!(transcribe(&x, SR, &bad).is_err());
+    }
+
+    fn sample_transcription() -> Transcription {
+        Transcription {
+            source: "sample.wav".into(),
+            sample_rate: SR,
+            duration_s: 8.0,
+            start_s: 0.0,
+            grid: Grid {
+                bpm: 114.0,
+                beat0_s: 0.25,
+                time_signature: [4, 4],
+                ppq: 960,
+                subdivision: 16,
+                bpm_overridden: false,
+                offset_overridden: false,
+            },
+            key: Some(crate::analysis::chroma::Key {
+                tonic: "C#".into(),
+                mode: "minor".into(),
+                confidence: 0.9,
+            }),
+            bass: vec![BassNote {
+                pitch: 30,
+                note: "F#1".into(),
+                start: "1.1.0".into(),
+                length: "0.0.480".into(),
+                vel: 100,
+                clarity: 0.95,
+                raw_s: 0.26,
+                quant_error_ticks: 12,
+            }],
+            drums: vec![DrumHit {
+                class: "kick".into(),
+                start: "1.1.0".into(),
+                strength: 1.0,
+                raw_s: 0.25,
+                quant_error_ticks: 0,
+            }],
+            chords: vec![MeasureChord {
+                bar: 1,
+                chord: "C#m".into(),
+                confidence: 0.8,
+                alt: "E".into(),
+                alt_confidence: 0.7,
+            }],
+        }
+    }
+
+    #[test]
+    fn transcription_json_round_trips() {
+        let t = sample_transcription();
+        let json = serde_json::to_string(&t).unwrap();
+        let back: Transcription = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.grid.bpm, 114.0);
+        assert_eq!(back.bass[0].pitch, 30);
+        assert_eq!(back.bass[0].start, "1.1.0");
+        assert_eq!(back.drums[0].class, "kick");
+        assert_eq!(back.chords[0].chord, "C#m");
+        assert_eq!(back.key.as_ref().map(|k| k.tonic.as_str()), Some("C#"));
+    }
+
+    #[test]
+    fn transcription_load_reads_a_file() {
+        let path = std::env::temp_dir().join("telenn_transcription_load.json");
+        let json = serde_json::to_string_pretty(&sample_transcription()).unwrap();
+        std::fs::write(&path, json).unwrap();
+        let back = Transcription::load(&path).expect("load");
+        std::fs::remove_file(&path).ok();
+        assert_eq!(back.bass.len(), 1);
+        assert_eq!(back.bass[0].note, "F#1");
     }
 }

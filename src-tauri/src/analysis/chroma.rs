@@ -5,7 +5,7 @@
 //! from weighted triad templates scored by cosine similarity, the key from
 //! Krumhansl-Schmuckler profile correlation.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::analysis::fft::{bin_hz, power_spectrum};
 
@@ -111,7 +111,7 @@ pub fn mean_chroma(frames: &[[f32; 12]]) -> [f32; 12] {
     acc
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChordMatch {
     /// `"C"`…`"B"` for major triads, `"Cm"`…`"Bm"` for minor.
     pub chord: String,
@@ -152,7 +152,7 @@ pub fn best_chord(chroma: &[f32; 12]) -> Option<ChordMatch> {
     })
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Key {
     pub tonic: String,
     /// `"major"` or `"minor"`.

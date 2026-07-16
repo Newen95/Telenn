@@ -24,12 +24,19 @@ pub struct F0 {
 /// when no periodic dip is found — expected for drums and noise, not an
 /// error. Pass the sustain segment, not the attack.
 pub fn estimate_f0(x: &[f32], sample_rate: u32) -> Option<F0> {
-    if sample_rate == 0 {
+    estimate_f0_in(x, sample_rate, F0_MIN, F0_MAX)
+}
+
+/// [`estimate_f0`] with an explicit search range. A narrow range (e.g.
+/// 30–200 Hz for a bass line) keeps the first-dip rule from locking onto a
+/// harmonic of another voice.
+pub fn estimate_f0_in(x: &[f32], sample_rate: u32, f_min: f32, f_max: f32) -> Option<F0> {
+    if sample_rate == 0 || f_min <= 0.0 || f_max <= f_min {
         return None;
     }
     let window = WINDOW.min(x.len());
-    let tau_max = ((sample_rate as f32 / F0_MIN) as usize).min(window / 2);
-    let tau_min = ((sample_rate as f32 / F0_MAX) as usize).max(2);
+    let tau_max = ((sample_rate as f32 / f_min) as usize).min(window / 2);
+    let tau_min = ((sample_rate as f32 / f_max) as usize).max(2);
     if tau_max <= tau_min + 2 {
         return None; // slice too short to hold a full period
     }
@@ -107,6 +114,32 @@ mod tests {
             .collect();
         let f0 = estimate_f0(&x, sr).unwrap();
         assert!((f0.hz - 55.0).abs() < 0.5, "f0 {}", f0.hz);
+    }
+
+    #[test]
+    fn bass_range_resists_a_strong_second_harmonic() {
+        // 55 Hz with a second harmonic almost as loud: the bass search range
+        // must still report the fundamental, not the octave.
+        let sr = 48_000u32;
+        let x: Vec<f32> = (0..8192)
+            .map(|i| {
+                let t = i as f32 / sr as f32;
+                (std::f32::consts::TAU * 55.0 * t).sin()
+                    + 0.9 * (std::f32::consts::TAU * 110.0 * t).sin()
+            })
+            .collect();
+        let f0 = estimate_f0_in(&x, sr, 30.0, 200.0).unwrap();
+        assert!((f0.hz - 55.0).abs() < 1.0, "f0 {}", f0.hz);
+    }
+
+    #[test]
+    fn degenerate_ranges_yield_none() {
+        let sr = 48_000u32;
+        let x: Vec<f32> = (0..8192)
+            .map(|i| (std::f32::consts::TAU * 440.0 * i as f32 / sr as f32).sin())
+            .collect();
+        assert!(estimate_f0_in(&x, sr, 0.0, 200.0).is_none());
+        assert!(estimate_f0_in(&x, sr, 200.0, 100.0).is_none());
     }
 
     #[test]

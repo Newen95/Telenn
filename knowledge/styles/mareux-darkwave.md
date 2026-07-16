@@ -33,7 +33,7 @@ autocorrélation d'attaques + chroma) et de connaissances de genre.
 
 | Rôle | Son recherché (mesurable) | Recette locale (mesurée 2026-07-14, `projects/mareux-test`) |
 |---|---|---|
-| basse | LA voix principale : ostinato en croches, saw/pulse doublé détuné, lowpass 500-900 Hz, centroïde < 400 Hz, attaque < 15 ms, ligne registre 26-38 (ré1-ré2) | subtractive (saw, osc2 1.0, detune 10 ct, cutoff 700 Hz, att 3 ms) → saturator (drive 8 dB, tone 2 kHz, level −3) → chorus (mix 0.2) — mesuré : centroïde 128 Hz, attaque 6 ms, crest solo 10.6 dB |
+| basse | LA voix principale : ostinato en croches, saw/pulse doublé détuné, lowpass 500-900 Hz, centroïde < 400 Hz, attaque < 15 ms, ligne registre **23-38 (si0-ré2)** — transcription LNCL 2026-07-15 : tonique tenue à F#1/B0/C#1, plus grave que supposé | subtractive (saw, osc2 1.0, detune 10 ct, cutoff 700 Hz, att 3 ms) → saturator (drive 8 dB, tone 2 kHz, level −3) → chorus (mix 0.2) — mesuré : centroïde 128 Hz, attaque 6 ms, crest solo 10.6 dB |
 | batterie | drum machine sèche : kick rond, snare claquante + reverb courte dense (gated 80s), hats fins en croches | drum_sampler → compressor (**attack 0.5 ms**, threshold −22, ratio 4:1, makeup +7 — voir leçon 2026-07-14) → reverb (size 0.25, damp 0.7, mix 0.12) |
 | nappe | froide, attaque lente (200-500 ms), spectre médium qui bouge peu, très réverbérée, accords tenus 1-2 mesures | wavetable (position 0.35, attack 350 ms, release 500 ms) → chorus (0.35) → reverb (size 0.7, mix 0.4) — mesuré : attaque 441 ms, centroïde 246 Hz à G#3 |
 | lead | rare et simple : mélodie conjointe mineure, 1 note à la fois, delay en croche pointée, jamais virtuose | wavetable (position 0.55, pos_env −0.25, att 8 ms) → delay (sync 1/8., feedback 0.4, mix 0.28, tone 3.5 kHz) → reverb (0.3) |
@@ -104,6 +104,15 @@ Miniature 12 mesures : intro 2 (drums+basse) — A 4 (+nappe) — B 4 (+lead)
   crest plancher est ~14-15 dB sans bus master — les 11-13 dB des
   références viennent d'un mastering pleine densité (qui clippe).
   En attente du verdict d'écoute.
+- `2026-07-15` — première transcription (`transcribe` sur LNCL) : tempo
+  détecté 113.9 vs 114.0 ✓ ; basse = ostinato en croches confirmé, clartés
+  0.85-0.98, mais **registre plus grave que la fiche** (F#1/B0/C#1, soit
+  34-46 Hz — recoupe le déficit de sub mesuré par reference_match) ;
+  accords = pédale C#/C#m sur le couplet, l'intro assise sur F# (iv) ;
+  four-on-the-floor lisible sur l'intro exposée (mesures 3-4), canal kick
+  sur-détecte dès que l'ostinato entre (kick et basse partagent 40-150 Hz —
+  transcrire la batterie sur segments exposés). Ambiguïté maj/min persistante
+  (Krumhansl donne C# majeur 0.84 sur le couplet — tierce de picardie).
 - `2026-07-14` — stéréo native + bus master : le même morceau passe à
   corrélation 0.94 (les reverbs/chorus décorrèlent ; références 0.64-0.86)
   et un master `compressor (thr −20, makeup +3) → saturator (drive 4 dB)`

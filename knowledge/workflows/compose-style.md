@@ -14,6 +14,29 @@ X ». S'appuie sur `workflows/sound-design.md` pour les sons manquants.
   mélodie d'un morceau existant — s'inspirer d'un style oui, recopier une
   œuvre non.
 
+## 1 bis. Transcrire les patterns réels (si références audio fournies)
+
+```
+cargo run --bin transcribe -- <réf.wav> [--start-s a --dur-s n] [--json p]
+```
+
+Sort la ligne de basse note à note, le pattern de batterie et la grille
+d'accords par mesure, positions `bar.beat.tick` sur une grille inférée
+(tempo/phase/downbeat ; `--bpm`/`--offset-s` pour corriger une inférence
+ratée). Usage :
+
+- **Nourrir la fiche en patterns** : registre et densité de la basse,
+  grammaire des enchaînements (degrés, pas des intervalles), squelette
+  rythmique — toujours résumés en règles dans la fiche, **jamais** les
+  lignes transcrites recopiées telles quelles dans une composition (le
+  garde-fou ci-dessus s'applique à plus forte raison à une transcription).
+- **Limites connues** : couches accessibles seulement (basse dominante,
+  batterie, accords — pas les voix ni les arpèges noyés) ; sur un mix à
+  ostinato de basse continu, le canal kick sur-détecte (basse et kick
+  partagent la bande 40-150 Hz) → transcrire la batterie sur un **segment
+  exposé** (intro/break, `--start-s`/`--dur-s`) ; grille rigide (tempo
+  constant), `raw_s`/`quant_error_ticks` exposent la dérive.
+
 ## 2. Analyse d'écart (sons)
 
 Lister les rôles requis par la fiche (basse, lead, batterie…) et regarder

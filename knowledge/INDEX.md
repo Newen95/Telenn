@@ -11,5 +11,5 @@ commit** que toute fiche créée/modifiée (voir `README.md`).
 | `lessons.md` | leçons | journal transverse daté | — | — |
 | `sounds/berceuse-hantee.md` | son | mobile musical (lame pincée + lowpass + reverb), calé sur une référence réelle ; démo Brahms incluse ; preset de chaîne app : `berceuse` | plucked, filter, reverb | **v3.1 VALIDÉ 2026-07-12** (lowpass anti-H2, reverb.mix 0.38 à l'oreille) |
 | `styles/_template.md` | gabarit | fiche de style | — | — |
-| `styles/mareux-darkwave.md` | style | darkwave/post-punk synthétique (Mareux) : mesures de 4 références, patterns, cibles mix | subtractive, wavetable, drum_sampler | 2026-07-14 plausible (mesures, pas encore de morceau validé) |
+| `styles/mareux-darkwave.md` | style | darkwave/post-punk synthétique (Mareux) : mesures de 4 références, patterns, cibles mix | subtractive, wavetable, drum_sampler | 2026-07-15 transcription LNCL (tempo ✓, ostinato ✓, registre basse corrigé si0-ré2) |
 | `sounds/_template.md` | gabarit | recette de son | — | — |

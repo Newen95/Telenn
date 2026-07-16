@@ -38,6 +38,10 @@ path = "tools/module_specs.rs"
 name = "reference_match"
 path = "tools/reference_match.rs"
 
+[[bin]]
+name = "transcribe"
+path = "tools/transcribe.rs"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

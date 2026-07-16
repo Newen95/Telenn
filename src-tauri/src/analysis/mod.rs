@@ -6,6 +6,7 @@
 //! non-regression tests asserting spectral properties.
 
 pub mod bands;
+pub mod chroma;
 pub mod envelope;
 pub mod fft;
 pub mod levels;

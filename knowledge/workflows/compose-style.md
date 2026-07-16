@@ -62,6 +62,29 @@ cargo run --bin song_lint -- <chemin>/song.json
 
 Boucler jusqu'à exit 0.
 
+## 3 bis. Garde anti-plagiat (si références transcrites)
+
+```
+cargo run --bin song_stats -- <chemin>/song.json --vs <transcription.json> […]
+```
+
+**Exit 0 requis** avant de passer au mix. Deux niveaux de signal :
+
+- `DEFECT` (run d'intervalles+rythme ≥ 8 partagé avec une référence, ou
+  similarité ≥ 0.85) = **preuve dure** : réécrire la ligne concernée, le
+  rapport donne la position du passage des deux côtés ;
+- `WARN` = à juger : le **plancher de nouveauté** (avec ≥ 2 références)
+  vérifie qu'une ligne composée reste au moins aussi loin de chaque
+  référence que les références le sont entre elles — plus proche = on
+  imite un morceau, pas le style. `--strict` promeut les WARN en exit 2.
+
+Sans `--vs`, l'outil sort les métriques seules (densité, registre,
+intervalles, grille rythmique, auto-répétition) — utile pour comparer sa
+composition aux grandeurs de la fiche. Le garde-fou de l'étape 1
+(« s'inspirer oui, recopier non ») devient ainsi vérifiable chiffré ; il
+trouve des preuves, il ne prouve pas l'absence de copie — l'écoute humaine
+reste le dernier juge.
+
 ## 4. Boucle de mix
 
 ```

@@ -42,6 +42,10 @@ path = "tools/reference_match.rs"
 name = "transcribe"
 path = "tools/transcribe.rs"
 
+[[bin]]
+name = "song_stats"
+path = "tools/song_stats.rs"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

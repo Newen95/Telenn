@@ -113,6 +113,13 @@ Miniature 12 mesures : intro 2 (drums+basse) — A 4 (+nappe) — B 4 (+lead)
   sur-détecte dès que l'ostinato entre (kick et basse partagent 40-150 Hz —
   transcrire la batterie sur segments exposés). Ambiguïté maj/min persistante
   (Krumhansl donne C# majeur 0.84 sur le couplet — tierce de picardie).
+- `2026-07-15` — espace de liberté mesuré (`song_stats` sur les 4 basses
+  transcrites) : distances inter-références 0.81-1.00 (paire la plus proche
+  LFTP↔Summertime 0.81) — même chez l'artiste, deux morceaux ne partagent
+  presque aucun n-gramme (intervalle, rythme) ; c'est la grammaire (ostinato
+  de croches, pédale, ouvertures d'octave) qui est commune, pas les lignes.
+  Plancher de nouveauté pour composer : ≥ 0.81. `mareux-test` v1 : basse à
+  0.85 de LNCL (au-dessus), pad/lead à 1.00, 0 defect — garde passée.
 - `2026-07-14` — stéréo native + bus master : le même morceau passe à
   corrélation 0.94 (les reverbs/chorus décorrèlent ; références 0.64-0.86)
   et un master `compressor (thr −20, makeup +3) → saturator (drive 4 dB)`

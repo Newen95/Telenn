@@ -113,10 +113,21 @@ pub fn spectral_centroid_hz(power: &[f32], fft_len: usize, sample_rate: u32) -> 
 /// Spectral flatness (geometric / arithmetic mean of power) over
 /// 50 Hz..Nyquist, in dB. 0 dB = white noise, very negative = pure tone.
 pub fn spectral_flatness_db(power: &[f32], fft_len: usize, sample_rate: u32) -> f32 {
+    spectral_flatness_above_db(power, fft_len, sample_rate, 50.0)
+}
+
+/// [`spectral_flatness_db`] restricted to `lo_hz..Nyquist` — e.g. above
+/// 4 kHz to ask "is the high end noisy?" regardless of what plays below.
+pub fn spectral_flatness_above_db(
+    power: &[f32],
+    fft_len: usize,
+    sample_rate: u32,
+    lo_hz: f32,
+) -> f32 {
     let first = power
         .iter()
         .enumerate()
-        .position(|(i, _)| bin_hz(i, fft_len, sample_rate) >= 50.0)
+        .position(|(i, _)| bin_hz(i, fft_len, sample_rate) >= lo_hz)
         .unwrap_or(0);
     let band = &power[first..];
     if band.is_empty() {

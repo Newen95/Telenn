@@ -17,6 +17,7 @@ pub mod report;
 pub mod rhythm;
 pub mod spectral;
 pub mod spectrogram;
+pub mod transcribe;
 
 use std::path::Path;
 

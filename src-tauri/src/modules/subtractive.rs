@@ -1,11 +1,14 @@
 //! Subtractive synthesiser: 8-voice polyphony, band-limited oscillators
 //! (polyBLEP saw / pulse / triangle) + white noise + a detunable second
 //! oscillator → resonant low-pass (RBJ biquad) → ADSR amplitude envelope.
+//! An optional filter envelope opens the cutoff at note-on and closes it
+//! exponentially — the bright-attack / dark-sustain shape of classic synth
+//! basses and plucks.
 //!
 //! All DSP is hand-written. `process` is RT-SAFE: a fixed voice array, no
 //! allocation, no locks. Voice stealing takes the oldest voice.
 
-use crate::engine::dsp::{next_white, AdsrSettings, Biquad, Env, MIN_RELEASE_S, RNG_SEED};
+use crate::engine::dsp::{flush, next_white, AdsrSettings, Biquad, Env, MIN_RELEASE_S, RNG_SEED};
 use crate::engine::node::{
     AudioNode, NodeIo, NoteKind, ParamCurve, ParamId, ParamSpec, Port, PortSpec, ProcessCtx,
     SignalKind,
@@ -29,13 +32,22 @@ const P_WIDTH: ParamId = 8;
 const P_NOISE: ParamId = 9;
 const P_OSC2: ParamId = 10;
 const P_DETUNE: ParamId = 11;
+const P_FENV: ParamId = 12;
+const P_FENV_DECAY: ParamId = 13;
+const P_VIB_RATE: ParamId = 14;
+const P_VIB_DEPTH: ParamId = 15;
+const P_UNISON: ParamId = 16;
+const P_SPREAD: ParamId = 17;
+
+/// Hard cap on unison sub-oscillators per voice (7 × 8 voices = 56 osc).
+const MAX_UNISON: usize = 7;
 
 /// Waveform selector values (P_WAVE, rounded): saw, pulse, triangle.
 const WAVE_SAW: usize = 0;
 const WAVE_PULSE: usize = 1;
 const WAVE_TRIANGLE: usize = 2;
 
-const PARAMS: [ParamSpec; 12] = [
+const PARAMS: [ParamSpec; 18] = [
     ParamSpec {
         id: P_CUTOFF,
         name: "cutoff",
@@ -144,6 +156,65 @@ const PARAMS: [ParamSpec; 12] = [
         default: 7.0,
         curve: ParamCurve::Linear,
     },
+    // Filter envelope: octaves added to the cutoff at note-on (0 = off, the
+    // legacy static filter), closing exponentially over `fenv_decay`.
+    ParamSpec {
+        id: P_FENV,
+        name: "fenv",
+        unit: "oct",
+        min: -4.0,
+        max: 4.0,
+        default: 0.0,
+        curve: ParamCurve::Linear,
+    },
+    ParamSpec {
+        id: P_FENV_DECAY,
+        name: "fenv_decay",
+        unit: "ms",
+        min: 5.0,
+        max: 2000.0,
+        default: 200.0,
+        curve: ParamCurve::Log,
+    },
+    // Module-wide vibrato LFO (block-rate pitch wobble; depth 0 = off).
+    ParamSpec {
+        id: P_VIB_RATE,
+        name: "vib_rate",
+        unit: "Hz",
+        min: 0.1,
+        max: 12.0,
+        default: 5.0,
+        curve: ParamCurve::Log,
+    },
+    ParamSpec {
+        id: P_VIB_DEPTH,
+        name: "vib_depth",
+        unit: "ct",
+        min: 0.0,
+        max: 100.0,
+        default: 0.0,
+        curve: ParamCurve::Linear,
+    },
+    // Unison: N detuned sub-oscillators fanned across the stereo field
+    // (1 = off, the legacy voice; > 1 replaces the osc2 pair).
+    ParamSpec {
+        id: P_UNISON,
+        name: "unison",
+        unit: "",
+        min: 1.0,
+        max: 7.0,
+        default: 1.0,
+        curve: ParamCurve::Linear,
+    },
+    ParamSpec {
+        id: P_SPREAD,
+        name: "spread",
+        unit: "ct",
+        min: 0.0,
+        max: 50.0,
+        default: 12.0,
+        curve: ParamCurve::Linear,
+    },
 ];
 
 /// Per-block oscillator settings, shared by every voice (smoothed once per
@@ -155,6 +226,8 @@ struct OscParams {
     noise: f32,
     osc2: f32,
     det: f32,
+    /// Vibrato frequency multiplier for this block (1.0 = none).
+    vib: f32,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -175,20 +248,70 @@ struct Voice {
     amp: f32,
     filter: Biquad,
     env: Env,
+    /// Filter-envelope level: 1.0 at note-on, exponential decay per block
+    /// (a one-field AD envelope — the attack is the note-on itself).
+    fenv_level: f32,
+    /// Unison sub-oscillator phases and triangle states (used when
+    /// `unison > 1`; the legacy fields above cover the single-osc path).
+    phases: [f32; MAX_UNISON],
+    tris: [f32; MAX_UNISON],
+    /// Right-channel filter for the stereo unison path (same coefficients as
+    /// `filter`, separate state).
+    filter2: Biquad,
+}
+
+/// Per-block unison settings: detune ratio and constant-power pan gains for
+/// each sub-oscillator, plus the 1/√N loudness normalization.
+#[derive(Clone, Copy)]
+struct UnisonParams {
+    n: usize,
+    ratios: [f32; MAX_UNISON],
+    gl: [f32; MAX_UNISON],
+    gr: [f32; MAX_UNISON],
+    norm: f32,
+}
+
+impl UnisonParams {
+    /// Sub-oscillator k sits at `pos` in −1..1: detuned by `spread · pos`
+    /// cents and panned there (constant-power). Mono collapses the pan.
+    fn build(n: usize, spread_ct: f32, stereo: bool) -> Self {
+        let mut u = Self {
+            n,
+            ratios: [1.0; MAX_UNISON],
+            gl: [1.0; MAX_UNISON],
+            gr: [0.0; MAX_UNISON],
+            norm: 1.0 / (n as f32).sqrt(),
+        };
+        for k in 0..n {
+            let pos = if n > 1 {
+                2.0 * k as f32 / (n - 1) as f32 - 1.0
+            } else {
+                0.0
+            };
+            u.ratios[k] = (spread_ct * pos / 1200.0).exp2();
+            if stereo {
+                let theta = (pos + 1.0) * core::f32::consts::FRAC_PI_4;
+                u.gl[k] = theta.cos();
+                u.gr[k] = theta.sin();
+            }
+        }
+        u
+    }
 }
 
 impl Voice {
     // RT-SAFE
     fn render(&mut self, p: &OscParams, white: f32, adsr: &AdsrSettings, sr: f32) -> f32 {
-        let o1 = osc_sample(p.wave, self.phase, self.inc, p.width, &mut self.tri1);
-        self.phase += self.inc;
+        let inc = self.inc * p.vib;
+        let o1 = osc_sample(p.wave, self.phase, inc, p.width, &mut self.tri1);
+        self.phase += inc;
         if self.phase >= 1.0 {
             self.phase -= 1.0;
         }
         // The second oscillator only runs once mixed in; its level fades the
         // normalized sum continuously, so osc2 = 0 is exactly the legacy voice.
         let osc = if p.osc2 > 0.0 {
-            let inc2 = self.inc * p.det;
+            let inc2 = inc * p.det;
             let o2 = osc_sample(p.wave, self.phase2, inc2, p.width, &mut self.tri2);
             self.phase2 += inc2;
             if self.phase2 >= 1.0 {
@@ -212,6 +335,44 @@ impl Voice {
         }
         filtered * env * self.amp
     }
+
+    /// Unison render: N detuned sub-oscillators panned into an L/R pair,
+    /// each side through its own filter (same coefficients). Mono callers
+    /// read only `.0`. Replaces (does not stack with) the osc2 pair. // RT-SAFE
+    fn render_unison(
+        &mut self,
+        p: &OscParams,
+        u: &UnisonParams,
+        white: f32,
+        adsr: &AdsrSettings,
+        sr: f32,
+    ) -> (f32, f32) {
+        let mut l = 0.0;
+        let mut r = 0.0;
+        for k in 0..u.n {
+            let inc = self.inc * p.vib * u.ratios[k];
+            let s = osc_sample(p.wave, self.phases[k], inc, p.width, &mut self.tris[k]);
+            self.phases[k] += inc;
+            if self.phases[k] >= 1.0 {
+                self.phases[k] -= 1.0;
+            }
+            l += s * u.gl[k];
+            r += s * u.gr[k];
+        }
+        l *= u.norm;
+        r *= u.norm;
+        if p.noise > 0.0 {
+            l = l * (1.0 - p.noise) + white * p.noise;
+            r = r * (1.0 - p.noise) + white * p.noise;
+        }
+        let fl = self.filter.process(l);
+        let fr = self.filter2.process(r);
+        let env = self.env.tick(adsr, sr);
+        if !self.env.is_active() {
+            self.active = false;
+        }
+        (fl * env * self.amp, fr * env * self.amp)
+    }
 }
 
 pub struct Subtractive {
@@ -219,6 +380,15 @@ pub struct Subtractive {
     voices: [Voice; VOICES],
     cutoff: OnePole,
     resonance: OnePole,
+    fenv_oct: OnePole,
+    fenv_decay_s: f32,
+    vib_rate: OnePole,
+    vib_depth: OnePole,
+    /// Vibrato LFO phase in turns (0..1), advanced per block.
+    vib_phase: f32,
+    /// Unison sub-oscillator count (1 = off, legacy voice path).
+    unison_n: usize,
+    spread: OnePole,
     level: LinearRamp,
     adsr: AdsrSettings,
     next_age: u64,
@@ -238,6 +408,13 @@ impl Default for Subtractive {
             voices: [Voice::default(); VOICES],
             cutoff: OnePole::new(2000.0, 0.99),
             resonance: OnePole::new(0.7, 0.99),
+            fenv_oct: OnePole::new(0.0, 0.99),
+            fenv_decay_s: 0.2,
+            vib_rate: OnePole::new(5.0, 0.99),
+            vib_depth: OnePole::new(0.0, 0.99),
+            vib_phase: 0.0,
+            unison_n: 1,
+            spread: OnePole::new(12.0, 0.99),
             level: LinearRamp::new(1.0, 10.0, 48_000.0),
             adsr: AdsrSettings::default(),
             next_age: 0,
@@ -264,6 +441,12 @@ impl Subtractive {
         v.active = true;
         v.age = age;
         v.env.note_on();
+        v.fenv_level = 1.0;
+        // Deterministically decorrelated unison phases: an aligned start
+        // would sum to a single loud saw for the first few cycles.
+        for (k, ph) in v.phases.iter_mut().enumerate() {
+            *ph = (k as f32 * 0.618).fract();
+        }
     }
 
     fn note_off(&mut self, pitch: u8) {
@@ -318,35 +501,104 @@ impl AudioNode for Subtractive {
         let sr = self.sample_rate;
         let fc = self.cutoff.advance(frames);
         let q = self.resonance.advance(frames);
+        let unison = self.unison_n.clamp(1, MAX_UNISON);
+        let stereo_unison = unison > 1 && io.channels() > 1;
+        let fenv_oct = self.fenv_oct.advance(frames);
+        // Per-voice cutoff, block-rate like the cutoff glide: the filter
+        // envelope opens `fenv_oct` octaves at note-on and closes
+        // exponentially; at 0 this is the legacy static filter exactly.
+        let close = (-(frames as f32) / (self.fenv_decay_s * sr)).exp();
         for v in &mut self.voices {
-            if v.active {
-                v.filter.set_lowpass(fc, q, sr);
+            if !v.active {
+                continue;
+            }
+            let fc_v = if fenv_oct != 0.0 {
+                let f = (fc * (fenv_oct * v.fenv_level).exp2()).clamp(20.0, 20_000.0);
+                v.fenv_level = flush(v.fenv_level * close);
+                f
+            } else {
+                fc
+            };
+            v.filter.set_lowpass(fc_v, q, sr);
+            if stereo_unison {
+                v.filter2.set_lowpass(fc_v, q, sr);
             }
         }
         // Oscillator settings once per block; det converts cents → freq ratio.
+        // The vibrato multiplier is sampled once per block (5.3 ms at 256):
+        // a staircase inaudible at ≤ 12 Hz / 100 ct.
+        let vib_depth = self.vib_depth.advance(frames);
+        let vib_rate = self.vib_rate.advance(frames);
+        let vib = if vib_depth > 0.0 {
+            let m = (vib_depth * (core::f32::consts::TAU * self.vib_phase).sin() / 1200.0).exp2();
+            self.vib_phase = (self.vib_phase + vib_rate * frames as f32 / sr).fract();
+            m
+        } else {
+            1.0
+        };
         let osc = OscParams {
             wave: self.wave_idx,
             width: self.width.advance(frames),
             noise: self.noise.advance(frames),
             osc2: self.osc2.advance(frames),
             det: (self.detune.advance(frames) / 1200.0).exp2(),
+            vib,
         };
 
-        let out = io.output(0);
-        for slot in out.iter_mut() {
-            let level = self.level.tick();
-            // One noise source per frame, enveloped per voice (a shared VCA'd
-            // noise bed — cheaper than a generator per voice, same sound).
-            let white = next_white(&mut self.rng);
-            let mut sum = 0.0;
-            for v in &mut self.voices {
-                if v.active {
-                    sum += v.render(&osc, white, &self.adsr, sr);
+        if unison > 1 {
+            let uni = UnisonParams::build(unison, self.spread.advance(frames), stereo_unison);
+            if stereo_unison {
+                for i in 0..frames {
+                    let level = self.level.tick();
+                    let white = next_white(&mut self.rng);
+                    let mut sum_l = 0.0;
+                    let mut sum_r = 0.0;
+                    for v in &mut self.voices {
+                        if v.active {
+                            let (l, r) = v.render_unison(&osc, &uni, white, &self.adsr, sr);
+                            sum_l += l;
+                            sum_r += r;
+                        }
+                    }
+                    io.output_ch(0, 0)[i] = sum_l * level;
+                    io.output_ch(0, 1)[i] = sum_r * level;
+                    for ch in 2..io.channels() {
+                        let left = io.output_ch(0, 0)[i];
+                        io.output_ch(0, ch)[i] = left;
+                    }
                 }
+            } else {
+                let out = io.output(0);
+                for slot in out.iter_mut() {
+                    let level = self.level.tick();
+                    let white = next_white(&mut self.rng);
+                    let mut sum = 0.0;
+                    for v in &mut self.voices {
+                        if v.active {
+                            sum += v.render_unison(&osc, &uni, white, &self.adsr, sr).0;
+                        }
+                    }
+                    *slot = sum * level;
+                }
+                io.spread_output(0);
             }
-            *slot = sum * level;
+        } else {
+            let out = io.output(0);
+            for slot in out.iter_mut() {
+                let level = self.level.tick();
+                // One noise source per frame, enveloped per voice (a shared
+                // VCA'd noise bed — cheaper than one generator per voice).
+                let white = next_white(&mut self.rng);
+                let mut sum = 0.0;
+                for v in &mut self.voices {
+                    if v.active {
+                        sum += v.render(&osc, white, &self.adsr, sr);
+                    }
+                }
+                *slot = sum * level;
+            }
+            io.spread_output(0);
         }
-        io.spread_output(0);
     }
 
     fn ports(&self) -> PortSpec {
@@ -381,6 +633,12 @@ impl AudioNode for Subtractive {
             P_NOISE => self.noise.set_target(real),
             P_OSC2 => self.osc2.set_target(real),
             P_DETUNE => self.detune.set_target(real),
+            P_FENV => self.fenv_oct.set_target(real),
+            P_FENV_DECAY => self.fenv_decay_s = real / 1000.0,
+            P_VIB_RATE => self.vib_rate.set_target(real),
+            P_VIB_DEPTH => self.vib_depth.set_target(real),
+            P_UNISON => self.unison_n = (real.round() as usize).clamp(1, MAX_UNISON),
+            P_SPREAD => self.spread.set_target(real),
             _ => {}
         }
     }
@@ -398,6 +656,13 @@ impl AudioNode for Subtractive {
         let coef = (-1.0 / (SMOOTH_S * sample_rate)).exp();
         self.cutoff = OnePole::new(default_real(P_CUTOFF), coef);
         self.resonance = OnePole::new(default_real(P_RESONANCE), coef);
+        self.fenv_oct = OnePole::new(default_real(P_FENV), coef);
+        self.fenv_decay_s = default_real(P_FENV_DECAY) / 1000.0;
+        self.vib_rate = OnePole::new(default_real(P_VIB_RATE), coef);
+        self.vib_depth = OnePole::new(default_real(P_VIB_DEPTH), coef);
+        self.vib_phase = 0.0;
+        self.unison_n = default_real(P_UNISON).round() as usize;
+        self.spread = OnePole::new(default_real(P_SPREAD), coef);
         self.level = LinearRamp::new(default_real(P_LEVEL), 10.0, sample_rate);
         self.adsr = AdsrSettings {
             attack_s: default_real(P_ATTACK) / 1000.0,
@@ -487,6 +752,7 @@ mod tests {
             frames,
             channels: 1,
             samples_per_beat: 0.0,
+            beat_phase: 0.0,
         };
         let mut io = NodeIo::new(notes, &[], out, frames, 1);
         s.process(&ctx, &mut io);
@@ -590,6 +856,230 @@ mod tests {
             .map(|w| (w[1] - w[0]).abs())
             .fold(0.0f32, f32::max);
         assert!(max_delta < 0.2, "release click, max delta {max_delta}");
+    }
+
+    #[test]
+    fn filter_env_zero_ignores_the_decay_setting() {
+        // fenv = 0 must stay the exact legacy static-filter path: the decay
+        // knob alone changes nothing.
+        let on = [NoteEvent {
+            frame: 0,
+            kind: NoteKind::On {
+                pitch: 36,
+                vel: 110,
+            },
+        }];
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        let mut s = synth();
+        s.set_param(P_FENV_DECAY, 0.0);
+        render_notes(&mut s, &on, 8192, &mut a);
+        let mut s = synth();
+        s.set_param(P_FENV_DECAY, 1.0);
+        render_notes(&mut s, &on, 8192, &mut b);
+        assert_eq!(a, b, "fenv 0 must ignore fenv_decay entirely");
+    }
+
+    /// Goertzel magnitude over a window of the buffer.
+    fn mag_win(buf: &[f32], from: usize, len: usize, freq: f32, sr: f32) -> f32 {
+        mag_at(&buf[from..from + len], freq, sr)
+    }
+
+    /// Render in engine-sized blocks (256): block-rate behaviour (filter
+    /// envelope, glides) advances as it does live — a single giant block
+    /// would freeze the per-block state at its first value.
+    fn render_chunked(s: &mut Subtractive, notes: &[NoteEvent], frames: usize, out: &mut Vec<f32>) {
+        out.clear();
+        let mut chunk = Vec::new();
+        let mut done = 0;
+        while done < frames {
+            let n = 256.min(frames - done);
+            render_notes(s, if done == 0 { notes } else { &[] }, n, &mut chunk);
+            out.extend_from_slice(&chunk);
+            done += n;
+        }
+    }
+
+    #[test]
+    fn filter_env_brightens_the_attack_then_closes() {
+        // Low saw, filter at 150 Hz, envelope +3 octaves closing over 100 ms:
+        // a high harmonic must be loud in the attack window and gone from the
+        // sustain — the bright-attack / dark-sustain plume.
+        let mut s = synth();
+        set_real(&mut s, P_CUTOFF, 150.0);
+        set_real(&mut s, P_FENV, 3.0);
+        set_real(&mut s, P_FENV_DECAY, 100.0);
+        s.set_param(P_ATTACK, 0.0);
+        let on = [NoteEvent {
+            frame: 0,
+            kind: NoteKind::On {
+                pitch: 36, // C2, 65.4 Hz
+                vel: 110,
+            },
+        }];
+        let mut buf = Vec::new();
+        render_chunked(&mut s, &on, 48_000, &mut buf);
+        let f0 = midi_to_freq(36);
+        let h8 = f0 * 8.0; // 523 Hz: above the 150 Hz base, under the opened peak
+        let attack = mag_win(&buf, 0, 2400, h8, 48_000.0);
+        let sustain = mag_win(&buf, 24_000, 2400, h8, 48_000.0);
+        assert!(
+            attack > sustain * 4.0,
+            "h8 attack {attack} vs sustain {sustain}: the envelope did not close"
+        );
+        let h1_sustain = mag_win(&buf, 24_000, 2400, f0, 48_000.0);
+        assert!(h1_sustain > 0.01, "fundamental vanished from the sustain");
+    }
+
+    #[test]
+    fn vibrato_zero_ignores_the_rate_setting() {
+        let on = [NoteEvent {
+            frame: 0,
+            kind: NoteKind::On {
+                pitch: 69,
+                vel: 110,
+            },
+        }];
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        let mut s = synth();
+        s.set_param(P_VIB_RATE, 0.0);
+        render_chunked(&mut s, &on, 8192, &mut a);
+        let mut s = synth();
+        s.set_param(P_VIB_RATE, 1.0);
+        render_chunked(&mut s, &on, 8192, &mut b);
+        assert_eq!(a, b, "vib_depth 0 must ignore vib_rate entirely");
+    }
+
+    #[test]
+    fn vibrato_wobbles_the_pitch() {
+        let mut s = synth();
+        s.set_param(P_CUTOFF, 1.0); // wide open: give YIN a clean waveform
+        set_real(&mut s, P_VIB_RATE, 2.0);
+        set_real(&mut s, P_VIB_DEPTH, 50.0);
+        let on = [NoteEvent {
+            frame: 0,
+            kind: NoteKind::On {
+                pitch: 69, // A4
+                vel: 110,
+            },
+        }];
+        let mut buf = Vec::new();
+        render_chunked(&mut s, &on, 48_000, &mut buf);
+        // f0 over sliding 50 ms windows: ±50 ct peak depth reads as ≥ 3 %
+        // total excursion even with window averaging.
+        let (mut lo, mut hi) = (f32::MAX, 0.0f32);
+        for start in (4800..43_200).step_by(2400) {
+            if let Some(f0) = crate::analysis::pitch::estimate_f0(&buf[start..start + 2400], 48_000)
+            {
+                lo = lo.min(f0.hz);
+                hi = hi.max(f0.hz);
+            }
+        }
+        assert!(hi > 0.0 && lo < f32::MAX, "no pitch detected");
+        let span = (hi - lo) / 440.0;
+        assert!(span > 0.03, "vibrato span {span} too small ({lo}..{hi} Hz)");
+    }
+
+    /// Stereo chunked render: `out` holds [ch0.., ch1..] per 256-frame block,
+    /// re-flattened to two contiguous channels on return.
+    fn render_stereo_chunked(
+        s: &mut Subtractive,
+        notes: &[NoteEvent],
+        frames: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let mut left = Vec::with_capacity(frames);
+        let mut right = Vec::with_capacity(frames);
+        let mut out = vec![0.0f32; 2 * 256];
+        let mut done = 0;
+        while done < frames {
+            let n = 256.min(frames - done);
+            out.resize(2 * n, 0.0);
+            let ctx = ProcessCtx {
+                sample_rate: 48_000.0,
+                frames: n,
+                channels: 2,
+                samples_per_beat: 0.0,
+                beat_phase: 0.0,
+            };
+            let evs = if done == 0 { notes } else { &[] };
+            let mut io = NodeIo::new(evs, &[], &mut out, n, 2);
+            s.process(&ctx, &mut io);
+            left.extend_from_slice(&out[..n]);
+            right.extend_from_slice(&out[n..2 * n]);
+            done += n;
+        }
+        (left, right)
+    }
+
+    #[test]
+    fn unison_one_ignores_the_spread_setting() {
+        let on = [NoteEvent {
+            frame: 0,
+            kind: NoteKind::On {
+                pitch: 57,
+                vel: 110,
+            },
+        }];
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        let mut s = synth();
+        s.set_param(P_SPREAD, 0.0);
+        render_chunked(&mut s, &on, 8192, &mut a);
+        let mut s = synth();
+        s.set_param(P_SPREAD, 1.0);
+        render_chunked(&mut s, &on, 8192, &mut b);
+        assert_eq!(a, b, "unison 1 must ignore spread entirely");
+    }
+
+    #[test]
+    fn unison_widens_and_thickens() {
+        let mut s = synth();
+        s.set_param(P_CUTOFF, 1.0);
+        set_real(&mut s, P_UNISON, 5.0);
+        set_real(&mut s, P_SPREAD, 30.0);
+        let on = [NoteEvent {
+            frame: 0,
+            kind: NoteKind::On {
+                pitch: 57, // A3
+                vel: 110,
+            },
+        }];
+        let (l, r) = render_stereo_chunked(&mut s, &on, 24_000);
+        let corr = crate::analysis::levels::stereo_correlation(&l, &r);
+        assert!(
+            corr < 0.95,
+            "unison spread left the image mono (correlation {corr})"
+        );
+        assert!(corr > -0.5, "channels out of phase (correlation {corr})");
+        // Both sides carry signal, and no clicks slip through the detune sum.
+        let peak_r = r.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        assert!(peak_r > 0.02, "right channel silent, peak {peak_r}");
+        let clicks = crate::analysis::levels::detect_clicks(&l, 48_000);
+        assert!(clicks.is_empty(), "unison clicked: {clicks:?}");
+    }
+
+    #[test]
+    fn filter_env_sweep_is_click_free() {
+        let mut s = synth();
+        set_real(&mut s, P_CUTOFF, 200.0);
+        set_real(&mut s, P_FENV, 3.5);
+        set_real(&mut s, P_FENV_DECAY, 80.0);
+        let mut out = Vec::new();
+        let mut chunk = Vec::new();
+        for i in 0..8 {
+            let on = [NoteEvent {
+                frame: 0,
+                kind: NoteKind::On {
+                    pitch: 36 + (i % 3) * 12,
+                    vel: 110,
+                },
+            }];
+            render_chunked(&mut s, &on, 6000, &mut chunk);
+            out.extend_from_slice(&chunk);
+        }
+        let clicks = crate::analysis::levels::detect_clicks(&out, 48_000);
+        assert!(clicks.is_empty(), "filter env clicked: {clicks:?}");
     }
 
     /// Single-bin DFT magnitude (Goertzel-style), normalized by length.

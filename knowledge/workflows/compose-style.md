@@ -37,12 +37,63 @@ ratée). Usage :
   exposé** (intro/break, `--start-s`/`--dur-s`) ; grille rigide (tempo
   constant), `raw_s`/`quant_error_ticks` exposent la dérive.
 
+## 1 ter. Séparer les stems des références (préprocessing externe)
+
+Les outils maison comparent mal un stem à un mix complet (bandes relatives,
+transcription batterie polluée par la basse). Solution : séparer les
+références en stems UNE fois, hors app — même statut que la conversion VLC
+d'un MP3, jamais une dépendance du cœur. Demucs vit dans un venv dédié :
+
+```
+%USERPROFILE%\.telenn\demucs-venv\Scripts\demucs.exe -o <dossier> <réf.wav> […]
+```
+
+Sortie : `<dossier>/htdemucs/<titre>/{bass,drums,other,vocals}.wav`
+(CPU ~1.5× temps réel). Ensuite : `analyze_wav`/`transcribe` sur le stem
+`bass` (f0, enveloppe, timbre réels), `transcribe` sur `drums` (pattern sans
+la limite kick/basse), `reference_match` stem contre piste solo du rendu
+(diff de timbre enfin comparable), extraits cibles propres pour
+l'appariement de sons. Les stems restent hors repo (fichiers dérivés
+d'œuvres protégées : analyse privée uniquement, ne jamais les committer ni
+les échantillonner dans une composition).
+
+Limites constatées à l'oreille (2026-07-16, stems Mareux) : `other` est le
+meilleur stem — mélodie principale/lead bien isolée avec quelques sons
+parasites (ex. le lead de LFTP net sur `other` 2:15-3:00) ; les **voix sont
+la plupart du temps perdues** (pas captées du tout) et, quand elles le sont,
+elles atterrissent bien dans `vocals` — cas piège : sur Summertime la
+mélodie principale est partie dans `vocals` (le séparateur l'a prise pour
+une voix — vérifier les deux stems pour trouver le lead) ; `drums` est bien
+isolé ; le stem `bass` sonne dégradé (artefacts « sous-marins ») — bon pour
+la **structure** (enveloppe, grille, registre, répartition d'énergie), pas
+comme cible de timbre fine sans recouper avec la bande grave du mix.
+
 ## 2. Analyse d'écart (sons)
 
 Lister les rôles requis par la fiche (basse, lead, batterie…) et regarder
 dans `knowledge/sounds/` (via INDEX) ce qui existe. Chaque son manquant passe
 par le workflow sound-design **avant** de composer ; les presets validés se
 copient dans `projects/<p>/presets/`.
+
+## 2 bis. Sources échantillonnées (quand le moteur ne suffit pas)
+
+Un timbre acoustique (guitare, piano, cuivre) coûte cher à synthétiser et
+n'apporte rien au moteur. Le module `sampler` le couvre : une banque SF2
+libre (ex. **GeneralUser GS**, `~/.telenn/soundfonts/`) rendue en zones WAV,
+une par note racine tous les 3-4 demi-tons, dans `projects/<p>/samples/<nom>/`
+(`sf2_zones.py` : audition **par la mesure** — attaque, sustain à 1 s,
+centroïde — puis rendu). Le module `drum_sampler` prend de la même façon un
+répertoire `kit` d'one-shots. Règles :
+
+- la banque et les samples restent **hors dépôt** (`projects/` est gitignoré) ;
+  la fiche de style note quel preset a été retenu et pourquoi, pas le binaire ;
+- le caractère vient de la **chaîne** (ampsim, chorus, delay, reverb), pas du
+  sample brut — un preset GM nu sonne GM ;
+- un one-shot qui manque de corps se **synthétise** plutôt que se remplacer
+  (cf. le kick sub de la fiche Mareux) ; on le règle sur un profil mesuré
+  (glissando, décroissance, parts de bandes), jamais à l'oreille seule ;
+- ne jamais échantillonner une référence protégée — les stems servent de
+  **cible de mesure**, pas de matière première.
 
 ## 3. Composer dans `song.json`
 

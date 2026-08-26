@@ -4,6 +4,63 @@ Journal daté, du plus récent au plus ancien. Format : `## AAAA-MM-JJ — titre
 puis contexte, mesure (commande exacte), conclusion. Les impasses se
 consignent au même titre que les réussites.
 
+## 2026-07-25 — Saturer du grave asymétrique fabrique du DC (mettre un HP derrière)
+
+Mareux v3 : le mix sortait avec `dc +0.0078` (DEFECT) alors qu'aucune source
+n'en avait. Autopsie : le `subtractive` à nu est propre (dc −0.00018) ; dès
+qu'un saturateur est derrière, l'offset apparaît et **croît avec le drive**
+(drive 6 → +0.0009, 8 → +0.0034, 10 → +0.0061, 12 → +0.0175). Le shaper est
+pourtant un `tanh` symétrique : c'est le **signal** qui est asymétrique (une
+scie filtrée bas avec résonance n'a pas la même excursion des deux côtés), et
+un shaper symétrique compresse davantage la plus grande excursion → moyenne
+non nulle. Le coupable final n'était pas la basse (son HP 25 Hz local marchait)
+mais le **saturateur du master**, qui refabrique du DC sur le mix entier.
+Règle : après **chaque** étage de saturation traversé par du grave, un
+passe-haut 20-25 Hz (le condensateur de liaison de l'analogique). Coût
+mesuré : nul (dc −0.000003, aucune perte de sub audible à 34 Hz).
+
+## 2026-07-25 — Une ligne en pédale ne peut pas passer le plancher de nouveauté
+
+`song_stats` sur mareux-v3 : la basse sort à 0.88 d'une basse de référence
+quand le plancher inter-références vaut 0.97, et la garde signale « 21
+intervalles partagés en ignorant le rythme ». Ces 21 intervalles sont… des
+`+0` : les deux lignes tiennent une pédale en croches. Le détecteur de runs
+compte une suite de notes répétées comme un motif partagé, donc **toute
+basse-pédale du genre échouera contre toute autre basse-pédale**. Deux
+conséquences : (1) lire un WARN de run en regardant les `steps` du rapport —
+une suite de `+0` est de la grammaire, pas une citation ; (2) ce qui fait
+vraiment baisser la distance, ce sont les **figures** (levée à l'octave, 5te,
+b7, approche chromatique) et un **motif rythmique par section** — ajoutés en
+v3, ils ont fait tomber le DEFECT de la guitare doublée (0.50 → 1.00) sans
+changer le caractère. Piste outil : ignorer les runs dont tous les intervalles
+sont nuls, ou les pondérer par l'entropie du motif.
+
+## 2026-07-25 — Compresser le master efface la structure du morceau
+
+Le morceau semblait « plat » : mesuré section par section (RMS sur 4 mesures),
+intro −13.7, refrain −13.1, break −14.7 — 0,6 dB entre l'intro dépouillée
+(basse + hats) et le refrain complet. Cause : le compresseur master à
+threshold −25 / makeup +7 (réglé pour la densité) ramenait tout au même
+niveau. Réglé à −14 / ratio 2.5 / makeup +1.5, le même arrangement respire :
+intro −13.5, refrains −12.0, break −15.4, C −11.9. Leçon : le crest cible de
+la fiche (11-13 dB) se règle **sans** écraser la dynamique de forme — vérifier
+toute compression master par un RMS par section, pas seulement par le crest
+global (le crest, lui, ne bougeait presque pas : 12.2 → 13.1).
+
+## 2026-07-16 — Scie sub à nu : le premier front lit comme un clic
+
+Mareux v2.1, basse saw do#1 (34,6 Hz, période 29 ms) seule sur la mesure 1 :
+`render_probe --song` flagge « 1 clic à 0.029 s, jump 0.12 ». Ce n'est pas
+l'enveloppe (attaque 3 → 8 ms : inchangé) : c'est le **premier front de
+scie**, une période après le départ — les deux fenêtres avant du détecteur
+(2/25 ms) sont plus courtes que la période, donc « rien ne suit » = glitch.
+Seul le premier front flagge (les suivants baignent dans le signal). En v2
+le kick à t=0 le masquait ; à do#2 (14,5 ms de période) le cas n'existe pas.
+Correctif musical, pas de détecteur : ne jamais démarrer un morceau sur une
+scie sub à plein niveau depuis le silence — fondu de vélocité sur la
+première mesure (56 → 91), cohérent avec les intros du genre qui
+s'installent. Clic éteint, son inchangé passé la mesure 1.
+
 ## 2026-07-14 — Compresser un bus de drums : l'attaque décide si le crest monte ou descend
 
 Mix mareux-test, cible crest 11-13 dB. Compressor sur

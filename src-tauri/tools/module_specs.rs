@@ -28,7 +28,18 @@ const QUIRKS: &str = "\
 - **drum_sampler**: fixed pitch map — 36 kick, 38 snare, 39 clap,
   42 closed_hat, 45 low_tom, 46 open_hat, 49 crash, 50 hi_tom. Any other
   pitch is SILENT. Note-offs are ignored (one-shots); retrigger restarts the
-  sample. `level` is the only param whose max exceeds 0 dB (+6).
+  sample. `level` is the only param whose max exceeds 0 dB (+6). Config key
+  `kit` (song.json `config` map) points at a directory of real one-shots by
+  slot name (`kick.wav`, `snare.wav`, `clap.wav`, `closed_hat.wav`,
+  `open_hat.wav`, `low_tom.wav`, `hi_tom.wav`, `crash.wav`; project-relative
+  paths OK); a missing file keeps that slot's embedded synthetic sound.
+- **sampler**: content-driven — SILENT until config key `zones` names a
+  directory of WAV zones, one per root note, stem = MIDI number (`048.wav`)
+  or note name (`c3.wav`, `f#2.wav`; C4 = 60). A note picks the NEAREST
+  root and repitches by the semitone ratio (no sustain loop: pick sources
+  longer than your notes; too-far repitches sound chipmunky past ~5 st).
+  ADSR shapes the raw sample (sustain default 1.0 = play as recorded);
+  note-offs enter `release` like a synth.
 - **subtractive**: `wave` is a rounded selector — 0 saw, 1 pulse, 2 triangle.
   `width` only shapes the pulse (0.5 = square, odd harmonics only; narrower
   adds even harmonics; DC compensated internally). `noise` crossfades the
@@ -36,7 +47,13 @@ const QUIRKS: &str = "\
   `osc2` mixes a second oscillator detuned by `detune` cents (normalized sum,
   0 = bit-identical legacy voice); expect level beating — that is the point.
   Switching `wave` on a sounding voice swaps the waveform instantly (can
-  click); the other new params glide.
+  click); the other new params glide. `fenv` (octaves, ±) opens the cutoff
+  at note-on and closes it over `fenv_decay` — THE bright-attack/dark-sustain
+  synth-bass shape (0 = legacy static filter). `vib_rate`/`vib_depth` is a
+  module-wide pitch LFO (block-rate; depth 0 = off). `unison` (1-7) fans
+  detuned sub-oscillators ±`spread` cents across the stereo field
+  (constant-power pan, 1/√N normalized); when unison > 1 the osc2/detune
+  pair is IGNORED (unison replaces it), 1 = legacy voice exactly.
 - **fm**: `ratio` = modulator/carrier frequency ratio — integer ratios give
   harmonic tones, non-integer give inharmonic/bell timbres. `index` =
   modulation depth (radians): more index, brighter and noisier spectrum.
@@ -58,6 +75,7 @@ const QUIRKS: &str = "\
   at note-on): high notes legitimately lose upper harmonics instead of
   aliasing. `pos_env` pushes the position ± during the note (own
   `pos_decay`, settles back to the knob) — the travelling-spectrum control.
+  `vib_rate`/`vib_depth`: same module-wide pitch LFO as the subtractive.
 - **plucked**: `brightness` below ~0.3 lets a DC offset build up in the
   loop (measured -0.013 at 0.1) and skews centroid readings — stay >= 0.3.
   `release` gates the string: for a freely ringing tine set it to the max
@@ -75,10 +93,10 @@ const QUIRKS: &str = "\
   before `level`), so loudness RISES with drive — trim with `level`. `tone`
   is a post-shaper lowpass taming the added highs. Crest factor drops as
   drive rises (a saturated sine squares up).
-- **chorus**: mono (two modulated taps around 15 ms, decorrelated LFOs) —
-  it thickens and animates but does not widen until the stereo seam lands.
-  Full `mix` on a steady tone audibly pumps at the LFO rate (comb movement):
-  0.2-0.5 is the musical zone.
+- **chorus**: two modulated taps around 15 ms, decorrelated LFOs — tap 0
+  feeds the left channel, tap 1 the right (stereo widening since the stereo
+  seam; a mono render folds back to the legacy sum). Full `mix` on a steady
+  tone audibly pumps at the LFO rate (comb movement): 0.2-0.5 is the zone.
 - **compressor**: `threshold` is declared `curve: linear` with unit dB ON
   PURPOSE — the gain computer consumes the dB number itself (normalize/
   denormalize stay a plain ramp over -60..0 dB), unlike `makeup`/`level`
@@ -86,6 +104,21 @@ const QUIRKS: &str = "\
 - **delay**: `feedback` is capped at 0.9 by design so the loop always
   decays; `time` is free-running milliseconds unless `sync` > 0 (rounded
   selector: off, 1/16, 1/8, 1/8., 1/4, 1/4., 1/2, 1/1 of a beat).
+- **reverb**: `gate` (0 = off) is a threshold on the DRY input — the wet
+  opens with a hit and slams shut 120 ms after the input drops (8 ms close
+  ramp): the 80s gated-snare. Tails are truncated by design when it is on.
+- **eq**: three bands in series — low shelf fixed at 120 Hz, mid peaking at
+  `mid_freq` (Q 0.9), high shelf fixed at 6 kHz. All gains at 0 dB is a
+  pass-through.
+- **ampsim**: two nonlinear stages (preamp tanh driven by `drive`, then a
+  BIASED power stage adding even harmonics) around a bass/mid/treble tone
+  stack (250 Hz / 800 Hz / 3 kHz), into a fixed cabinet (90 Hz - 5.5 kHz).
+  Unlike the saturator it produces h2 AND h3 — the \"amp\" warmth. Loudness
+  rises fast with drive: trim with `level`.
+- **ducker**: tempo-synced gain dip (`rate` rounded selector — 0 every
+  beat, 1 every eighth, 2 every half note) recovering over `release` — the
+  sidechain-pump WITHOUT routing. Needs the transport grid: without a tempo
+  (stopped, probes) it passes dry. Dip is 5 ms; depth 0 = bypass.
 - **Loop & export**: the loop length is the content end rounded UP to a
   whole bar; the metronome is monitoring-only and never rendered/exported.
 ";

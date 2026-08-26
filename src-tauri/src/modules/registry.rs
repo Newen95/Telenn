@@ -8,15 +8,19 @@ use serde::Serialize;
 
 use crate::engine::node::AudioNode;
 use crate::modules::_template::Gain;
+use crate::modules::ampsim::AmpSim;
 use crate::modules::chorus::Chorus;
 use crate::modules::compressor::Compressor;
 use crate::modules::delay::Delay;
 use crate::modules::drum_sampler::DrumSampler;
+use crate::modules::ducker::Ducker;
+use crate::modules::eq::Eq;
 use crate::modules::filter::Filter;
 use crate::modules::fm::Fm;
 use crate::modules::modal::Modal;
 use crate::modules::plucked::Plucked;
 use crate::modules::reverb::Reverb;
+use crate::modules::sampler::Sampler;
 use crate::modules::saturator::Saturator;
 use crate::modules::subtractive::Subtractive;
 use crate::modules::wavetable::Wavetable;
@@ -75,6 +79,11 @@ const MODULES: &[ModuleDesc] = &[
         category: ModuleCategory::Instrument,
     },
     ModuleDesc {
+        id: "sampler",
+        name: "Sampler",
+        category: ModuleCategory::Instrument,
+    },
+    ModuleDesc {
         id: "gain",
         name: "Gain",
         category: ModuleCategory::Effect,
@@ -109,6 +118,21 @@ const MODULES: &[ModuleDesc] = &[
         name: "Compressor",
         category: ModuleCategory::Effect,
     },
+    ModuleDesc {
+        id: "eq",
+        name: "EQ",
+        category: ModuleCategory::Effect,
+    },
+    ModuleDesc {
+        id: "ampsim",
+        name: "Amp Sim",
+        category: ModuleCategory::Effect,
+    },
+    ModuleDesc {
+        id: "ducker",
+        name: "Ducker",
+        category: ModuleCategory::Effect,
+    },
 ];
 
 fn boxed<N: AudioNode + Default + 'static>() -> Box<dyn AudioNode> {
@@ -129,6 +153,7 @@ pub fn create(module_id: &str) -> Option<Box<dyn AudioNode>> {
         "wavetable" => Some(boxed::<Wavetable>()),
         "modal" => Some(boxed::<Modal>()),
         "drum_sampler" => Some(boxed::<DrumSampler>()),
+        "sampler" => Some(boxed::<Sampler>()),
         "gain" => Some(boxed::<Gain>()),
         "filter" => Some(boxed::<Filter>()),
         "delay" => Some(boxed::<Delay>()),
@@ -136,6 +161,9 @@ pub fn create(module_id: &str) -> Option<Box<dyn AudioNode>> {
         "chorus" => Some(boxed::<Chorus>()),
         "saturator" => Some(boxed::<Saturator>()),
         "compressor" => Some(boxed::<Compressor>()),
+        "eq" => Some(boxed::<Eq>()),
+        "ampsim" => Some(boxed::<AmpSim>()),
+        "ducker" => Some(boxed::<Ducker>()),
         _ => None,
     }
 }

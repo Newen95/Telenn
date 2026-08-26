@@ -3,17 +3,25 @@
 //! and embedded at compile time (`include_bytes!`), so the module ships its content
 //! with no runtime file lookup.
 //!
-//! `prepare` decodes the WAVs (allocation off the audio thread); `process` is
-//! RT-SAFE — it only reads the pre-decoded buffers and advances playheads. A new
-//! hit on a slot retriggers it from the start; distinct slots play at once.
+//! A real kit can replace the embedded one per instance: config key `kit` names
+//! a directory (project-relative) holding WAVs by slot name (`kick.wav`,
+//! `snare.wav`, `clap.wav`, `closed_hat.wav`, `open_hat.wav`, `low_tom.wav`,
+//! `hi_tom.wav`, `crash.wav`). Missing or unreadable files keep their embedded
+//! sound, so partial kits work.
+//!
+//! `configure`/`prepare` decode the WAVs (allocation off the audio thread);
+//! `process` is RT-SAFE — it only reads the pre-decoded buffers and advances
+//! playheads. A new hit on a slot retriggers it from the start; distinct slots
+//! play at once.
 
-use std::io::Cursor;
+use std::path::Path;
 
 use crate::engine::node::{
     AudioNode, NodeIo, NoteKind, ParamCurve, ParamId, ParamSpec, Port, PortSpec, ProcessCtx,
     SignalKind,
 };
 use crate::engine::params::LinearRamp;
+use crate::modules::wav;
 
 const P_LEVEL: ParamId = 0;
 
@@ -40,11 +48,25 @@ const KIT: [(u8, &[u8]); 8] = [
     (49, include_bytes!("../../assets/drumkit/crash.wav")),
 ];
 
+/// File names a `kit` config directory is probed for, in [`KIT`] slot order.
+const SLOT_FILES: [&str; 8] = [
+    "kick.wav",
+    "snare.wav",
+    "clap.wav",
+    "closed_hat.wav",
+    "open_hat.wav",
+    "low_tom.wav",
+    "hi_tom.wav",
+    "crash.wav",
+];
+
 /// One kit slot: its trigger pitch, the decoded sample, and a single playhead.
 struct Slot {
     pitch: u8,
     sample: Vec<f32>,
     bytes: &'static [u8],
+    /// File-loaded replacement (`configure`), used over `bytes` when present.
+    loaded: Option<(Vec<f32>, f32)>,
     /// Read position in the sample (fractional, for rate conversion).
     pos: f32,
     /// Samples to advance per output sample (`wav_sr / engine_sr`).
@@ -66,6 +88,7 @@ impl Slot {
             pitch,
             sample: Vec::new(),
             bytes,
+            loaded: None,
             pos: 0.0,
             step: 1.0,
             amp: 0.0,
@@ -188,9 +211,24 @@ impl AudioNode for DrumSampler {
         }
     }
 
+    fn configure(&mut self, config: &[(String, String)], base_dir: &Path) {
+        for (key, value) in config {
+            if key == "kit" {
+                let dir = wav::resolve(base_dir, value);
+                for (slot, file) in self.slots.iter_mut().zip(SLOT_FILES) {
+                    slot.loaded = wav::load_mono(&dir.join(file));
+                }
+            }
+        }
+    }
+
     fn prepare(&mut self, sample_rate: f32, _max_block: usize) {
         for slot in &mut self.slots {
-            let (sample, wav_sr) = decode(slot.bytes);
+            let (sample, wav_sr) = slot
+                .loaded
+                .clone()
+                .or_else(|| wav::decode_mono_bytes(slot.bytes))
+                .unwrap_or((Vec::new(), sample_rate));
             slot.step = wav_sr / sample_rate;
             slot.sample = sample;
             slot.pos = 0.0;
@@ -212,24 +250,6 @@ fn sample_at(buf: &[f32], pos: f32) -> f32 {
     }
     let frac = pos - i as f32;
     buf[i] * (1.0 - frac) + buf[i + 1] * frac
-}
-
-/// Decode an embedded 16-bit PCM WAV into mono `f32` samples and its sample rate.
-/// Off the audio thread (called from `prepare`); a decode error yields an empty
-/// sample so the slot is simply silent rather than panicking.
-fn decode(bytes: &'static [u8]) -> (Vec<f32>, f32) {
-    match hound::WavReader::new(Cursor::new(bytes)) {
-        Ok(mut reader) => {
-            let sr = reader.spec().sample_rate as f32;
-            let sample = reader
-                .samples::<i16>()
-                .filter_map(Result::ok)
-                .map(|s| s as f32 / i16::MAX as f32)
-                .collect();
-            (sample, sr)
-        }
-        Err(_) => (Vec::new(), 48_000.0),
-    }
 }
 
 /// Real default value for a parameter (round-trips through the curve).
@@ -256,6 +276,7 @@ mod tests {
             frames,
             channels: 1,
             samples_per_beat: 0.0,
+            beat_phase: 0.0,
         };
         let mut io = NodeIo::new(notes, &[], out, frames, 1);
         s.process(&ctx, &mut io);
@@ -318,6 +339,40 @@ mod tests {
         render(&mut s, &[hit(36, 110)], 48_000, &mut buf); // 1 s, past the sample
         let tail = peak(&buf[40_000..]);
         assert!(tail < 1.0e-4, "one-shot did not free itself, tail {tail}");
+    }
+
+    #[test]
+    fn kit_config_swaps_a_slot_and_spares_the_rest() {
+        let dir = std::env::temp_dir().join(format!("telenn_kit_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A kick nothing like the embedded one: 50 ms of constant 0.5.
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 48_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut w = hound::WavWriter::create(dir.join("kick.wav"), spec).unwrap();
+        for _ in 0..2400 {
+            w.write_sample((0.5 * i16::MAX as f32) as i16).unwrap();
+        }
+        w.finalize().unwrap();
+
+        let mut s = DrumSampler::default();
+        let config = vec![("kit".to_string(), dir.to_string_lossy().into_owned())];
+        s.configure(&config, std::path::Path::new(""));
+        s.prepare(48_000.0, 256);
+        std::fs::remove_dir_all(&dir).ok();
+
+        let mut buf = Vec::new();
+        render(&mut s, &[hit(36, 127)], 2048, &mut buf);
+        // Well after the 1 ms attack ramp the loaded plateau reads back.
+        let mid = buf[1000];
+        assert!((mid - 0.5).abs() < 0.02, "loaded kick not playing: {mid}");
+        // The snare file was absent: its embedded sample still fires.
+        let mut buf2 = Vec::new();
+        render(&mut s, &[hit(38, 110)], 8192, &mut buf2);
+        assert!(peak(&buf2) > 0.05, "embedded fallback lost");
     }
 
     #[test]

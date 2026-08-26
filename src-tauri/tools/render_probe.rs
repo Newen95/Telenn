@@ -294,6 +294,7 @@ fn build_probe_project(spec: &ProbeSpec) -> Result<(Project, Vec<String>), Strin
             id: module_id.clone(),
             module: module_id.clone(),
             params,
+            config: Default::default(),
         });
     }
 
@@ -322,6 +323,7 @@ fn build_probe_project(spec: &ProbeSpec) -> Result<(Project, Vec<String>), Strin
         time_signature: [4, 4],
         master_gain_db: 0.0,
         master_chain: vec![],
+        base_dir: Default::default(),
         tracks: vec![Track {
             id: "probe".into(),
             name: "probe".into(),

@@ -28,6 +28,10 @@ pub struct NodeDesc {
     /// Initial parameter values, normalized 0..1.
     #[serde(default)]
     pub params: Vec<(ParamId, f32)>,
+    /// Non-parameter setup (sample kit directories, file paths…), passed to
+    /// [`AudioNode::configure`] at build time. Empty for most modules.
+    #[serde(default)]
+    pub config: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -63,6 +67,10 @@ pub struct GraphDesc {
     /// topological walk of `process_block`.
     #[serde(default)]
     pub master: Vec<NodeIdx>,
+    /// Directory node `config` paths resolve against (the project directory).
+    /// Empty when the graph has no file-backed nodes (tests, lint).
+    #[serde(default)]
+    pub base_dir: std::path::PathBuf,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -227,7 +235,13 @@ impl CompiledGraph {
     /// Process one block of `frames` samples (≤ the compiled `max_block`). The
     /// caller routes notes and params beforehand; `samples_per_beat` comes from
     /// the active schedule (0.0 = no tempo known). // RT-SAFE
-    pub fn process_block(&mut self, sample_rate: f32, frames: usize, samples_per_beat: f32) {
+    pub fn process_block(
+        &mut self,
+        sample_rate: f32,
+        frames: usize,
+        samples_per_beat: f32,
+        beat_phase: f32,
+    ) {
         self.last_frames = frames;
         for pos in 0..self.order.len() {
             let node = self.order[pos];
@@ -268,6 +282,7 @@ impl CompiledGraph {
             let out_buf = &mut right[0][..out_len];
             let ctx = ProcessCtx {
                 samples_per_beat,
+                beat_phase,
                 sample_rate,
                 frames,
                 channels: self.channels,
@@ -324,6 +339,7 @@ impl CompiledGraph {
         sample_rate: f32,
         frames: usize,
         samples_per_beat: f32,
+        beat_phase: f32,
     ) {
         if self.master.is_empty() || self.channels < 2 {
             return;
@@ -345,6 +361,7 @@ impl CompiledGraph {
             let out_buf = &mut self.outputs[pos][..port_len];
             let ctx = ProcessCtx {
                 samples_per_beat,
+                beat_phase,
                 sample_rate,
                 frames,
                 channels: self.channels,
@@ -406,6 +423,9 @@ pub fn compile(
     for node_desc in &desc.nodes {
         let mut node = create(&node_desc.module_id)
             .ok_or_else(|| GraphError::UnknownModule(node_desc.module_id.clone()))?;
+        if !node_desc.config.is_empty() {
+            node.configure(&node_desc.config, &desc.base_dir);
+        }
         node.prepare(sample_rate, max_block);
         let ports = node.ports();
         in_counts.push(ports.inputs.len());
@@ -608,11 +628,13 @@ mod tests {
                     id: "src".into(),
                     module_id: "const".into(),
                     params: vec![],
+                    config: vec![],
                 },
                 NodeDesc {
                     id: "fx".into(),
                     module_id: "half".into(),
                     params: vec![],
+                    config: vec![],
                 },
             ],
             connections: vec![Connection {
@@ -625,9 +647,10 @@ mod tests {
             track_mix: vec![],
             master_gain_db: 0.0,
             master: vec![],
+            base_dir: Default::default(),
         };
         let mut g = compile(&desc, create, 48_000.0, 64, 1).expect("compiles");
-        g.process_block(48_000.0, 32, 0.0);
+        g.process_block(48_000.0, 32, 0.0, 0.0);
         // const(1.0) → half(×0.5) = 0.5 on the tail buffer.
         assert!(g.node_output(1).iter().all(|&s| (s - 0.5).abs() < 1e-6));
     }
@@ -641,11 +664,13 @@ mod tests {
                     id: "src".into(),
                     module_id: "const".into(),
                     params: vec![],
+                    config: vec![],
                 },
                 NodeDesc {
                     id: "fx".into(),
                     module_id: "half".into(),
                     params: vec![],
+                    config: vec![],
                 },
             ],
             connections: vec![Connection {
@@ -658,9 +683,10 @@ mod tests {
             track_mix: vec![],
             master_gain_db: 0.0,
             master: vec![],
+            base_dir: Default::default(),
         };
         let mut g = compile(&desc, create, 48_000.0, 64, 1).expect("compiles");
-        g.process_block(48_000.0, 32, 0.0);
+        g.process_block(48_000.0, 32, 0.0, 0.0);
         let m = g.meters();
         assert_eq!(m.len(), 2, "one meter per node");
         // A constant signal: peak == rms == the level.
@@ -679,11 +705,13 @@ mod tests {
                     id: "fx".into(),
                     module_id: "half".into(),
                     params: vec![],
+                    config: vec![],
                 },
                 NodeDesc {
                     id: "src".into(),
                     module_id: "const".into(),
                     params: vec![],
+                    config: vec![],
                 },
             ],
             connections: vec![Connection {
@@ -696,6 +724,7 @@ mod tests {
             track_mix: vec![],
             master_gain_db: 0.0,
             master: vec![],
+            base_dir: Default::default(),
         };
         let g = compile(&desc, create, 48_000.0, 64, 1).expect("compiles");
         // node 1 (const) must come before node 0 (half) in the order.
@@ -712,17 +741,19 @@ mod tests {
                 id: "t".into(),
                 module_id: "tail".into(),
                 params: vec![],
+                config: vec![],
             }],
             connections: vec![],
             tails: vec![0],
             track_mix: vec![],
             master_gain_db: 0.0,
             master: vec![],
+            base_dir: Default::default(),
         };
         // Ring the tail (struck to 1.0 by prepare) well down.
         let mut a = compile(&desc, test_support::create, 48_000.0, 64, 1).expect("compiles");
         for _ in 0..16 {
-            a.process_block(48_000.0, 64, 0.0);
+            a.process_block(48_000.0, 64, 0.0, 0.0);
         }
         let decayed = a.node_output(0)[0];
         assert!(decayed < 0.7, "tail should have decayed: {decayed}");
@@ -731,7 +762,7 @@ mod tests {
         // live node must carry the decayed state instead of restarting at 1.0.
         let mut b = compile(&desc, test_support::create, 48_000.0, 64, 1).expect("compiles");
         b.adopt_nodes_from(&mut a);
-        b.process_block(48_000.0, 64, 0.0);
+        b.process_block(48_000.0, 64, 0.0, 0.0);
         assert!(
             b.node_output(0)[0] <= decayed,
             "live state was not moved into the new graph: {}",
@@ -751,11 +782,13 @@ mod tests {
                     id: "t".into(),
                     module_id: "tail".into(),
                     params: vec![],
+                    config: vec![],
                 },
                 NodeDesc {
                     id: "fx".into(),
                     module_id: "filter".into(),
                     params: vec![],
+                    config: vec![],
                 },
             ],
             connections: vec![Connection {
@@ -768,6 +801,7 @@ mod tests {
             track_mix: vec![],
             master_gain_db: 0.0,
             master: vec![],
+            base_dir: Default::default(),
         };
         let total = 480 * 8;
         let run = |block: usize| {
@@ -777,7 +811,7 @@ mod tests {
             let mut done = 0usize;
             while done < total {
                 let frames = block.min(total - done);
-                g.process_block(48_000.0, frames, 0.0);
+                g.process_block(48_000.0, frames, 0.0, 0.0);
                 left.extend_from_slice(g.node_output_ch(1, 0));
                 right.extend_from_slice(g.node_output_ch(1, 1));
                 done += frames;
@@ -800,14 +834,39 @@ mod tests {
         use crate::engine::node::{NoteEvent, NoteKind};
         use crate::engine::swap::test_support;
         use crate::modules::registry::{self, ModuleCategory};
+
+        // The sampler is content-driven: hand it a one-zone kit so the sweep
+        // exercises the `config` path through `compile` too.
+        let zone_dir = std::env::temp_dir().join(format!("telenn_sweep_{}", std::process::id()));
+        std::fs::create_dir_all(&zone_dir).expect("temp zone dir");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 48_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut w = hound::WavWriter::create(zone_dir.join("036.wav"), spec).expect("zone wav");
+        for i in 0..9600 {
+            let x = (std::f32::consts::TAU * 110.0 * i as f32 / 48_000.0).sin();
+            w.write_sample((x * 0.8 * i16::MAX as f32) as i16)
+                .expect("zone sample");
+        }
+        w.finalize().expect("zone finalize");
+
         for desc in registry::list() {
             let is_instrument = desc.category == ModuleCategory::Instrument;
+            let config = if desc.id == "sampler" {
+                vec![("zones".to_string(), zone_dir.to_string_lossy().into_owned())]
+            } else {
+                vec![]
+            };
             let (nodes, connections, target) = if is_instrument {
                 (
                     vec![NodeDesc {
                         id: "m".into(),
                         module_id: desc.id.into(),
                         params: vec![],
+                        config,
                     }],
                     vec![],
                     0,
@@ -819,11 +878,13 @@ mod tests {
                             id: "src".into(),
                             module_id: "dc".into(),
                             params: vec![],
+                            config: vec![],
                         },
                         NodeDesc {
                             id: "m".into(),
                             module_id: desc.id.into(),
                             params: vec![],
+                            config: vec![],
                         },
                     ],
                     vec![Connection {
@@ -842,6 +903,7 @@ mod tests {
                 track_mix: vec![],
                 master_gain_db: 0.0,
                 master: vec![],
+                base_dir: Default::default(),
             };
             let mut g =
                 compile(&graph_desc, test_support::create, 48_000.0, 256, 2).expect("compiles");
@@ -862,7 +924,7 @@ mod tests {
             let decorrelates = matches!(desc.id, "chorus" | "reverb");
             let mut energy = [0.0f32; 2];
             for _ in 0..16 {
-                g.process_block(48_000.0, 256, 0.0);
+                g.process_block(48_000.0, 256, 0.0, 0.0);
                 g.clear_notes();
                 let (c0, c1) = (g.node_output_ch(target, 0), g.node_output_ch(target, 1));
                 if !decorrelates {
@@ -874,6 +936,7 @@ mod tests {
             assert!(energy[0] > 0.0, "'{}' left channel 0 silent", desc.id);
             assert!(energy[1] > 0.0, "'{}' left channel 1 silent", desc.id);
         }
+        std::fs::remove_dir_all(&zone_dir).ok();
     }
 
     #[test]
@@ -884,12 +947,14 @@ mod tests {
                 id: "src".into(),
                 module_id: "const".into(),
                 params: vec![],
+                config: vec![],
             }],
             connections: vec![],
             tails: vec![0],
             track_mix: vec![],
             master_gain_db: 0.0,
             master: vec![0],
+            base_dir: Default::default(),
         };
         assert!(matches!(
             compile(&desc, create, 48_000.0, 64, 2),
@@ -908,11 +973,13 @@ mod tests {
                     id: "src".into(),
                     module_id: "const".into(),
                     params: vec![],
+                    config: vec![],
                 },
                 NodeDesc {
                     id: "mfx".into(),
                     module_id: "half".into(),
                     params: vec![],
+                    config: vec![],
                 },
             ],
             connections: vec![],
@@ -920,17 +987,18 @@ mod tests {
             track_mix: vec![],
             master_gain_db: 0.0,
             master: vec![1],
+            base_dir: Default::default(),
         };
         let frames = 32;
         let mut g = compile(&desc, create, 48_000.0, 64, 2).expect("compiles");
-        g.process_block(48_000.0, frames, 0.0);
+        g.process_block(48_000.0, frames, 0.0, 0.0);
         assert!(
             g.node_output_ch(1, 0).iter().all(|&s| s == 0.0),
             "the walk processed a master node"
         );
 
         let mut bus = vec![1.0f32; frames * 2];
-        g.process_master(&mut bus, 48_000.0, frames, 0.0);
+        g.process_master(&mut bus, 48_000.0, frames, 0.0, 0.0);
         assert!(
             bus.iter().all(|&s| (s - 0.5).abs() < 1e-6),
             "master chain did not process the bus"
@@ -951,11 +1019,13 @@ mod tests {
                     id: "src".into(),
                     module_id: "const".into(),
                     params: vec![],
+                    config: vec![],
                 },
                 NodeDesc {
                     id: "sink".into(),
                     module_id: "notesink".into(),
                     params: vec![],
+                    config: vec![],
                 },
             ],
             connections: vec![Connection {
@@ -968,6 +1038,7 @@ mod tests {
             track_mix: vec![],
             master_gain_db: 0.0,
             master: vec![],
+            base_dir: Default::default(),
         };
         assert!(matches!(
             compile(&desc, create, 48_000.0, 64, 1),

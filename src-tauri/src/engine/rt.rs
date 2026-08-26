@@ -319,8 +319,19 @@ impl RtState {
             }
 
             let samples_per_beat = self.schedule.samples_per_beat as f32;
+            // Bar-relative beat phase at the chunk start; frozen at 0.0 when
+            // stopped so grid-locked effects (ducker) sit idle. // RT-SAFE
+            let beat_phase = if self.playing {
+                crate::engine::node::beats_into_bar(
+                    chunk_start,
+                    samples_per_beat,
+                    self.schedule.beats_per_bar,
+                )
+            } else {
+                0.0
+            };
             self.graph
-                .process_block(self.sample_rate, n, samples_per_beat);
+                .process_block(self.sample_rate, n, samples_per_beat, beat_phase);
             // Track sum into the planar bus (per-track gain/pan, NO master
             // gain yet — the master chain sees the raw sum).
             self.mixer
@@ -333,7 +344,7 @@ impl RtState {
             if let Some(fading) = self.fading.as_mut() {
                 // Same tempo as the live graph: a removed synced delay's tail
                 // must not glide back to its ms fallback while fading out.
-                fading.process_block(self.sample_rate, n, samples_per_beat);
+                fading.process_block(self.sample_rate, n, samples_per_beat, beat_phase);
                 fading.clear_notes();
                 let energy =
                     self.mixer
@@ -356,6 +367,7 @@ impl RtState {
                 self.sample_rate,
                 n,
                 samples_per_beat,
+                beat_phase,
             );
             self.mixer.apply_master(&self.bus, n, &mut self.mix);
 
@@ -871,12 +883,14 @@ mod tests {
                 id: "s".into(),
                 module_id: "silence".into(),
                 params: vec![],
+                config: vec![],
             }],
             connections: vec![],
             tails: vec![0],
             track_mix: vec![],
             master_gain_db: 0.0,
             master: vec![],
+            base_dir: Default::default(),
         };
         let graph = compile(&silence, test_support::create, 48_000.0, MAX_BLOCK, 1).unwrap();
         let schedule = Schedule {
@@ -979,6 +993,7 @@ mod tests {
             id: "lead_fx".into(),
             module: "gain".into(),
             params: Default::default(),
+            config: Default::default(),
         });
         let (desc, _index) = project.to_graph().unwrap();
         let graph = crate::engine::graph::compile(
@@ -1002,6 +1017,7 @@ mod tests {
                 id: "master_fx".into(),
                 module: "compressor".into(),
                 params: Default::default(),
+                config: Default::default(),
             });
         let (desc, _index) = project.to_graph().unwrap();
         let graph = crate::engine::graph::compile(
@@ -1150,12 +1166,14 @@ mod tests {
                 id: "t".into(),
                 module_id: "tail".into(),
                 params: vec![],
+                config: vec![],
             }],
             connections: vec![],
             tails: vec![0],
             track_mix: vec![],
             master_gain_db: 0.0,
             master: vec![],
+            base_dir: Default::default(),
         };
         let graph_a = compile(&tail, test_support::create, 48_000.0, MAX_BLOCK, 1).unwrap();
         let (prod, _cons) = rtrb::RingBuffer::<Garbage>::new(8);
@@ -1176,12 +1194,14 @@ mod tests {
                 id: "s".into(),
                 module_id: "silence".into(),
                 params: vec![],
+                config: vec![],
             }],
             connections: vec![],
             tails: vec![0],
             track_mix: vec![],
             master_gain_db: 0.0,
             master: vec![],
+            base_dir: Default::default(),
         };
         let graph_b = compile(&silence, test_support::create, 48_000.0, MAX_BLOCK, 1).unwrap();
         rt.handle(ControlMsg::SwapGraph(Box::new(graph_b)));

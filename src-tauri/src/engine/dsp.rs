@@ -86,6 +86,46 @@ impl Biquad {
         self.a2 = (1.0 - alpha) / a0;
     }
 
+    /// Peaking EQ: a ±`gain_db` bell at `fc`, width set by `q`. 0 dB is a
+    /// pass-through by construction (A = 1 collapses every term).
+    pub fn set_peaking(&mut self, fc: f32, q: f32, gain_db: f32, sr: f32) {
+        let a = 10.0f32.powf(gain_db / 40.0);
+        let (cos_w0, alpha) = Self::omega(fc, q, sr);
+        let a0 = 1.0 + alpha / a;
+        self.b0 = (1.0 + alpha * a) / a0;
+        self.b1 = (-2.0 * cos_w0) / a0;
+        self.b2 = (1.0 - alpha * a) / a0;
+        self.a1 = self.b1;
+        self.a2 = (1.0 - alpha / a) / a0;
+    }
+
+    /// Low shelf (slope 1): ±`gain_db` below `fc`, unity above.
+    pub fn set_lowshelf(&mut self, fc: f32, gain_db: f32, sr: f32) {
+        let a = 10.0f32.powf(gain_db / 40.0);
+        // Slope S = 1 makes the shelf alpha equal the Q = 1/√2 alpha.
+        let (cos_w0, alpha) = Self::omega(fc, core::f32::consts::FRAC_1_SQRT_2, sr);
+        let two_sqrt_a_alpha = 2.0 * a.sqrt() * alpha;
+        let a0 = (a + 1.0) + (a - 1.0) * cos_w0 + two_sqrt_a_alpha;
+        self.b0 = a * ((a + 1.0) - (a - 1.0) * cos_w0 + two_sqrt_a_alpha) / a0;
+        self.b1 = 2.0 * a * ((a - 1.0) - (a + 1.0) * cos_w0) / a0;
+        self.b2 = a * ((a + 1.0) - (a - 1.0) * cos_w0 - two_sqrt_a_alpha) / a0;
+        self.a1 = -2.0 * ((a - 1.0) + (a + 1.0) * cos_w0) / a0;
+        self.a2 = ((a + 1.0) + (a - 1.0) * cos_w0 - two_sqrt_a_alpha) / a0;
+    }
+
+    /// High shelf (slope 1): ±`gain_db` above `fc`, unity below.
+    pub fn set_highshelf(&mut self, fc: f32, gain_db: f32, sr: f32) {
+        let a = 10.0f32.powf(gain_db / 40.0);
+        let (cos_w0, alpha) = Self::omega(fc, core::f32::consts::FRAC_1_SQRT_2, sr);
+        let two_sqrt_a_alpha = 2.0 * a.sqrt() * alpha;
+        let a0 = (a + 1.0) - (a - 1.0) * cos_w0 + two_sqrt_a_alpha;
+        self.b0 = a * ((a + 1.0) + (a - 1.0) * cos_w0 + two_sqrt_a_alpha) / a0;
+        self.b1 = -2.0 * a * ((a - 1.0) + (a + 1.0) * cos_w0) / a0;
+        self.b2 = a * ((a + 1.0) + (a - 1.0) * cos_w0 - two_sqrt_a_alpha) / a0;
+        self.a1 = 2.0 * ((a - 1.0) - (a + 1.0) * cos_w0) / a0;
+        self.a2 = ((a + 1.0) - (a - 1.0) * cos_w0 - two_sqrt_a_alpha) / a0;
+    }
+
     /// Shared RBJ intermediates: clamped normalized frequency → (cos ω₀, α).
     fn omega(fc: f32, q: f32, sr: f32) -> (f32, f32) {
         let w0 = TAU * (fc / sr).clamp(1.0e-4, 0.49);
@@ -312,6 +352,70 @@ mod tests {
             }
         }
         (tail_energy / (n - tail_start) as f32).sqrt()
+    }
+
+    /// Gain in dB of `bq` at `freq`, measured against the unit-sine RMS.
+    fn gain_db_at(bq: Biquad, freq: f32, sr: f32) -> f32 {
+        20.0 * (sine_rms_through(bq, freq, sr) / core::f32::consts::FRAC_1_SQRT_2).log10()
+    }
+
+    #[test]
+    fn peaking_boosts_the_bell_only() {
+        let sr = 48_000.0;
+        let mut pk = Biquad::default();
+        pk.set_peaking(1000.0, 1.0, 9.0, sr);
+        let centre = gain_db_at(pk, 1000.0, sr);
+        assert!(
+            (centre - 9.0).abs() < 0.5,
+            "peak centre {centre} dB, want 9"
+        );
+        let far = gain_db_at(pk, 60.0, sr);
+        assert!(far.abs() < 0.5, "peak leaked to 60 Hz: {far} dB");
+
+        let mut cut = Biquad::default();
+        cut.set_peaking(1000.0, 1.0, -9.0, sr);
+        let centre = gain_db_at(cut, 1000.0, sr);
+        assert!(
+            (centre + 9.0).abs() < 0.5,
+            "cut centre {centre} dB, want -9"
+        );
+    }
+
+    #[test]
+    fn shelves_lift_their_band_only() {
+        let sr = 48_000.0;
+        let mut ls = Biquad::default();
+        ls.set_lowshelf(200.0, 6.0, sr);
+        let low = gain_db_at(ls, 40.0, sr);
+        assert!((low - 6.0).abs() < 0.5, "low shelf at 40 Hz: {low} dB");
+        let high = gain_db_at(ls, 4000.0, sr);
+        assert!(high.abs() < 0.5, "low shelf leaked to 4 kHz: {high} dB");
+
+        let mut hs = Biquad::default();
+        hs.set_highshelf(2000.0, 6.0, sr);
+        let top = gain_db_at(hs, 12_000.0, sr);
+        assert!((top - 6.0).abs() < 0.5, "high shelf at 12 kHz: {top} dB");
+        let bottom = gain_db_at(hs, 100.0, sr);
+        assert!(
+            bottom.abs() < 0.5,
+            "high shelf leaked to 100 Hz: {bottom} dB"
+        );
+    }
+
+    #[test]
+    fn zero_gain_filters_are_transparent() {
+        let sr = 48_000.0;
+        for freq in [60.0, 500.0, 3000.0, 12_000.0] {
+            let mut pk = Biquad::default();
+            pk.set_peaking(1000.0, 1.0, 0.0, sr);
+            assert!(gain_db_at(pk, freq, sr).abs() < 0.1);
+            let mut ls = Biquad::default();
+            ls.set_lowshelf(200.0, 0.0, sr);
+            assert!(gain_db_at(ls, freq, sr).abs() < 0.1);
+            let mut hs = Biquad::default();
+            hs.set_highshelf(2000.0, 0.0, sr);
+            assert!(gain_db_at(hs, freq, sr).abs() < 0.1);
+        }
     }
 
     #[test]

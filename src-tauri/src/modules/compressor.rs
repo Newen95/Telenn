@@ -230,6 +230,7 @@ mod tests {
             frames,
             channels: 1,
             samples_per_beat: 0.0,
+            beat_phase: 0.0,
         };
         let mut io = NodeIo::new(&[], input, out, frames, 1);
         c.process(&ctx, &mut io);

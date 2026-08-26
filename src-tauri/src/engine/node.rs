@@ -108,12 +108,38 @@ pub struct ProcessCtx {
     /// (live keyboard before a project loads, offline tail phase of a probe).
     /// Tempo-aware effects fall back to their absolute-time params on 0.0.
     pub samples_per_beat: f32,
+    /// Fractional beats into the current bar at the block start (0 ≤ x <
+    /// beats_per_bar); 0.0 when stopped or without a tempo. Grid-locked
+    /// effects (ducker) position themselves with it.
+    pub beat_phase: f32,
     pub sample_rate: f32,
     pub frames: usize,
     /// Channels per port (the engine compiles at [`crate::engine::CHANNELS`];
     /// offline probes and unit tests may compile mono). Buffer layout within a
     /// port is channel-major: `[p0c0.., p0c1.., p1c0..]`.
     pub channels: usize,
+}
+
+impl Default for ProcessCtx {
+    fn default() -> Self {
+        Self {
+            samples_per_beat: 0.0,
+            beat_phase: 0.0,
+            sample_rate: 48_000.0,
+            frames: 0,
+            channels: 1,
+        }
+    }
+}
+
+/// Fractional beats into the bar at `playhead`, for [`ProcessCtx::beat_phase`].
+/// f64 modulo: a long session's playhead exceeds the f32 mantissa. // RT-SAFE
+pub fn beats_into_bar(playhead: u64, samples_per_beat: f32, beats_per_bar: u32) -> f32 {
+    if samples_per_beat <= 0.0 || beats_per_bar == 0 {
+        return 0.0;
+    }
+    let bar_len = samples_per_beat as f64 * beats_per_bar as f64;
+    ((playhead as f64 % bar_len) / samples_per_beat as f64) as f32
 }
 
 /// The buffers and note events a node reads/writes for one block. Audio buffers
@@ -233,6 +259,14 @@ pub trait AudioNode: Send {
     /// through their normal release, so this stays click-free. Default no-op for
     /// nodes that hold no voices (effects). // RT-SAFE
     fn all_notes_off(&mut self) {}
+
+    /// Non-parameter setup: the node's `config` key/value pairs from `song.json`
+    /// (sample kit directories, file paths…). Relative paths are the module's to
+    /// resolve against `base_dir` (the project directory). Called during graph
+    /// build, after creation and before [`prepare`](Self::prepare) — never on
+    /// the audio thread, so file I/O and allocation are fine here. Default
+    /// no-op: most modules have no config.
+    fn configure(&mut self, _config: &[(String, String)], _base_dir: &std::path::Path) {}
 
     /// Off-thread preparation. All allocation belongs here, never in `process`.
     fn prepare(&mut self, sample_rate: f32, max_block: usize);

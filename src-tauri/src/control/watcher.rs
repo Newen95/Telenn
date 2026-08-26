@@ -7,9 +7,13 @@
 //! (parse, hot-swap, history commit, self-write dedup) lives in
 //! [`commands::reload_after_external_change`]; here we only drive it and forward
 //! the resulting diff (or a parse error) to the UI.
+//!
+//! Opening another project retargets the watch through [`WatcherControl`]: the
+//! rewatch request rides the same channel as the filesystem events, so the loop
+//! never needs to select over two receivers.
 
 use std::path::PathBuf;
-use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
@@ -31,19 +35,41 @@ const CHANGED_EVENT: &str = "project_changed";
 /// current state; nothing is reloaded).
 const ERROR_EVENT: &str = "project_error";
 
-/// Spawn the watcher thread for the project's directory. It runs for the app's
-/// lifetime; when the app shuts down the event sender drops and the loop ends.
-pub fn spawn(app: AppHandle, project_path: PathBuf) {
-    let Some(dir) = project_path.parent().map(PathBuf::from) else {
-        return;
+enum Msg {
+    /// A filesystem event fired in the watched directory.
+    Fs,
+    /// Retarget the watch to another project directory (project switch).
+    Watch(PathBuf),
+}
+
+/// Handle to the watcher thread, held in Tauri state so `open_project` can
+/// retarget the watch. Dropping every sender ends the thread.
+pub struct WatcherControl(Sender<Msg>);
+
+impl WatcherControl {
+    /// Point the watcher at another project directory. Best effort: a dead
+    /// watcher thread only costs external-edit reloads, never the open itself.
+    pub fn rewatch(&self, dir: PathBuf) {
+        let _ = self.0.send(Msg::Watch(dir));
+    }
+}
+
+/// Spawn the watcher thread for the project's directory and return its control
+/// handle. The thread runs for the app's lifetime; when the app shuts down the
+/// senders drop and the loop ends.
+pub fn spawn(app: AppHandle, project_path: PathBuf) -> WatcherControl {
+    let (tx, rx) = mpsc::channel::<Msg>();
+    let control = WatcherControl(tx.clone());
+    let Some(initial_dir) = project_path.parent().map(PathBuf::from) else {
+        return control;
     };
     let _ = thread::Builder::new()
         .name("telenn-watcher".into())
         .spawn(move || {
-            let (tx, rx) = mpsc::channel();
+            let fs_tx = tx;
             let mut watcher = match RecommendedWatcher::new(
-                move |res| {
-                    let _ = tx.send(res);
+                move |_res| {
+                    let _ = fs_tx.send(Msg::Fs);
                 },
                 Config::default(),
             ) {
@@ -53,6 +79,7 @@ pub fn spawn(app: AppHandle, project_path: PathBuf) {
             // Non-recursive: only the directory's direct entries (song.json),
             // never the presets/ subtree. Dropping `watcher` stops watching, so
             // it must stay alive for the whole loop below.
+            let mut dir = initial_dir;
             if watcher.watch(&dir, RecursiveMode::NonRecursive).is_err() {
                 return;
             }
@@ -60,13 +87,24 @@ pub fn spawn(app: AppHandle, project_path: PathBuf) {
             loop {
                 // Block until something happens, then drain the burst: keep
                 // pulling events until the directory is quiet for the debounce
-                // window, and only then react once.
-                if rx.recv().is_err() {
-                    break; // sender dropped: app shutting down
+                // window, and only then react once. A rewatch can arrive at any
+                // point; stale events from the old directory are harmless (the
+                // reload dedups against the active file's bytes).
+                match rx.recv() {
+                    Err(_) => break, // senders dropped: app shutting down
+                    Ok(Msg::Watch(new_dir)) => {
+                        retarget(&mut watcher, &mut dir, new_dir);
+                        continue; // a switch alone is not a file change
+                    }
+                    Ok(Msg::Fs) => {}
                 }
                 loop {
                     match rx.recv_timeout(DEBOUNCE) {
-                        Ok(_) => continue,
+                        Ok(Msg::Fs) => continue,
+                        Ok(Msg::Watch(new_dir)) => {
+                            retarget(&mut watcher, &mut dir, new_dir);
+                            continue;
+                        }
                         Err(RecvTimeoutError::Timeout) => break,
                         Err(RecvTimeoutError::Disconnected) => return,
                     }
@@ -74,6 +112,19 @@ pub fn spawn(app: AppHandle, project_path: PathBuf) {
                 react(&app);
             }
         });
+    control
+}
+
+/// Swap the watched directory; on failure keep whatever notify left us with —
+/// the next rewatch (or app restart) recovers.
+fn retarget(watcher: &mut RecommendedWatcher, dir: &mut PathBuf, new_dir: PathBuf) {
+    if new_dir == *dir {
+        return;
+    }
+    let _ = watcher.unwatch(dir);
+    if watcher.watch(&new_dir, RecursiveMode::NonRecursive).is_ok() {
+        *dir = new_dir;
+    }
 }
 
 /// Reload the project and forward the outcome to the UI.

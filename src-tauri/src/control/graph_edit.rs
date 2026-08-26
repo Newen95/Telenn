@@ -163,6 +163,7 @@ pub fn add_track(
             id: instrument_id.to_string(),
             module: module.to_string(),
             params: Default::default(),
+            config: Default::default(),
         }],
         clips: vec![clip],
     });
@@ -211,6 +212,7 @@ pub fn set_instrument(
         id: node_id.to_string(),
         module: module.to_string(),
         params: Default::default(),
+        config: Default::default(),
     };
     Ok(())
 }
@@ -321,6 +323,7 @@ pub fn insert_effect_at(
             id: node_id.to_string(),
             module: module.to_string(),
             params: params.into_iter().collect(),
+            config: Default::default(),
         },
     );
     Ok(())
@@ -412,6 +415,8 @@ pub fn copy_node(
         id: new_id.to_string(),
         module: source.module.clone(),
         params: source.params.clone(),
+        // A copied node keeps its config: a duplicated sampler keeps its kit.
+        config: source.config.clone(),
     };
     let dst = chain_ref(project, to_track)?;
     if dst == ChainRef::Master {
@@ -804,6 +809,7 @@ mod tests {
             id: id.to_string(),
             module: module.to_string(),
             params: params.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+            config: Default::default(),
         }
     }
 

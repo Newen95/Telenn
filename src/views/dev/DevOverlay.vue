@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // Dev overlay (Ctrl+Alt+D): raw engine controls kept out of the main layout —
-// demo reload / WAV export, the flat graph node list with quick edits, raw
+// project reload / WAV export, the flat graph node list with quick edits, raw
 // module sliders and a one-octave audition keyboard. Labels stay raw technical
 // strings (not i18n), as before.
 
@@ -9,7 +9,6 @@ import { invoke } from "@tauri-apps/api/core";
 
 import { useProjectStore } from "../../stores/project";
 import Icon from "../../ui/Icon.vue";
-import { DEMO_PATH, EXPORT_PATH } from "../../projectPaths";
 
 const emit = defineEmits<{ close: [] }>();
 
@@ -52,7 +51,8 @@ let fxCounter = 0;
 
 async function loadDemo() {
   try {
-    await invoke("load_project", { path: DEMO_PATH });
+    await invoke("project_reload");
+    await project.load();
     actionMsg.value = "loaded";
   } catch (e) {
     actionMsg.value = String(e);
@@ -61,8 +61,8 @@ async function loadDemo() {
 
 async function exportWav() {
   try {
-    await invoke("export_wav", { projectPath: DEMO_PATH, outPath: EXPORT_PATH });
-    actionMsg.value = "exported";
+    const out = await invoke<string>("export_wav", {});
+    actionMsg.value = `exported: ${out}`;
   } catch (e) {
     actionMsg.value = String(e);
   }

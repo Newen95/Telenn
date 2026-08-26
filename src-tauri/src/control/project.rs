@@ -53,6 +53,11 @@ pub struct Project {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub master_chain: Vec<NodeSpec>,
     pub tracks: Vec<Track>,
+    /// Directory the file was loaded from, so node `config` paths can be
+    /// project-relative. Runtime-only ([`Project::load`] sets it): never
+    /// serialized, so `song.json` stays portable.
+    #[serde(skip)]
+    pub base_dir: std::path::PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,6 +88,11 @@ pub struct NodeSpec {
     /// on-disk JSON stays diffable.
     #[serde(default)]
     pub params: BTreeMap<String, f32>,
+    /// Non-parameter setup the module interprets (sample kit directory, file
+    /// paths…). Relative paths resolve against the project directory. Absent
+    /// from the JSON when empty, so existing files stay byte-stable.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub config: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -332,8 +342,10 @@ impl ChainPreset {
 impl Project {
     /// Read and parse a `song.json` from disk. // off-RT
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ProjectError> {
+        let path = path.as_ref();
         let text = std::fs::read_to_string(path).map_err(|e| ProjectError::Io(e.to_string()))?;
-        let project: Project = serde_json::from_str(&text)?;
+        let mut project: Project = serde_json::from_str(&text)?;
+        project.base_dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
         Ok(project)
     }
 
@@ -439,6 +451,7 @@ impl Project {
                 track_mix: self.tracks.iter().map(|t| t.mixer).collect(),
                 master_gain_db: self.master_gain_db,
                 master,
+                base_dir: self.base_dir.clone(),
             },
             index,
         ))
@@ -541,6 +554,11 @@ impl Project {
             id: spec.id.clone(),
             module_id: spec.module.clone(),
             params: resolve_params(&spec.module, &spec.params)?,
+            config: spec
+                .config
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
         })
     }
 
@@ -763,6 +781,7 @@ mod tests {
             id: "m_gain".into(),
             module: "gain".into(),
             params: BTreeMap::new(),
+            config: BTreeMap::new(),
         });
         let written = with_master.to_json().unwrap();
         assert!(written.contains("master_chain"));

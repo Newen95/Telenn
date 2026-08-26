@@ -78,6 +78,7 @@ pub fn render_samples_with_tail(
         Some(&schedule),
         sample_rate,
         samples_per_beat,
+        schedule.beats_per_bar,
         total,
         &mut out,
     );
@@ -88,6 +89,7 @@ pub fn render_samples_with_tail(
         None,
         sample_rate,
         samples_per_beat,
+        schedule.beats_per_bar,
         tail_frames as usize,
         &mut out,
     );
@@ -105,6 +107,7 @@ fn pump(
     schedule: Option<&Schedule>,
     sample_rate: u32,
     samples_per_beat: f32,
+    beats_per_bar: u32,
     total: usize,
     out: &mut Vec<f32>,
 ) {
@@ -112,12 +115,23 @@ fn pump(
     let mut produced = 0usize;
     while produced < total {
         let n = (total - produced).min(RENDER_BLOCK);
+        // Chunk-start beat phase, captured before the cursor advances — the
+        // same convention as the real-time path.
+        let beat_phase =
+            crate::engine::node::beats_into_bar(cursor.playhead(), samples_per_beat, beats_per_bar);
         if let Some(schedule) = schedule {
             let g = &mut *graph;
             cursor.advance(n, schedule, |node, ev| g.push_note(node, ev));
         }
-        graph.process_block(sample_rate as f32, n, samples_per_beat);
-        mixer.mix(graph, sample_rate as f32, samples_per_beat, n, &mut stereo);
+        graph.process_block(sample_rate as f32, n, samples_per_beat, beat_phase);
+        mixer.mix(
+            graph,
+            sample_rate as f32,
+            samples_per_beat,
+            beat_phase,
+            n,
+            &mut stereo,
+        );
         out.extend_from_slice(&stereo[..n * 2]);
         graph.clear_notes();
         produced += n;
@@ -229,6 +243,7 @@ mod tests {
             params: [("gain".to_string(), (60.0 - 6.0206) / 72.0)]
                 .into_iter()
                 .collect(),
+            config: Default::default(),
         };
         mastered.master_chain.push(gain_spec);
         let halved = render_samples(&mastered, 48_000, 1).unwrap();
@@ -255,6 +270,7 @@ mod tests {
                     id: format!("m{i}"),
                     module: (*module).into(),
                     params: Default::default(),
+                    config: Default::default(),
                 });
         }
         let offline = render_samples(&project, 48_000, 1).unwrap();
@@ -328,6 +344,7 @@ mod tests {
             Some(&schedule),
             48_000,
             schedule.samples_per_beat as f32,
+            schedule.beats_per_bar,
             total,
             &mut mono,
         );

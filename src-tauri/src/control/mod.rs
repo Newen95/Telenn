@@ -16,6 +16,7 @@ pub mod undo;
 pub mod watcher;
 
 use std::path::{Path, PathBuf};
+use std::sync::RwLock;
 
 use crate::engine::graph::{compile, CompiledGraph};
 use crate::engine::mix::TrackMix;
@@ -28,12 +29,57 @@ use sequencer::Schedule;
 
 /// Absolute path of the editable `song.json` (the source of truth the UI writes
 /// back to). Resolved from the crate dir so it is stable regardless of the
-/// process working directory. Held in Tauri state for the edit commands.
-pub struct ProjectFile(pub PathBuf);
+/// process working directory. Held in Tauri state for the edit commands;
+/// interior mutability so "open project" can retarget every consumer at once.
+pub struct ProjectFile(RwLock<PathBuf>);
+
+impl ProjectFile {
+    pub fn new(path: PathBuf) -> Self {
+        Self(RwLock::new(path))
+    }
+
+    /// The active project file. Clones so no lock is held across file I/O.
+    pub fn path(&self) -> PathBuf {
+        match self.0.read() {
+            Ok(p) => p.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    pub fn set(&self, path: PathBuf) {
+        match self.0.write() {
+            Ok(mut p) => *p = path,
+            Err(poisoned) => *poisoned.into_inner() = path,
+        }
+    }
+}
 
 /// Canonical location of the demo project on disk.
 pub fn demo_song_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../projects/demo/song.json")
+}
+
+/// The user's projects root (`projects/`, gitignored user land).
+pub fn projects_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../projects")
+}
+
+/// Openable projects: direct subdirectories of `dir` holding a `song.json`,
+/// sorted by name.
+pub fn scan_projects(dir: &Path) -> Vec<(String, PathBuf)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut projects: Vec<(String, PathBuf)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let song = e.path().join("song.json");
+            let name = e.file_name().to_str()?.to_string();
+            song.is_file().then_some((name, song))
+        })
+        .collect();
+    projects.sort_by(|a, b| a.0.cmp(&b.0));
+    projects
 }
 
 /// The demo project, embedded at build time so the engine always boots with a
@@ -132,8 +178,8 @@ pub fn build_engine_init(project: Project) -> Result<(EngineInit, GraphIndex), E
 }
 
 /// Build the engine initialiser plus the control-side state kept for later
-/// commands: the note-routing index (`load_project`) and the editable project
-/// (graph edits / undo).
+/// commands: the note-routing index and the editable project (graph edits /
+/// undo).
 pub fn build_demo() -> Result<(EngineInit, GraphIndex, Project, PathBuf), EngineError> {
     let path = demo_song_path();
     // Materialize the embedded demo on first launch (or fresh clone) so the
@@ -157,4 +203,36 @@ pub fn build_demo() -> Result<(EngineInit, GraphIndex, Project, PathBuf), Engine
     let project_for_engine = project.clone();
     let (init, index) = build_engine_init(project)?;
     Ok((init, index, project_for_engine, path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scan_projects_lists_song_json_dirs_sorted() {
+        let root = std::env::temp_dir().join("telenn_scan_projects_test");
+        let _ = std::fs::remove_dir_all(&root);
+        for name in ["zeta", "alpha"] {
+            let dir = root.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("song.json"), "{}").unwrap();
+        }
+        std::fs::create_dir_all(root.join("empty")).unwrap();
+        std::fs::write(root.join("stray.json"), "{}").unwrap();
+
+        let found = scan_projects(&root);
+        let names: Vec<&str> = found.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "zeta"]);
+        assert!(found.iter().all(|(_, p)| p.ends_with("song.json")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn project_file_path_swaps() {
+        let file = ProjectFile::new(PathBuf::from("a/song.json"));
+        assert_eq!(file.path(), PathBuf::from("a/song.json"));
+        file.set(PathBuf::from("b/song.json"));
+        assert_eq!(file.path(), PathBuf::from("b/song.json"));
+    }
 }

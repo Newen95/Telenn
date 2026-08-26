@@ -7,16 +7,17 @@ pub mod telemetry;
 use std::sync::Mutex;
 
 use rtrb::RingBuffer;
+use tauri::Manager;
 
 use control::commands::{
     clip_move, clip_resize, edit_redo, edit_undo, engine_status, export_wav, graph_insert_effect,
     graph_move_node, graph_nodes, graph_remove_node, list_chain_presets, list_modules,
-    list_presets, load_project, metronome_set, mixer_commit_master, mixer_commit_track,
+    list_presets, list_projects, metronome_set, mixer_commit_master, mixer_commit_track,
     mixer_set_master, mixer_set_track, module_params, node_commit_param, node_copy, node_insert,
     node_move_to, node_set_param, note_add, note_delete, note_move, note_off, note_on, note_resize,
-    project_view, read_chain_preset, read_preset, save_chain_preset, save_preset, set_node_param,
-    track_add, track_add_chain, track_move, track_remove, track_set_chain, track_set_instrument,
-    transport_play, transport_stop,
+    open_project, project_reload, project_view, read_chain_preset, read_preset, save_chain_preset,
+    save_preset, set_node_param, track_add, track_add_chain, track_move, track_remove,
+    track_set_chain, track_set_instrument, transport_play, transport_stop,
 };
 use control::undo::EditHistory;
 use telemetry::frame::TelemetryFrame;
@@ -39,10 +40,11 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(engine)
         .manage(history)
-        .manage(control::ProjectFile(project_path))
+        .manage(control::ProjectFile::new(project_path))
         .setup(move |app| {
             control::telemetry_pump::spawn(app.handle().clone(), telemetry_cons);
-            control::watcher::spawn(app.handle().clone(), watch_path);
+            let watcher = control::watcher::spawn(app.handle().clone(), watch_path);
+            app.manage(watcher);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -53,7 +55,9 @@ pub fn run() {
             set_node_param,
             engine_status,
             module_params,
-            load_project,
+            list_projects,
+            open_project,
+            project_reload,
             export_wav,
             graph_insert_effect,
             graph_remove_node,

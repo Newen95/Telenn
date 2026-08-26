@@ -8,8 +8,10 @@ use tauri::State;
 use crate::control::project::{ChainPreset, NodeSpec, Preset, Project, ProjectDiff, ProjectView};
 use crate::control::sequencer::Schedule;
 use crate::control::undo::EditHistory;
+use crate::control::watcher::WatcherControl;
 use crate::control::{
-    clip_edit, graph_edit, ids, note_edit, render, ControlMsg, ProjectFile, TransportCmd,
+    clip_edit, graph_edit, ids, note_edit, render, scan_projects, ControlMsg, ProjectFile,
+    TransportCmd,
 };
 use crate::engine::graph::{compile, GraphDesc};
 use crate::engine::mix::TrackMix;
@@ -33,27 +35,84 @@ pub fn transport_stop(engine: State<'_, AudioEngine>) {
     engine.send(ControlMsg::Transport(TransportCmd::Stop));
 }
 
-/// Reload a project from disk and swap its sequence in without interrupting
-/// playback. The graph topology stays fixed (a chain change needs a restart
-/// until the M4 hot-swap): notes are resolved against the running graph.
+/// One openable project for the "open project" menu.
+#[derive(serde::Serialize)]
+pub struct ProjectInfo {
+    pub name: String,
+    pub path: String,
+    pub active: bool,
+}
+
+/// Openable projects (subdirectories of `projects/` holding a `song.json`),
+/// with the active one marked.
 #[tauri::command]
-pub fn load_project(engine: State<'_, AudioEngine>, path: String) -> Result<(), String> {
-    let project = Project::load(&path).map_err(|e| e.to_string())?;
-    let schedule = project
-        .to_schedule(engine.sample_rate(), &engine.index())
-        .map_err(|e| e.to_string())?;
-    if !engine.send(ControlMsg::SetSchedule(Box::new(schedule))) {
-        return Err("engine busy: command dropped".into());
+pub fn list_projects(file: State<'_, ProjectFile>) -> Vec<ProjectInfo> {
+    let active = file.path().canonicalize().ok();
+    scan_projects(&crate::control::projects_dir())
+        .into_iter()
+        .map(|(name, path)| ProjectInfo {
+            active: path.canonicalize().ok() == active && active.is_some(),
+            path: path.to_string_lossy().into_owned(),
+            name,
+        })
+        .collect()
+}
+
+/// Open another project: load it, hot-swap graph and schedule, retarget the
+/// file state and the watcher, and start a fresh undo history (undo must never
+/// carry one project's content into another's file).
+#[tauri::command]
+pub fn open_project(
+    engine: State<'_, AudioEngine>,
+    history: State<'_, Mutex<EditHistory>>,
+    file: State<'_, ProjectFile>,
+    watcher: State<'_, WatcherControl>,
+    path: String,
+) -> Result<(), String> {
+    let path = PathBuf::from(path);
+    let mut next = Project::load(&path).map_err(|e| e.to_string())?;
+    if ids::normalize(&mut next) {
+        let _ = next.save(&path);
     }
+    let mut history = history.lock().map_err(|_| "edit state poisoned")?;
+    let prev = history.project().clone();
+    apply_restored(&engine, &prev, &next)?;
+    *history = EditHistory::new(next);
+    if let Some(dir) = path.parent() {
+        watcher.rewatch(dir.to_path_buf());
+    }
+    file.set(path);
     Ok(())
 }
 
-/// Render a project to a 16-bit stereo WAV offline (deterministic, device-free).
+/// Re-read the active project from disk (menu "reload"): same path as an
+/// external file change, minus the watcher.
 #[tauri::command]
-pub fn export_wav(project_path: String, out_path: String) -> Result<(), String> {
+pub fn project_reload(
+    engine: State<'_, AudioEngine>,
+    history: State<'_, Mutex<EditHistory>>,
+    file: State<'_, ProjectFile>,
+) -> Result<(), String> {
+    reload_after_external_change(&engine, &history, &file).map(|_| ())
+}
+
+/// Render a project to a 16-bit stereo WAV offline (deterministic,
+/// device-free). Defaults to the active project, written as `export.wav` next
+/// to its `song.json`; returns the output path.
+#[tauri::command]
+pub fn export_wav(
+    file: State<'_, ProjectFile>,
+    project_path: Option<String>,
+    out_path: Option<String>,
+) -> Result<String, String> {
+    let project_path = project_path.map_or_else(|| file.path(), PathBuf::from);
+    let out_path =
+        out_path.map_or_else(|| project_path.with_file_name("export.wav"), PathBuf::from);
     let project = Project::load(&project_path).map_err(|e| e.to_string())?;
-    render::render_to_wav(&project, EXPORT_SAMPLE_RATE, EXPORT_LOOPS, &out_path)
-        .map_err(|e| e.to_string())
+    let out = out_path.to_string_lossy().into_owned();
+    render::render_to_wav(&project, EXPORT_SAMPLE_RATE, EXPORT_LOOPS, &out)
+        .map_err(|e| e.to_string())?;
+    Ok(out)
 }
 
 /// Compile a graph description and hot-swap it onto the audio thread, then
@@ -97,7 +156,7 @@ fn set_schedule(engine: &AudioEngine, schedule: Schedule) -> Result<(), String> 
 /// effort: a write failure does not undo the edit already applied to the engine,
 /// it just leaves the disk mirror to be refreshed by the next edit.
 fn persist(history: &EditHistory, file: &ProjectFile) {
-    let _ = history.project().save(&file.0);
+    let _ = history.project().save(file.path());
 }
 
 /// Apply a validated **graph** edit (effect chain) to a trial clone and hot-swap
@@ -198,7 +257,7 @@ pub(crate) fn reload_after_external_change(
     history: &Mutex<EditHistory>,
     file: &ProjectFile,
 ) -> Result<Option<ProjectDiff>, String> {
-    let disk = std::fs::read_to_string(&file.0).map_err(|e| e.to_string())?;
+    let disk = std::fs::read_to_string(file.path()).map_err(|e| e.to_string())?;
     let mut history = history.lock().map_err(|_| "edit state poisoned")?;
 
     // Our own write echoing back? Compare against the exact bytes we would write.
@@ -806,7 +865,7 @@ pub fn list_modules() -> Vec<registry::ModuleDesc> {
 
 /// The project's `presets/` directory (next to its `song.json`).
 fn presets_dir(file: &ProjectFile) -> Option<PathBuf> {
-    file.0.parent().map(|p| p.join("presets"))
+    file.path().parent().map(|p| p.join("presets"))
 }
 
 /// Reject names that could escape the presets directory or break the filename.

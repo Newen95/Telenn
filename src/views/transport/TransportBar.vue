@@ -3,7 +3,7 @@
 // the transport cluster in the center, master meter and engine health on the
 // right. One row — the transport never moves, whatever the zones do.
 
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import { invoke } from "@tauri-apps/api/core";
 
@@ -13,7 +13,6 @@ import { useProjectStore } from "../../stores/project";
 import { useTelemetryStore } from "../../stores/telemetry";
 import { useToastStore } from "../../stores/toasts";
 import { useUiStore } from "../../stores/ui";
-import { DEMO_PATH, EXPORT_PATH } from "../../projectPaths";
 
 const { t, locale } = useI18n();
 const project = useProjectStore();
@@ -59,12 +58,35 @@ async function run(action: () => Promise<void>, done = ""): Promise<void> {
   }
 }
 
-const exportWav = () =>
-  run(
-    () => invoke("export_wav", { projectPath: DEMO_PATH, outPath: EXPORT_PATH }),
-    t("toast.exported"),
-  );
-const reloadProject = () => run(() => invoke("load_project", { path: DEMO_PATH }));
+// Openable projects, refreshed each time the file menu opens (cheap scan).
+interface ProjectInfo {
+  name: string;
+  path: string;
+  active: boolean;
+}
+const projects = ref<ProjectInfo[]>([]);
+
+watch(openMenu, async (menu) => {
+  if (menu !== "file") return;
+  try {
+    projects.value = await invoke<ProjectInfo[]>("list_projects");
+  } catch {
+    projects.value = [];
+  }
+});
+
+const openProject = (p: ProjectInfo) =>
+  run(async () => {
+    await invoke("open_project", { path: p.path });
+    await project.load();
+  }, t("toast.projectOpened", { name: p.name }));
+
+const exportWav = () => run(() => invoke("export_wav", {}), t("toast.exported"));
+const reloadProject = () =>
+  run(async () => {
+    await invoke("project_reload");
+    await project.load();
+  });
 const editUndo = () =>
   run(async () => {
     await invoke("edit_undo");
@@ -148,6 +170,20 @@ onUnmounted(() => {
           <button type="button" class="item" @click="reloadProject">
             {{ t("menu.reloadProject") }}
           </button>
+          <div class="separator"></div>
+          <div class="section-label">{{ t("menu.openProject") }}</div>
+          <button
+            v-for="p in projects"
+            :key="p.path"
+            type="button"
+            class="item"
+            @click="openProject(p)"
+          >
+            <span class="check">{{ p.active ? "✓" : "" }}</span>{{ p.name }}
+          </button>
+          <div v-if="projects.length === 0" class="section-label">
+            {{ t("menu.noProjects") }}
+          </div>
         </div>
       </div>
 
@@ -356,6 +392,14 @@ onUnmounted(() => {
   height: 1px;
   margin: 0.25rem 0.4rem;
   background: var(--border);
+}
+
+.section-label {
+  padding: 0.2rem 0.5rem;
+  font-size: 0.65rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-3);
 }
 
 /* --- Transport --- */

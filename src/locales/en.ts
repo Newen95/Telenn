@@ -15,6 +15,8 @@ export default {
     view: "View",
     exportWav: "Export as WAV",
     reloadProject: "Reload project",
+    openProject: "Open a project",
+    noProjects: "No project found",
     undo: "Undo",
     redo: "Redo",
     devOverlay: "Dev console",
@@ -46,5 +48,6 @@ export default {
     exported: "WAV export done",
     actionFailed: "The action failed",
     projectError: "Invalid song.json — the project was not reloaded",
+    projectOpened: "Project opened: {name}",
   },
 };

@@ -38,8 +38,11 @@ const P_DECAY: ParamId = 4;
 const P_SUSTAIN: ParamId = 5;
 const P_RELEASE: ParamId = 6;
 const P_LEVEL: ParamId = 7;
+// Appended (ids are frozen — presets address params by name, order by id).
+const P_VIB_RATE: ParamId = 8;
+const P_VIB_DEPTH: ParamId = 9;
 
-const PARAMS: [ParamSpec; 8] = [
+const PARAMS: [ParamSpec; 10] = [
     ParamSpec {
         id: P_POSITION,
         name: "position",
@@ -111,6 +114,25 @@ const PARAMS: [ParamSpec; 8] = [
         max: 0.0,
         default: -6.0,
         curve: ParamCurve::Db,
+    },
+    // Module-wide vibrato LFO (block-rate pitch wobble; depth 0 = off).
+    ParamSpec {
+        id: P_VIB_RATE,
+        name: "vib_rate",
+        unit: "Hz",
+        min: 0.1,
+        max: 12.0,
+        default: 5.0,
+        curve: ParamCurve::Log,
+    },
+    ParamSpec {
+        id: P_VIB_DEPTH,
+        name: "vib_depth",
+        unit: "ct",
+        min: 0.0,
+        max: 100.0,
+        default: 0.0,
+        curve: ParamCurve::Linear,
     },
 ];
 
@@ -184,6 +206,10 @@ pub struct Wavetable {
     level: LinearRamp,
     adsr: AdsrSettings,
     next_age: u64,
+    vib_rate: OnePole,
+    vib_depth: OnePole,
+    /// Vibrato LFO phase in turns (0..1), advanced per block.
+    vib_phase: f32,
 }
 
 impl Default for Wavetable {
@@ -198,6 +224,9 @@ impl Default for Wavetable {
             level: LinearRamp::new(1.0, 10.0, 48_000.0),
             adsr: AdsrSettings::default(),
             next_age: 0,
+            vib_rate: OnePole::new(5.0, 0.99),
+            vib_depth: OnePole::new(0.0, 0.99),
+            vib_phase: 0.0,
         }
     }
 }
@@ -301,6 +330,17 @@ impl AudioNode for Wavetable {
         let sr = self.sample_rate;
         let position = self.position.advance(frames);
         let pos_amt = self.pos_env_amt.advance(frames);
+        // Vibrato multiplier sampled once per block (staircase inaudible at
+        // ≤ 12 Hz / 100 ct); depth 0 keeps the exact legacy increment.
+        let vib_depth = self.vib_depth.advance(frames);
+        let vib_rate = self.vib_rate.advance(frames);
+        let vib = if vib_depth > 0.0 {
+            let m = (vib_depth * (TAU * self.vib_phase).sin() / 1200.0).exp2();
+            self.vib_phase = (self.vib_phase + vib_rate * frames as f32 / sr).fract();
+            m
+        } else {
+            1.0
+        };
         let pos_adsr = AdsrSettings {
             attack_s: self.adsr.attack_s,
             decay_s: self.pos_decay_s,
@@ -326,7 +366,7 @@ impl AudioNode for Wavetable {
                 };
                 let s = self.read(pos_eff, mip, phase);
                 let v = &mut self.voices[vi];
-                v.phase += v.inc;
+                v.phase += v.inc * vib;
                 if v.phase >= 1.0 {
                     v.phase -= 1.0;
                 }
@@ -369,6 +409,8 @@ impl AudioNode for Wavetable {
             P_SUSTAIN => self.adsr.sustain = real,
             P_RELEASE => self.adsr.release_s = (real / 1000.0).max(MIN_RELEASE_S),
             P_LEVEL => self.level.set_target(real),
+            P_VIB_RATE => self.vib_rate.set_target(real),
+            P_VIB_DEPTH => self.vib_depth.set_target(real),
             _ => {}
         }
     }
@@ -424,6 +466,9 @@ impl AudioNode for Wavetable {
             sustain: default_real(P_SUSTAIN),
             release_s: (default_real(P_RELEASE) / 1000.0).max(MIN_RELEASE_S),
         };
+        self.vib_rate = OnePole::new(default_real(P_VIB_RATE), coef);
+        self.vib_depth = OnePole::new(default_real(P_VIB_DEPTH), coef);
+        self.vib_phase = 0.0;
         self.voices = [Voice::default(); VOICES];
         self.next_age = 0;
     }
@@ -464,9 +509,44 @@ mod tests {
             frames,
             channels: 1,
             samples_per_beat: 0.0,
+            beat_phase: 0.0,
         };
         let mut io = NodeIo::new(notes, &[], out, frames, 1);
         s.process(&ctx, &mut io);
+    }
+
+    /// Render in engine-sized blocks so block-rate state (vibrato) advances.
+    fn render_chunked(s: &mut Wavetable, notes: &[NoteEvent], frames: usize, out: &mut Vec<f32>) {
+        out.clear();
+        let mut chunk = Vec::new();
+        let mut done = 0;
+        while done < frames {
+            let n = 256.min(frames - done);
+            render_notes(s, if done == 0 { notes } else { &[] }, n, &mut chunk);
+            out.extend_from_slice(&chunk);
+            done += n;
+        }
+    }
+
+    #[test]
+    fn vibrato_wobbles_the_pitch() {
+        let mut s = synth();
+        set_real(&mut s, P_POSITION, 1.0); // vox end: rich, but pitched
+        set_real(&mut s, P_VIB_RATE, 2.0);
+        set_real(&mut s, P_VIB_DEPTH, 50.0);
+        let mut buf = Vec::new();
+        render_chunked(&mut s, &[on(69)], 48_000, &mut buf);
+        let (mut lo, mut hi) = (f32::MAX, 0.0f32);
+        for start in (4800..43_200).step_by(2400) {
+            if let Some(f0) = crate::analysis::pitch::estimate_f0(&buf[start..start + 2400], 48_000)
+            {
+                lo = lo.min(f0.hz);
+                hi = hi.max(f0.hz);
+            }
+        }
+        assert!(hi > 0.0 && lo < f32::MAX, "no pitch detected");
+        let span = (hi - lo) / 440.0;
+        assert!(span > 0.03, "vibrato span {span} too small ({lo}..{hi} Hz)");
     }
 
     fn on(pitch: u8) -> NoteEvent {

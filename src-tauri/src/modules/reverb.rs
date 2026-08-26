@@ -13,7 +13,7 @@
 //! `prepare`. Every feedback path flushes denormals (`DelayLine::write` and
 //! the one-pole stores).
 
-use crate::engine::dsp::{flush, DelayLine};
+use crate::engine::dsp::{flush, DelayLine, EnvFollower};
 use crate::engine::node::{
     AudioNode, NodeIo, ParamCurve, ParamId, ParamSpec, Port, PortSpec, ProcessCtx, SignalKind,
 };
@@ -67,8 +67,17 @@ const P_SIZE: ParamId = 0;
 const P_DAMP: ParamId = 1;
 const P_MIX: ParamId = 2;
 const P_PREDELAY: ParamId = 3;
+const P_GATE: ParamId = 4;
 
-const PARAMS: [ParamSpec; 4] = [
+/// Gate timing: how long the wet stays open after the input drops below the
+/// threshold, and the open/close slews (the 80s gated-snare envelope).
+const GATE_HOLD_S: f32 = 0.12;
+const GATE_OPEN_S: f32 = 0.002;
+const GATE_CLOSE_S: f32 = 0.008;
+const GATE_DET_ATTACK_S: f32 = 0.001;
+const GATE_DET_RELEASE_S: f32 = 0.03;
+
+const PARAMS: [ParamSpec; 5] = [
     ParamSpec {
         id: P_SIZE,
         name: "size",
@@ -104,6 +113,17 @@ const PARAMS: [ParamSpec; 4] = [
         min: 0.0,
         max: PREDELAY_MAX_MS,
         default: 10.0,
+        curve: ParamCurve::Linear,
+    },
+    // Gate threshold on the dry input (0 = off): the wet opens with a hit
+    // and slams shut 120 ms later — the gated-reverb snare.
+    ParamSpec {
+        id: P_GATE,
+        name: "gate",
+        unit: "",
+        min: 0.0,
+        max: 1.0,
+        default: 0.0,
         curve: ParamCurve::Linear,
     },
 ];
@@ -238,6 +258,14 @@ pub struct Reverb {
     size: OnePole,
     damp: OnePole,
     mix: LinearRamp,
+    /// Gate threshold (0 = off), detector, hold counter and slewed wet gain.
+    gate_level: f32,
+    gate_env: EnvFollower,
+    gate_hold: u32,
+    gate_hold_samples: u32,
+    gate_gain: f32,
+    gate_open_coef: f32,
+    gate_close_coef: f32,
 }
 
 impl Default for Reverb {
@@ -256,6 +284,13 @@ impl Default for Reverb {
             size: OnePole::new(default_real(P_SIZE), 0.99),
             damp: OnePole::new(default_real(P_DAMP), 0.99),
             mix: LinearRamp::new(default_real(P_MIX), RAMP_MS, 48_000.0),
+            gate_level: 0.0,
+            gate_env: EnvFollower::default(),
+            gate_hold: 0,
+            gate_hold_samples: 0,
+            gate_gain: 1.0,
+            gate_open_coef: 0.0,
+            gate_close_coef: 0.0,
         }
     }
 }
@@ -314,12 +349,38 @@ impl AudioNode for Reverb {
             let yl = Self::read_taps(&self.a, &self.b, &self.taps_l);
             let yr = Self::read_taps(&self.b, &self.a, &self.taps_r);
 
+            // Gate on the DRY input: the wet opens with a hit and slams shut
+            // after the hold — dry hits keep triggering, tails never do. At
+            // threshold 0 the gain is exactly 1.0 (bit-identical wet).
+            let gate = if self.gate_level > 0.0 {
+                let det = self.gate_env.tick(x);
+                if det >= self.gate_level {
+                    self.gate_hold = self.gate_hold_samples;
+                } else if self.gate_hold > 0 {
+                    self.gate_hold -= 1;
+                }
+                let target = if det >= self.gate_level || self.gate_hold > 0 {
+                    1.0
+                } else {
+                    0.0
+                };
+                let coef = if target > self.gate_gain {
+                    self.gate_open_coef
+                } else {
+                    self.gate_close_coef
+                };
+                self.gate_gain = flush(target + (self.gate_gain - target) * coef);
+                self.gate_gain
+            } else {
+                1.0
+            };
+
             if stereo {
-                io.output_ch(0, 0)[i] = l * (1.0 - mix) + yl * WET_GAIN * mix;
-                io.output_ch(0, 1)[i] = r * (1.0 - mix) + yr * WET_GAIN * mix;
+                io.output_ch(0, 0)[i] = l * (1.0 - mix) + yl * WET_GAIN * mix * gate;
+                io.output_ch(0, 1)[i] = r * (1.0 - mix) + yr * WET_GAIN * mix * gate;
             } else {
                 let wet = 0.5 * (yl + yr) * WET_GAIN;
-                io.output_ch(0, 0)[i] = l * (1.0 - mix) + wet * mix;
+                io.output_ch(0, 0)[i] = l * (1.0 - mix) + wet * mix * gate;
             }
         }
     }
@@ -350,6 +411,7 @@ impl AudioNode for Reverb {
             P_PREDELAY => self
                 .predelay_len
                 .set_target(real * 0.001 * self.sample_rate),
+            P_GATE => self.gate_level = real,
             _ => {}
         }
     }
@@ -381,6 +443,16 @@ impl AudioNode for Reverb {
         self.mix = LinearRamp::new(default_real(P_MIX), RAMP_MS, sample_rate);
         let pd_coef = (-1.0 / (PREDELAY_SMOOTH_S * sample_rate)).exp();
         self.predelay_len = OnePole::new(default_real(P_PREDELAY) * 0.001 * sample_rate, pd_coef);
+
+        self.gate_level = default_real(P_GATE);
+        self.gate_env = EnvFollower::default();
+        self.gate_env
+            .set_times(GATE_DET_ATTACK_S, GATE_DET_RELEASE_S, sample_rate);
+        self.gate_hold = 0;
+        self.gate_hold_samples = (GATE_HOLD_S * sample_rate) as u32;
+        self.gate_gain = 1.0;
+        self.gate_open_coef = (-1.0 / (GATE_OPEN_S * sample_rate)).exp();
+        self.gate_close_coef = (-1.0 / (GATE_CLOSE_S * sample_rate)).exp();
     }
 }
 
@@ -414,6 +486,7 @@ mod tests {
             frames,
             channels: 1,
             samples_per_beat: 0.0,
+            beat_phase: 0.0,
         };
         let mut io = NodeIo::new(&[], input, out, frames, 1);
         r.process(&ctx, &mut io);
@@ -434,6 +507,62 @@ mod tests {
         let mut out = Vec::new();
         render(r, &input, &mut out);
         out
+    }
+
+    /// A 10 ms full-scale burst followed by silence (a snare-like hit).
+    fn burst_input(secs: f32) -> Vec<f32> {
+        let n = (secs * SR) as usize;
+        let mut input = vec![0.0; n];
+        let mut rng = crate::engine::dsp::RNG_SEED;
+        for s in input.iter_mut().take(480) {
+            *s = crate::engine::dsp::next_white(&mut rng) * 0.9;
+        }
+        input
+    }
+
+    #[test]
+    fn gate_zero_is_bit_identical() {
+        let input = burst_input(1.0);
+        let mut a = fx();
+        let mut ya = Vec::new();
+        render(&mut a, &input, &mut ya);
+        let mut b = fx();
+        b.set_param(P_GATE, 0.0);
+        let mut yb = Vec::new();
+        render(&mut b, &input, &mut yb);
+        assert_eq!(ya, yb, "gate 0 must leave the wet untouched");
+    }
+
+    #[test]
+    fn gate_chops_the_tail() {
+        let input = burst_input(1.2);
+        let tail = |r: &mut Reverb| -> f32 {
+            r.set_param(P_MIX, 1.0);
+            r.set_param(P_SIZE, 0.9); // long tail: plenty to chop
+            let mut y = Vec::new();
+            render(r, &input, &mut y);
+            energy(&y[(0.5 * SR) as usize..(1.0 * SR) as usize])
+        };
+        let open = tail(&mut fx());
+        let mut gated_rv = fx();
+        gated_rv.set_param(P_GATE, 0.2);
+        let gated = tail(&mut gated_rv);
+        assert!(
+            gated < open * 0.05,
+            "gate left the tail ringing: {gated} vs {open}"
+        );
+    }
+
+    #[test]
+    fn gate_close_is_click_free() {
+        let mut r = fx();
+        r.set_param(P_MIX, 1.0);
+        r.set_param(P_GATE, 0.2);
+        let input = burst_input(1.0);
+        let mut y = Vec::new();
+        render(&mut r, &input, &mut y);
+        let clicks = detect_clicks(&y, 48_000);
+        assert!(clicks.is_empty(), "gate close clicked: {clicks:?}");
     }
 
     #[test]
@@ -461,6 +590,7 @@ mod tests {
             frames: n,
             channels: 2,
             samples_per_beat: 0.0,
+            beat_phase: 0.0,
         };
         let mut io = NodeIo::new(&[], &stereo_in, &mut stereo_out, n, 2);
         st.process(&ctx, &mut io);

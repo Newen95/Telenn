@@ -27,3 +27,6 @@ dist-ssr
 # content: live testing edits them constantly. The app ships its demo embedded
 # and recreates projects/demo on first launch.
 projects/
+
+# Local probe renders from the verification tools
+src-tauri/src/target/

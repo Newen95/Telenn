@@ -47,6 +47,36 @@ const BASS_F_HI: f32 = 200.0;
 /// its half by a 200 Hz search ceiling.
 const BASS_F_SEARCH_HI: f32 = 400.0;
 const BASS_CLARITY_MIN: f32 = 0.5;
+
+/// Line-tracker register: the same monophonic tracker serves the bass
+/// (default) and, via [`Options::melody`], a lead line on an isolated stem.
+struct Register {
+    lp_hz: f32,
+    decim: usize,
+    f_lo: f32,
+    f_hi: f32,
+    /// YIN search ceiling, wider than the accepted range (see the
+    /// [`BASS_F_SEARCH_HI`] note).
+    search_hi: f32,
+}
+
+const BASS_REGISTER: Register = Register {
+    lp_hz: BASS_LP_HZ,
+    decim: DECIM,
+    f_lo: BASS_F_LO,
+    f_hi: BASS_F_HI,
+    search_hi: BASS_F_SEARCH_HI,
+};
+
+/// ~B2..C#6 acceptance — a synth lead on a separated stem. Lighter decimation
+/// keeps mid-register periods visible to YIN.
+const MELODY_REGISTER: Register = Register {
+    lp_hz: 2500.0,
+    decim: 2,
+    f_lo: 120.0,
+    f_hi: 1100.0,
+    search_hi: 2200.0,
+};
 /// Snap a bass-note start to a full-band onset this close (YIN frames are
 /// ~11 ms; onsets are sharper).
 const ONSET_SNAP_S: f32 = 0.04;
@@ -82,6 +112,10 @@ pub struct Options {
     pub offset_s: Option<f32>,
     /// Quantization denominator (16 = sixteenth grid). Must divide a bar.
     pub subdivision: u32,
+    /// Retarget the line tracker at a lead register (~B2..C#6) — for a
+    /// separated melody stem. The line still lands in the `bass` field;
+    /// `drums`/`chords` keep computing but are not meaningful on such a stem.
+    pub melody: bool,
 }
 
 impl Default for Options {
@@ -90,6 +124,7 @@ impl Default for Options {
             bpm: None,
             offset_s: None,
             subdivision: 16,
+            melody: false,
         }
     }
 }
@@ -207,10 +242,15 @@ pub fn transcribe(
         .into_iter()
         .map(|i| frame_time_s(i, sample_rate))
         .collect();
-    let low = lowpassed(x, sample_rate, BASS_LP_HZ);
-    let dec: Vec<f32> = low.iter().step_by(DECIM).copied().collect();
-    let dec_sr = sample_rate / DECIM as u32;
-    let raw_bass = track_bass(&dec, dec_sr, &onset_times);
+    let reg = if opts.melody {
+        &MELODY_REGISTER
+    } else {
+        &BASS_REGISTER
+    };
+    let low = lowpassed(x, sample_rate, reg.lp_hz);
+    let dec: Vec<f32> = low.iter().step_by(reg.decim).copied().collect();
+    let dec_sr = sample_rate / reg.decim as u32;
+    let raw_bass = track_bass(&dec, dec_sr, &onset_times, reg);
 
     let low_env = band_flux(x, sample_rate, 0.0, KICK_HI_HZ);
     let beat0_s = match opts.offset_s {
@@ -487,7 +527,7 @@ struct RawBassNote {
 
 /// Sliding YIN over the decimated lowpassed signal, median-filtered, then
 /// segmented into notes on sustained pitch changes or unvoiced gaps.
-fn track_bass(dec: &[f32], dec_sr: u32, onset_times: &[f32]) -> Vec<RawBassNote> {
+fn track_bass(dec: &[f32], dec_sr: u32, onset_times: &[f32], reg: &Register) -> Vec<RawBassNote> {
     // Per-frame fractional MIDI + clarity; `None` = unvoiced.
     let mut frames: Vec<Option<(f32, f32)>> = Vec::new();
     let mut start = 0usize;
@@ -495,10 +535,10 @@ fn track_bass(dec: &[f32], dec_sr: u32, onset_times: &[f32]) -> Vec<RawBassNote>
         let f = estimate_f0_in(
             &dec[start..start + BASS_WIN],
             dec_sr,
-            BASS_F_LO,
-            BASS_F_SEARCH_HI,
+            reg.f_lo,
+            reg.search_hi,
         )
-        .filter(|f| f.clarity >= BASS_CLARITY_MIN && f.hz <= BASS_F_HI)
+        .filter(|f| f.clarity >= BASS_CLARITY_MIN && f.hz <= reg.f_hi)
         .map(|f| (69.0 + 12.0 * (f.hz / 440.0).log2(), f.clarity));
         frames.push(f);
         start += BASS_HOP;
@@ -897,7 +937,31 @@ mod tests {
             bpm: Some(bpm),
             offset_s: Some(offset),
             subdivision: 16,
+            melody: false,
         }
+    }
+
+    #[test]
+    fn melody_register_tracks_a_lead_line() {
+        // Four half-note lead tones at 120 bpm: A3 B3 C#4 E4 — all above the
+        // bass acceptance ceiling, all inside the melody register.
+        let mut x = vec![0.0f32; (8.5 * SR as f32) as usize];
+        for (k, p) in [57, 59, 61, 64].iter().enumerate() {
+            add_at(&mut x, k as f32 * 1.0, &bass_note(*p, 0.9));
+        }
+        let mut o = opts(120.0, 0.0);
+        o.melody = true;
+        let t = transcribe(&x, SR, &o).expect("transcribes");
+        let pitches: Vec<u8> = t.bass.iter().map(|n| n.pitch).collect();
+        assert_eq!(pitches, vec![57, 59, 61, 64], "melody line missed");
+
+        // The default bass register must reject the same (too-high) line.
+        let tb = transcribe(&x, SR, &opts(120.0, 0.0)).expect("transcribes");
+        assert!(
+            tb.bass.is_empty(),
+            "bass register accepted a lead line: {:?}",
+            tb.bass
+        );
     }
 
     /// A bass note: sine + 30% second harmonic, 10 ms fades.
@@ -1125,6 +1189,7 @@ mod tests {
                 bpm: None,
                 offset_s: None,
                 subdivision: 16,
+                melody: false,
             },
         )
         .expect("transcription");
@@ -1155,6 +1220,7 @@ mod tests {
             bpm: Some(120.0),
             offset_s: Some(0.0),
             subdivision: 7,
+            melody: false,
         };
         assert!(transcribe(&x, SR, &bad).is_err());
     }

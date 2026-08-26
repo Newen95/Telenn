@@ -6,10 +6,12 @@
 //!
 //! Usage:
 //!   cargo run --bin transcribe -- <file.wav> [--bpm f] [--offset-s f]
-//!       [--start-s f] [--dur-s f] [--subdivision n] [--json path]
+//!       [--start-s f] [--dur-s f] [--subdivision n] [--melody] [--json path]
 //!
 //! `--bpm` and `--offset-s` override the grid inference when it lands wrong;
 //! `--start-s`/`--dur-s` transcribe an excerpt (the grid restarts at 1.1.0).
+//! `--melody` retargets the line tracker at a lead register (~B2..C#6) — for a
+//! separated melody stem; the line lands in the `bass` output.
 //! Exit codes: 0 done, 1 usage error (this is an extractor, not a linter).
 
 // Shared CLI helpers; each bin uses a different subset (see util.rs header).
@@ -59,11 +61,12 @@ fn try_run() -> Result<i32, String> {
             .map_err(|_| format!("--subdivision: '{v}' is not an integer"))?,
         None => 16,
     };
+    let melody = args.take_flag("--melody");
     let positional = args.finish_positional()?;
     let [path] = positional.as_slice() else {
         return Err(
             "usage: transcribe <file.wav> [--bpm f] [--offset-s f] [--start-s f] \
-             [--dur-s f] [--subdivision n] [--json path]"
+             [--dur-s f] [--subdivision n] [--melody] [--json path]"
                 .into(),
         );
     };
@@ -89,6 +92,7 @@ fn try_run() -> Result<i32, String> {
         bpm,
         offset_s,
         subdivision,
+        melody,
     };
     let mut transcription = transcribe(&mono[from..to], sr, &opts).map_err(|e| e.to_string())?;
     transcription.source = path.clone();

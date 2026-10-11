@@ -2,7 +2,7 @@
 //!
 //! A hand-written `song.json` need not carry ids: every edit addresses notes and
 //! clips by id, so we assign one to anything that lacks it. The rule (also in
-//! `CONTRIBUTING.md`): existing ids are **preserved**, only id-less objects receive a
+//! `AGENTS.md`): existing ids are **preserved**, only id-less objects receive a
 //! fresh one, and a project loaded with missing ids is rewritten to disk. Ids are
 //! unique across the whole project (notes share the namespace with clips) so an
 //! id alone resolves an object.

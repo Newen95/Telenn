@@ -17,7 +17,7 @@ default-run = "telenn"
 name = "telenn_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
-# Offline verification CLIs (the agent's "ears") — see CONTRIBUTING.md.
+# Offline verification CLIs (the agent's "ears") — see AGENTS.md.
 [[bin]]
 name = "analyze_wav"
 path = "tools/analyze_wav.rs"

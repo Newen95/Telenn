@@ -42,3 +42,7 @@ npm run tauri dev    # run the app in development
 ```
 
 Engine tests live in `src-tauri/` (`cargo test`).
+
+## License
+
+[MIT](LICENSE)

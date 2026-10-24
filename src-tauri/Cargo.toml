@@ -2,7 +2,8 @@
 name = "telenn"
 version = "0.1.0"
 description = "Telenn — modular cross-platform DAW"
-authors = ["Newen <newen.calle@gmail.com>"]
+authors = ["Newen Calle"]
+license = "MIT"
 edition = "2021"
 # The verification CLIs add extra [[bin]] targets; keep `cargo run` (and
 # therefore `tauri dev`) pointing at the app.

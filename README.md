@@ -4,6 +4,8 @@ A modular, cross-platform DAW (Windows/Linux) built with Tauri, Rust and Vue 3.
 The audio engine runs on a dedicated real-time thread; the whole project state is
 plain, diffable text so it can be driven from the UI or by editing files.
 
+![Telenn: timeline, piano roll and mixer during playback](docs/screenshot.jpg)
+
 ## Stack
 
 - **Frontend** - Tauri v2 + Vue 3 + TypeScript (custom canvas timeline/piano roll,

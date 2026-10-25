@@ -11,7 +11,8 @@ plain, diffable text so it can be driven from the UI or by editing files.
 - **Frontend** - Tauri v2 + Vue 3 + TypeScript (custom canvas timeline/piano roll,
   node graph editor).
 - **Backend** - Rust: real-time audio via `cpal`, lock-free ring buffers via
-  `rtrb`, WAV export via `hound`, MIDI via `midir`. DSP is hand-written.
+  `rtrb`, WAV export via `hound`, MIDI via `midir`. DSP is implemented
+  in-house, with no third-party DSP library.
 
 See `ARCHITECTURE.md` for the engine and project format, and `UX_SPEC.md` for the
 UI. `MVP_PLAN.md` tracks the milestone plan.
